@@ -264,6 +264,11 @@ abstract class FetchPowerCloud
 		];
 		$response = \wp_remote_get(Bootstrap::instance()->powercloud_api . '/templates/wordpress?page=1&limit=250', $args);
 
+		Plugin::logger("[GET] /templates/wordpress", 'debug', [
+			'response' => $response,
+			'powercloud_api_key' => $powercloud_api_key
+		]);
+
 		if (\is_wp_error($response)) {
 			return [];
 		}
@@ -427,6 +432,12 @@ abstract class FetchPowerCloud
 		/** @var string|false $legacy 就版本的 key */
 		$legacy = \get_transient(Main::POWERCLOUD_API_KEY_TRANSIENT_KEY . '_' . $user_id);
 		$key = \get_transient(Main::POWERCLOUD_API_KEY_TRANSIENT_KEY);
+
+		Plugin::logger('powercloud_api_key', 'debug', [
+			'legacy' => $legacy,
+			'key' => $key,
+		]);
+
 		if ($key) {
 			return (string) $key;
 		}
