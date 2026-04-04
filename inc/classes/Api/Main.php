@@ -842,10 +842,8 @@ final class Main
 		}
 
 		// Use transient to save (save to MySQL wp_options table)
-		$transient_key = FetchPowerCloud::get_powercloud_api_key((string) $user_id);
-		if ($transient_key) {
-			\set_transient($transient_key, $api_key);
-		}
+		\set_transient(Main::POWERCLOUD_API_KEY_TRANSIENT_KEY, $api_key);
+
 
 		return new \WP_REST_Response(
 			[
