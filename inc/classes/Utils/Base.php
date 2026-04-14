@@ -41,7 +41,7 @@ abstract class Base {
 				$psw      = '7t4T WpSr HgZL Auyl TtOw USyG';
 				// $base_url       = 'http://cloud.local';
 				$base_url       = 'http://cloud.local';
-				$powercloud_api = 'http://localhost:5000'; // local powercloud api
+				$powercloud_api = 'https://api.wpsite.pro'; // local powercloud api
 				break;
 			case 'staging': // staging 線上測試站
 				$username       = 'powerpartner';
