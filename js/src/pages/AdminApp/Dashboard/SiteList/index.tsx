@@ -50,6 +50,8 @@ import WebsiteListFilter, {
 	WebsiteFilters,
 } from './WebsiteListFilter'
 import type { IWebsite, IWebsiteResponse } from './types'
+import { useSubscriptionApps } from './hooks/useSubscriptionApps'
+import { SubscriptionBinding } from './SubscriptionBinding'
 
 const { Text, Link } = Typography
 
@@ -251,6 +253,14 @@ const PowercloudContent = () => {
 	const websites = data?.data?.data || []
 	const total = data?.data?.total || 0
 
+	// Batch query subscription mapping for all loaded websites
+	const websiteIds = websites.map((w: IWebsite) => w.id)
+	const {
+		subscriptionMap,
+		isFetching: isAppsFetching,
+		refetch: refetchApps,
+	} = useSubscriptionApps({ websiteIds })
+
 	const handleDelete = (id: string) => {
 		deleteWebsite(id)
 	}
@@ -443,6 +453,21 @@ const PowercloudContent = () => {
 			),
 		},
 		{
+			title: '對應訂閱',
+			key: 'subscription',
+			width: 200,
+			render: (_: unknown, record: IWebsite) => {
+				const subscriptionIds = subscriptionMap[record.id] || []
+				return (
+					<SubscriptionBinding
+						websiteId={record.id}
+						subscriptionIds={subscriptionIds}
+						onBindingChange={() => refetchApps()}
+					/>
+				)
+			},
+		},
+		{
 			title: '建立時間',
 			dataIndex: 'createdAt',
 			key: 'createdAt',
@@ -522,7 +547,10 @@ const PowercloudContent = () => {
 						<Text type="secondary">共 {total || 0} 個網站</Text>
 						<Button
 							icon={<ReloadOutlined spin={isFetching} />}
-							onClick={() => refetch()}
+							onClick={() => {
+								refetch()
+								refetchApps()
+							}}
 							loading={isFetching}
 						>
 							重新整理
