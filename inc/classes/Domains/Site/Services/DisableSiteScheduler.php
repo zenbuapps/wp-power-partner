@@ -108,22 +108,33 @@ final class DisableSiteScheduler extends Base {
 
 			// 如果 host_type 為 PowerCloud 新架構
 			if ($host_type === LinkedSites::DEFAULT_HOST_TYPE) {
-				$website_id = null;
-				$order_item = $item->get_meta( SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY );
+				// 優先從 pp_linked_site_ids 取 websiteId（涵蓋自動開站 + 手動綁定）
+				if (!empty($linked_site_ids)) {
+					foreach ($linked_site_ids as $site_id) {
+						$reason = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}";
+						FetchPowerCloud::disable_site((string) $current_user_id, (string) $site_id);
+						$subscription->add_order_note($reason);
+						$subscription->save();
+						Plugin::logger($reason, 'info');
+					}
+					continue;
+				}
 
-				// get websiteId from order_item
-				if ( is_string( $order_item ) && ! empty( $order_item ) ) {
-					$responses = json_decode( $order_item, true );
-					if ( is_array( $responses ) && ! empty( $responses ) ) {
-						// 取第一個 response 的 data.websiteId
+				// Fallback: 從 order item meta 提取 websiteId（相容舊資料）
+				$website_id = null;
+				$order_item = $item->get_meta(SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY);
+
+				if (is_string($order_item) && !empty($order_item)) {
+					$responses = json_decode($order_item, true);
+					if (is_array($responses) && !empty($responses)) {
 						$first_response = $responses[0];
-						if ( is_array( $first_response ) && isset( $first_response['data'] ) && is_array( $first_response['data'] ) && isset( $first_response['data']['websiteId'] ) ) {
+						if (is_array($first_response) && isset($first_response['data']) && is_array($first_response['data']) && isset($first_response['data']['websiteId'])) {
 							$website_id = (string) $first_response['data']['websiteId'];
 						}
 					}
 				}
 
-				if ( empty( $website_id ) ) {
+				if (empty($website_id)) {
 					Plugin::logger(
 						"訂閱 #{$subscription_id} 的訂單項目 #{$item->get_id()} 找不到 websiteId",
 						'error',
@@ -136,10 +147,10 @@ final class DisableSiteScheduler extends Base {
 				}
 
 				$reason = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}";
-				FetchPowerCloud::disable_site( (string) $current_user_id, $website_id );
-				$subscription->add_order_note( $reason );
+				FetchPowerCloud::disable_site((string) $current_user_id, $website_id);
+				$subscription->add_order_note($reason);
 				$subscription->save();
-				Plugin::logger( $reason, 'info' );
+				Plugin::logger($reason, 'info');
 				continue;
 			}
 		}
