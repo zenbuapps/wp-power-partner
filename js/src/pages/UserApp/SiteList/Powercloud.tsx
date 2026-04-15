@@ -73,6 +73,7 @@ interface IWebsite {
 	} | null
 	phpPodSize: number
 	ipAddress: string
+	memo?: string
 	createdAt: string
 	updatedAt: string
 }
@@ -203,6 +204,16 @@ const Powercloud = () => {
 			width: 250,
 			render: (_, record) => (
 				<Text copyable={{ text: record.adminPassword }}>••••••••</Text>
+			),
+		},
+		{
+			title: '備註',
+			dataIndex: 'memo',
+			key: 'memo',
+			width: 150,
+			ellipsis: true,
+			render: (memo?: string) => (
+				<Text ellipsis={{ tooltip: memo }}>{memo || '-'}</Text>
 			),
 		},
 		{
