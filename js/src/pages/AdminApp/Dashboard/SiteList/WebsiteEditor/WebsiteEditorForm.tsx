@@ -236,7 +236,7 @@ const WebsiteEditorForm = ({ websiteData }: WebsiteEditorFormProps) => {
 					</Col>
 				</Row>
 
-				<div className="border-t border-gray-200 border-solid pt-4 flex justify-end">
+				<div className="pt-4 flex justify-end">
 					<Button
 						type="primary"
 						htmlType="submit"
