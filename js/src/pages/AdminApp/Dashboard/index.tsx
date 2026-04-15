@@ -9,6 +9,7 @@ import {
 	CloudOutlined,
 } from '@ant-design/icons'
 import { Tabs, TabsProps, Form, Button } from 'antd'
+import { HashRouter, Routes, Route } from 'react-router-dom'
 import AccountIcon from './AccountIcon'
 import SiteList from './SiteList'
 import LogList from './LogList'
@@ -18,6 +19,7 @@ import ManualSiteSync from './ManualSiteSync'
 import Settings from './Settings'
 import LicenseCodes from './LicenseCodes'
 import PowercloudAuth from './PowercloudAuth'
+import WebsiteEditor from './SiteList/WebsiteEditor'
 import useSave, {
 	TFormValues,
 } from '@/pages/AdminApp/Dashboard/EmailSetting/hooks/useSave'
@@ -86,7 +88,7 @@ const items: TabsProps['items'] = [
 	},
 ]
 
-const index = () => {
+const TabsDashboard = () => {
 	const [form] = Form.useForm()
 	const { mutation, contextHolder } = useSave(form)
 	const { mutate: saveSettings, isPending } = mutation
@@ -124,6 +126,20 @@ const index = () => {
 				</Button>
 			)}
 		</Form>
+	)
+}
+
+const index = () => {
+	return (
+		<HashRouter>
+			<Routes>
+				<Route path="/" element={<TabsDashboard />} />
+				<Route
+					path="/websites/edit/:id"
+					element={<WebsiteEditor />}
+				/>
+			</Routes>
+		</HashRouter>
 	)
 }
 
