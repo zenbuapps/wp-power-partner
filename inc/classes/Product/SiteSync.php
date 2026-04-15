@@ -10,6 +10,7 @@ use J7\PowerPartner\Api\FetchPowerCloud;
 use J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks as EmailService;
 use J7\PowerPartner\Plugin;
 use J7\PowerPartner\Product\DataTabs\LinkedSites;
+use J7\PowerPartner\ShopSubscription;
 use J7\PowerPartner\Utils\Token;
 
 /** Class SiteSync */
@@ -213,6 +214,20 @@ final class SiteSync {
 
 		// 發送 email 給用戶，告知網站已建立成功
 		if ($response_obj->status === 201) {
+			// Store websiteId in pp_linked_site_ids for subscription binding
+			$website_id = $response_obj->data['websiteId'] ?? '';
+			if (!empty($website_id)) {
+				$existing_site_ids = ShopSubscription::get_linked_site_ids((int) $subscription->get_id());
+				$existing_site_ids_values = array_values($existing_site_ids);
+				if (!in_array((string) $website_id, $existing_site_ids_values, true)) {
+					$existing_site_ids_values[] = (string) $website_id;
+				}
+				ShopSubscription::update_linked_site_ids(
+					(int) $subscription->get_id(),
+					$existing_site_ids_values
+				);
+			}
+
 			$order_token = Token::get_order_tokens($parent_order);
 
 			// 拿到 email payloads
