@@ -142,6 +142,18 @@ final class Main
 
 		\register_rest_route(
 			Plugin::$kebab,
+			'unbind-site',
+			[
+				'methods'             => 'POST',
+				'callback'            => [$this, 'post_unbind_site_callback'],
+				'permission_callback' => function () {
+					return \current_user_can('manage_options');
+				},
+			]
+		);
+
+		\register_rest_route(
+			Plugin::$kebab,
 			'apps',
 			[
 				'methods'             => 'GET',
@@ -417,6 +429,59 @@ final class Main
 					'status'  => 500,
 					'message' => 'post change subscription fail: ' . $th->getMessage(),
 				]
+			);
+		}
+	}
+
+	/**
+	 * Post unbind site callback
+	 * 從所有訂閱中解除綁定指定的 site ID
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response
+	 */
+	public function post_unbind_site_callback($request): \WP_REST_Response
+	{
+		try {
+			$body_params = $request->get_json_params();
+			$site_id     = $body_params['site_id'] ?? '';
+
+			if (empty($site_id)) {
+				return new \WP_REST_Response(
+					[
+						'status'  => 400,
+						'message' => 'missing site_id',
+					],
+					400
+				);
+			}
+
+			$is_success = ShopSubscription::remove_linked_site_ids([(string) $site_id]);
+
+			if ($is_success) {
+				return new \WP_REST_Response(
+					[
+						'status'  => 200,
+						'message' => "unbind site {$site_id} success",
+					],
+					200
+				);
+			} else {
+				return new \WP_REST_Response(
+					[
+						'status'  => 500,
+						'message' => "unbind site {$site_id} fail",
+					],
+					500
+				);
+			}
+		} catch (\Throwable $th) {
+			return new \WP_REST_Response(
+				[
+					'status'  => 500,
+					'message' => 'unbind site fail: ' . $th->getMessage(),
+				],
+				500
 			);
 		}
 	}
