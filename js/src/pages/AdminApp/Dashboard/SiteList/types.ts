@@ -31,6 +31,7 @@ export interface IWebsite {
 	phpPodSize: number
 	ipAddress: string
 	dailyCost?: number
+	memo?: string
 	createdAt: string
 	updatedAt: string
 }
