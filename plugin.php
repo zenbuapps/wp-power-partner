@@ -3,7 +3,7 @@
  * Plugin Name:       Power Partner | 讓每個人都可以輕鬆地販售網站模板
  * Plugin URI:        https://cloud.luke.cafe/plugins/power-partner/
  * Description:       Power Partner 是一個 WordPress 套件，安裝後，可以讓你的 Woocommerce 商品與 cloud.luke.cafe 的模板網站連結，並且可以讓使用者自訂商品的價格，當用戶在您的網站下單後，會自動在 cloud.luke.cafe 創建網站，並且自動發送通知給用戶跟您。
- * Version:           3.2.17
+ * Version:           3.3.0
  * Requires at least: 5.7
  * Requires PHP:      8.1
  * Author:            J7
