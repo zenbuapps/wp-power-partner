@@ -92,8 +92,8 @@ E2E 使用 Playwright，測試分三層：
 ## 版本管理
 
 版本儲存在**兩處**，必須同步:
-- `package.json` → `"version": "3.2.5"`
-- `plugin.php` → `* Version: 3.2.5`
+- `package.json` → `"version": "3.2.17"`
+- `plugin.php` → `* Version: 3.2.17`
 
 ```bash
 pnpm sync:version   # 從 package.json 同步到 plugin.php

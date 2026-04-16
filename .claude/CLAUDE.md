@@ -1,7 +1,7 @@
 # Power Partner — AI Agent 開發指引
 
-**Last Updated:** 2026-03-15
-**Plugin Version:** 3.2.5
+**Last Updated:** 2026-04-09
+**Plugin Version:** 3.2.17
 **Namespace:** `J7\PowerPartner`
 
 ---
