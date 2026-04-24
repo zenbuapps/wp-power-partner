@@ -471,6 +471,10 @@ jobs:
 
           if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
             echo "ℹ️ Local 與 remote 已同步，無需推送"
+          elif [ "$REMOTE_SHA" = "none" ]; then
+            echo "🔄 Remote 分支尚未建立，首次推送 local commits（local: ${LOCAL_SHA:0:7}）"
+            git push origin "HEAD:${BRANCH}"
+            echo "✅ 首次推送完成"
           else
             echo "🔄 偵測到 local commits 未推送（local: ${LOCAL_SHA:0:7}, remote: ${REMOTE_SHA:0:7}）"
             git push origin "HEAD:${BRANCH}" --force-with-lease
@@ -540,7 +544,7 @@ jobs:
           version: 10
 
       - name: 安裝 Node 依賴
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: 安裝 Composer 依賴（主機端）
         run: composer install --no-interaction --prefer-dist
@@ -1054,7 +1058,11 @@ jobs:
           BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
           BUNNY_CDN_URL: ${{ secrets.BUNNY_CDN_URL }}
         run: |
-          BRANCH_DIR=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          # 注意：issue_comment/pull_request_review_comment 觸發時 github.ref_name
+          # 指向 default branch（master），不是 issue 分支。優先使用 claude job
+          # 解析出的 branch_name，才會以 issue 分支為單位歸檔。
+          RAW_BRANCH="${{ needs.claude.outputs.branch_name || github.ref_name }}"
+          BRANCH_DIR=$(echo "$RAW_BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g')
           bash .github/scripts/upload-to-bunny.sh /tmp/smoke-media "ci/${BRANCH_DIR}/smoke-test"
 
       - name: 上傳 Smoke Test 媒體 Artifact (備份)
