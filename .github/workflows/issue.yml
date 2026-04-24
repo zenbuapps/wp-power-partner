@@ -62,8 +62,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           MARKER="<!-- issue-creator-expanded -->"
+          # grep -c 在無匹配時 exit 1；`|| true` 吞掉 exit code，再 sanity-check 成純整數。
+          # 不可用 `|| echo "0"`：gh api 失敗時會產生 "\n0" 雙行，-gt 比較會噴 integer expression expected。
           EXISTING=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-            --paginate --jq '.[].body' 2>/dev/null | grep -c "$MARKER" || echo "0")
+            --paginate --jq '.[].body' 2>/dev/null | grep -c "$MARKER" || true)
+          EXISTING=$(printf '%s' "${EXISTING:-0}" | head -n1 | tr -cd '0-9')
+          EXISTING="${EXISTING:-0}"
           if [ "$EXISTING" -gt "0" ]; then
             echo "already_expanded=true" >> $GITHUB_OUTPUT
             echo "⚠️ 此 Issue 已經展開過需求，跳過重複執行"
