@@ -21,9 +21,17 @@ name: Act Test (Multi-Job Structure Validation)
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm_local_only:
+        description: '此 workflow 僅供本地 act 測試使用，若在 GitHub 線上觸發請輸入 "LOCAL-ONLY" 以繼續'
+        required: true
+        default: ''
+        type: string
 
 jobs:
   integration-tests:
+    # 安全閘：確保只有明確確認的 workflow_dispatch 才能跑
+    if: ${{ github.event.inputs.confirm_local_only == 'LOCAL-ONLY' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -32,7 +40,7 @@ jobs:
       phpunit_ok: ${{ steps.mock_phpunit.outcome }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: 設定 Node.js
         uses: actions/setup-node@v4
@@ -92,7 +100,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: 設定 Node.js
         uses: actions/setup-node@v4

@@ -1,0 +1,102 @@
+name: Release
+
+# 觸發時機：推送 v* tag 時自動建置 ZIP 並上傳到對應的 GitHub Release。
+# 使用流程：
+#   1. 本地執行 `pnpm release:patch`（release-it 會 bump 版本、commit、tag、push、建立 GitHub Release）
+#   2. 本 workflow 在 tag 推送後自動跑 pnpm build + zip，將 power-partner.zip 附加到 Release assets
+#   3. 若 release-it 本地已上傳 zip，此 workflow 會覆蓋（以 CI 產出為準，確保乾淨建置）
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要重新建置 ZIP 的 tag（例如 v3.3.1）'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: 建置並上傳 Release Asset
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # 上傳 release asset 需要
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: 設定 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 設定 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 設定 PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer:v2
+          coverage: none
+
+      - name: 安裝 Node 依賴
+        run: pnpm install --frozen-lockfile
+
+      - name: 安裝 Composer 依賴（含 dev，供 build 使用）
+        run: composer install --no-interaction --prefer-dist
+
+      - name: 建置前端
+        run: pnpm build
+
+      - name: 建立 release 目錄結構
+        run: node ./release/create-release.cjs
+
+      - name: 安裝 release 目錄的 production Composer 依賴
+        working-directory: release/power-partner/power-partner
+        run: composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: 打包 ZIP
+        run: node ./release/zip.cjs
+
+      - name: 取得版本號
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: 上傳 ZIP 到 Artifact（保留 30 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-partner-${{ steps.version.outputs.version }}
+          path: release/power-partner.zip
+          retention-days: 30
+
+      - name: 將 ZIP 附加到 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # 若 Release 不存在（例如純 tag push 未建 release）則先建立
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            echo "ℹ️ Release $TAG 不存在，建立新 Release"
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+          # --clobber 覆蓋既有同名 asset（以 CI 建置結果為準）
+          gh release upload "$TAG" release/power-partner.zip --clobber
+          echo "✅ 已將 power-partner.zip 附加到 Release $TAG"

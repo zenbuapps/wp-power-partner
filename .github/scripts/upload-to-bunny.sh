@@ -4,7 +4,7 @@
 #
 # Required env vars: BUNNY_STORAGE_HOST, BUNNY_STORAGE_ZONE,
 #                    BUNNY_STORAGE_PASSWORD, BUNNY_CDN_URL
-# Outputs to $GITHUB_OUTPUT: screenshot_files, video_files, media_url_prefix, has_media
+# Outputs to $GITHUB_OUTPUT: screenshot_files, video_files, media_url_prefix, upload_ok
 
 set -euo pipefail
 
@@ -35,4 +35,4 @@ VIDEO_FILES=$(ls "${SOURCE_DIR}"/*.webm 2>/dev/null | xargs -I{} basename {} | t
 echo "screenshot_files=${SCREENSHOT_FILES}" >> "$GITHUB_OUTPUT"
 echo "video_files=${VIDEO_FILES}" >> "$GITHUB_OUTPUT"
 echo "media_url_prefix=${BUNNY_CDN_URL}/${MEDIA_PREFIX}" >> "$GITHUB_OUTPUT"
-echo "has_media=${UPLOAD_OK}" >> "$GITHUB_OUTPUT"
+echo "upload_ok=${UPLOAD_OK}" >> "$GITHUB_OUTPUT"
