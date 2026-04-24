@@ -1169,9 +1169,19 @@ jobs:
               combinedMd += `<details>\n<summary><b>${groupTitle}</b></summary>\n\n${groupContent}</details>\n\n`;
             }
 
+            // run_ai_acceptance 可能是 success / failure / skipped（條件 detect_smoke.needed 未觸發時）
             const smokeStatus = '${{ steps.run_ai_acceptance.outcome }}';
-            const emoji = smokeStatus === 'success' ? '✅' : '⚠️';
-            const statusText = smokeStatus === 'success' ? '通過' : '異常';
+            let emoji, statusText;
+            if (smokeStatus === 'success') {
+              emoji = '✅';
+              statusText = '通過';
+            } else if (smokeStatus === 'skipped' || smokeStatus === '') {
+              emoji = 'ℹ️';
+              statusText = '未觸發';
+            } else {
+              emoji = '⚠️';
+              statusText = '異常';
+            }
 
             // processedReport 為主要內容（含 CDN 圖片預覽）；combinedMd 僅在 report 缺失時作為 fallback
             const mainContent = processedReport
@@ -1280,30 +1290,30 @@ jobs:
             AI_BADGE="⏭️ AI 驗收狀態: ${AI_OUTCOME}"
           fi
 
-          # 建立 PR
+          # 建立 PR — 用 printf 拼 body，避免 heredoc 結束標記縮排與 YAML block scalar 衝突。
+          PR_BODY=$(printf '%s\n' \
+            '## Summary' \
+            "${CLOSE_LINE}" \
+            '' \
+            '由 Claude Code 根據 Issue 需求自動實作。' \
+            '' \
+            '## 測試結果' \
+            "${TEST_BADGE}" \
+            '' \
+            '## AI 驗收' \
+            "${AI_BADGE}" \
+            '' \
+            '## Checklist' \
+            '- [ ] Code review 完成' \
+            '- [ ] 測試通過確認' \
+            '- [ ] 無安全性疑慮' \
+            '' \
+            '---' \
+            '*🤖 此 PR 由 Claude Code CI 自動建立*')
+
           gh pr create \
             --title "$PR_TITLE" \
-            --body "$(cat <<EOF
-          ## Summary
-          ${CLOSE_LINE}
-
-          由 Claude Code 根據 Issue 需求自動實作。
-
-          ## 測試結果
-          ${TEST_BADGE}
-
-          ## AI 驗收
-          ${AI_BADGE}
-
-          ## Checklist
-          - [ ] Code review 完成
-          - [ ] 測試通過確認
-          - [ ] 無安全性疑慮
-
-          ---
-          *🤖 此 PR 由 Claude Code CI 自動建立*
-          EOF
-          )" \
+            --body "$PR_BODY" \
             --base master \
             --head "$CURRENT_BRANCH"
 
