@@ -11,9 +11,11 @@
 .github/
 ├── workflows/
 │   ├── pipe.yml          # 核心 pipeline（claude → integration-tests）
-│   ├── pipe.md           # pipeline 中文規格書
 │   ├── issue.yml         # Issue 開啟時自動展開需求（PM/DEV 模式）
-│   └── act-test.yml      # 本機 act 多 job 結構驗證（不應用於正式 push）
+│   └── release.yml       # tag push 自動建置 ZIP 並上傳到 GitHub Release
+├── pipe.md               # pipe.yml 的中文規格書（放在 workflows/ 外避免 GitHub 掃描）
+├── act/
+│   └── test.yml          # 本機 act 多 job 結構驗證（不應用於正式 push）
 ├── actions/
 │   └── claude-retry/
 │       └── action.yml    # Claude Code Action 3 次重試（30s/60s backoff）

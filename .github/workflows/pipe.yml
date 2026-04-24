@@ -77,10 +77,8 @@ jobs:
           ISSUE_URL: ${{ github.event.comment.issue_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # 取得 issue number
-          if [ "$EVENT_NAME" = "issues" ]; then
-            ISSUE_NUM="$ISSUE_NUMBER"
-          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+          # 取得 issue number（on: 僅觸發於 issue_comment / pull_request_review_comment / pull_request_review）
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
             ISSUE_NUM=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$' || echo "")
             if [ -z "$ISSUE_NUM" ]; then
               ISSUE_NUM="$ISSUE_NUMBER"
@@ -132,12 +130,10 @@ jobs:
         id: parse_agent
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
           REVIEW_BODY: ${{ github.event.review.body }}
         run: |
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            COMMENT="$ISSUE_BODY"
-          elif [ "${{ github.event_name }}" = "pull_request_review" ]; then
+          # on: 僅觸發於 issue_comment / pull_request_review_comment（皆走 comment.body）與 pull_request_review（走 review.body）
+          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
             COMMENT="$REVIEW_BODY"
           else
             COMMENT="$COMMENT_BODY"
