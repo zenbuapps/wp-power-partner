@@ -12,7 +12,10 @@
 #
 # 測試範圍（刻意 mock 掉 wp-env 和 Claude Code，只驗結構）：
 #   integration-tests job：安裝依賴 + build + 上傳 auth artifact
-#   ai-acceptance job：LC bypass + auth artifact 預檢 + 下載 + 驗證
+#   ai-acceptance job：auth artifact 預檢 + 下載 + 驗證
+#
+# 注意：power-partner 的 plugin.php 已 hardcode 'lc' => false，
+#       不需要 LC bypass 步驟（LC bypass 已內建）
 
 name: Act Test (Multi-Job Structure Validation)
 
@@ -49,7 +52,7 @@ jobs:
           composer --version
 
       - name: 安裝 Composer 依賴
-        run: composer install --no-interaction --prefer-dist --ignore-platform-reqs
+        run: composer install --no-interaction --prefer-dist
 
       - name: 建置前端（驗證 TypeScript 編譯正常）
         run: pnpm run build
@@ -109,58 +112,33 @@ jobs:
           composer --version
 
       - name: 安裝 Composer 依賴（主機端）
-        run: composer install --no-interaction --prefer-dist --ignore-platform-reqs
+        run: composer install --no-interaction --prefer-dist
 
-      # ── 新步驟：LC Bypass 驗證 ────────────────────────
-      - name: 套用 LC Bypass（跳過外掛授權驗證）
+      # ── LC Bypass 驗證（power-partner 已內建 'lc' => false，僅驗證 .e2e-progress.json）
+      - name: 驗證 LC 內建狀態 + 更新 .e2e-progress.json
         run: |
+          echo "=== plugin.php LC 狀態驗證 ==="
+          if grep -q "'lc'" plugin.php; then
+            echo "✅ plugin.php 已有 'lc' 設定（內建）"
+            grep -n "'lc'" plugin.php | head -5
+          else
+            echo "❌ plugin.php 未找到 'lc' 設定，請檢查是否為 power-partner"
+            exit 1
+          fi
+
+          # 更新 .e2e-progress.json 的 lc_bypass_applied 欄位
           node -e "
             const fs = require('fs');
-            const CAPABILITY_LINE = \"'capability'  => 'manage_woocommerce',\";
-            const LC_LINE = \"\t\t\t\t\t'lc'          => false,\";
-            const content = fs.readFileSync('plugin.php', 'utf-8');
-            if (!content.includes(\"'lc'\")) {
-              const modified = content.replace(CAPABILITY_LINE, CAPABILITY_LINE + '\n' + LC_LINE);
-              if (modified !== content) {
-                fs.writeFileSync('plugin.php', modified);
-                console.log('✅ LC bypass applied to plugin.php');
-              } else {
-                console.warn('⚠️ capability line not found in plugin.php, skipping LC bypass');
-              }
-            } else {
-              console.log('ℹ️ LC bypass already applied');
-            }
             const p = JSON.parse(fs.readFileSync('.e2e-progress.json', 'utf-8'));
             p.lc_bypass_applied = true;
             fs.writeFileSync('.e2e-progress.json', JSON.stringify(p, null, '\t'));
             console.log('✅ .e2e-progress.json: lc_bypass_applied = true');
           "
 
-      - name: 驗證 LC Bypass 結果
-        run: |
-          echo "=== plugin.php LC bypass 驗證 ==="
-          if grep -q "'lc'" plugin.php; then
-            echo "✅ plugin.php 已成功注入 'lc' => false"
-            grep -n "lc" plugin.php | head -5
-          else
-            echo "❌ plugin.php 未找到 'lc' bypass，請檢查 capability line 是否存在"
-            exit 1
-          fi
-
-          echo ""
-          echo "=== .e2e-progress.json 驗證 ==="
-          LCB=$(node -e "const p=JSON.parse(require('fs').readFileSync('.e2e-progress.json','utf-8')); console.log(p.lc_bypass_applied)")
-          if [ "$LCB" = "true" ]; then
-            echo "✅ .e2e-progress.json lc_bypass_applied = true"
-          else
-            echo "❌ .e2e-progress.json lc_bypass_applied 未更新（值：$LCB）"
-            exit 1
-          fi
-
       - name: 建置前端（驗證第二個 job 也能 build）
         run: pnpm run build
 
-      # ── 新步驟：auth-state artifact 預檢 ─────────────
+      # ── auth-state artifact 預檢 ─────────────
       # act 環境下 gh api 無法查詢 artifact，改用 mock（直接設 exists=true）
       - name: 模擬 auth-state artifact 預檢（act 替代）
         id: check_auth
@@ -194,7 +172,7 @@ jobs:
         run: |
           echo "✅ ai-acceptance job 完成"
           echo "  - needs.integration-tests.outputs.phpunit_ok: ${{ needs.integration-tests.outputs.phpunit_ok }}"
-          echo "  - LC bypass: ✅"
+          echo "  - LC 內建: ✅"
           echo "  - .e2e-progress.json updated: ✅"
           echo "  - 前端 build（第二個 job）: ✅"
           echo "  - auth artifact 跨 job 下載: ✅（or known act limitation）"

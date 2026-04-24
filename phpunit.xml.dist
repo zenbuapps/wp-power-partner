@@ -9,15 +9,6 @@
             <directory suffix="Test.php">./tests/Integration/</directory>
         </testsuite>
     </testsuites>
-    <groups>
-        <include>
-            <group>smoke</group>
-            <group>happy</group>
-            <group>error</group>
-            <group>edge</group>
-            <group>security</group>
-        </include>
-    </groups>
     <coverage>
         <include>
             <directory suffix=".php">inc/classes</directory>

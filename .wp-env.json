@@ -7,6 +7,8 @@
 		"."
 	],
 	"themes": [],
+	"port": 8895,
+	"testsPort": 8896,
 	"config": {
 		"WP_DEBUG": false,
 		"WP_ENVIRONMENT_TYPE": "local"
