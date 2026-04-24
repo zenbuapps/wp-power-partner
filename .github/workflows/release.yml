@@ -42,6 +42,8 @@ jobs:
 
       - name: 設定 pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: 設定 PHP
         uses: shivammathur/setup-php@v2

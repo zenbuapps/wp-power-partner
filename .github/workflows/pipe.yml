@@ -540,6 +540,8 @@ jobs:
 
       - name: 設定 pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: 安裝 Node 依賴
         run: pnpm install
@@ -622,22 +624,12 @@ jobs:
         id: claude_fix_1
         if: steps.test_cycle_1.outcome == 'failure'
         continue-on-error: true
-        uses: anthropics/claude-code-action@v1
+        uses: ./.github/actions/claude-retry
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-
-          additional_permissions: |
-            actions: read
-          settings: .claude/settings.json
-          plugin_marketplaces: |
-            https://github.com/j7-dev/wp-workflows.git
-          plugins: |
-            wp-workflows@wp-workflows
           prompt: ${{ env.FIX_PROMPT }}
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 60
-            --model opus
+          max_turns: '60'
+          model: opus
 
       # ── 測試循環 2/3 ─────────────────────────────────
       - name: "PHPUnit 測試 (cycle 2/3)"
@@ -672,22 +664,12 @@ jobs:
         id: claude_fix_2
         if: steps.test_cycle_2.outcome == 'failure'
         continue-on-error: true
-        uses: anthropics/claude-code-action@v1
+        uses: ./.github/actions/claude-retry
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-
-          additional_permissions: |
-            actions: read
-          settings: .claude/settings.json
-          plugin_marketplaces: |
-            https://github.com/j7-dev/wp-workflows.git
-          plugins: |
-            wp-workflows@wp-workflows
           prompt: ${{ env.FIX_PROMPT }}
-          claude_args: |
-            --dangerously-skip-permissions
-            --max-turns 60
-            --model opus
+          max_turns: '60'
+          model: opus
 
       # ── 測試循環 3/3（最終測試，無修復）───────────────
       - name: "PHPUnit 測試 (cycle 3/3 - final)"
