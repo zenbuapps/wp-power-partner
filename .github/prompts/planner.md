@@ -13,6 +13,9 @@ Clarifier 已完成需求釐清，規格文件位於 ./specs 目錄。
 - 測試策略（PHP Integration Test / E2E）
 - 風險評估與注意事項
 
+### Git Commit 語言
+- 所有 commit message 必須使用繁體中文撰寫
+
 ### 重要規則
 - 只做規劃，不要實作程式碼
 - 計畫要具體到可以直接交給 tdd-coordinator 執行
