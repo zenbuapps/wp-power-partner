@@ -1127,11 +1127,11 @@ jobs:
                 .replace(/\(videos\//g, `(${urlPrefix}/`);
               // 方式 B：backtick 格式 `NN-xxx.webm` / `NN-xxx.png` → CDN Markdown 語法
               processedReport = processedReport.replace(
-                /`(\d{2}-[^`]+\.webm)`/g,
+                /`(?:videos\/)?(\d{2}-[^`]+\.webm)`/g,
                 (_, fn) => `[▶️ 觀看操作影片](${urlPrefix}/${fn})`
               );
               processedReport = processedReport.replace(
-                /`(\d{2}-[^`]+\.png)`/g,
+                /`(?:screenshots\/)?(\d{2}-[^`]+\.png)`/g,
                 (_, fn) => `![${fn.replace('.png', '')}](${urlPrefix}/${fn})`
               );
             }
