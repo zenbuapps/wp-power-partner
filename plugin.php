@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Plugin Name:       Power Partner | 讓每個人都可以輕鬆地販售網站模板
  * Plugin URI:        https://cloud.luke.cafe/plugins/power-partner/
@@ -15,18 +16,19 @@
  * Tags: WPCD
  */
 
-declare (strict_types = 1);
+declare(strict_types=1);
 
 namespace J7\PowerPartner;
 
-if ( \class_exists( 'J7\PowerPartner\Plugin' ) ) {
+if (\class_exists('J7\PowerPartner\Plugin')) {
 	return;
 }
 
 require_once __DIR__ . '/vendor/autoload.php';
 
 /** Class Plugin */
-final class Plugin {
+final class Plugin
+{
 	use \J7\WpUtils\Traits\PluginTrait;
 	use \J7\WpUtils\Traits\SingletonTrait;
 
@@ -57,13 +59,14 @@ final class Plugin {
 	<p>這封信很重要，不要刪掉，這樣之後才找得到喔</p><p>&nbsp;</p><p><br></p>';
 
 	/** Constructor */
-	public function __construct() {
+	public function __construct()
+	{
 		$this->required_plugins = [
 			[
 				'name'     => 'Powerhouse',
 				'slug'     => 'powerhouse',
 				'source'   => 'https://github.com/zenbuapps/wp-powerhouse/releases/latest/download/powerhouse.zip',
-				'version'  => '3.3.23',
+				'version'  => '3.3.47',
 				'required' => true,
 			],
 			[
@@ -85,9 +88,9 @@ final class Plugin {
 			[
 				'app_name'         => 'Power Partner',
 				'github_repo'      => 'https://github.com/zenbuapps/wp-power-partner',
-				'callback'         => [ Bootstrap::class, 'instance' ],
+				'callback'         => [Bootstrap::class, 'instance'],
 				'lc'               => false,
-				'submenu_callback' => [ Admin\Menu\Setting::class, 'render_page' ],
+				'submenu_callback' => [Admin\Menu\Setting::class, 'render_page'],
 			]
 		);
 	}
@@ -97,7 +100,8 @@ final class Plugin {
 	 *
 	 * @return void
 	 */
-	public function activate(): void {
+	public function activate(): void
+	{
 		\add_option(
 			'power_partner_settings',
 			[
@@ -114,7 +118,7 @@ final class Plugin {
 					],
 				],
 			]
-			);
+		);
 	}
 
 	/**
@@ -126,8 +130,9 @@ final class Plugin {
 	 * @param int                  $limit 記錄數量
 	 * @return void
 	 */
-	public static function logger( $message = '', $level = 'info', $args = [], $limit = 0 ): void {
-		\J7\WpUtils\Classes\WC::logger($message, $level, $args, 'power_partner', $limit );
+	public static function logger($message = '', $level = 'info', $args = [], $limit = 0): void
+	{
+		\J7\WpUtils\Classes\WC::logger($message, $level, $args, 'power_partner', $limit);
 	}
 }
 
