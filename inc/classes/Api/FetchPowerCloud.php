@@ -12,7 +12,6 @@ abstract class FetchPowerCloud
 {
 	const ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY = 'power_partner_allowed_template_options_powercloud';
 	const OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY   = 'power_partner_open_site_plan_options_powercloud';
-	const ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME = 7 * 24 * HOUR_IN_SECONDS;
 	/**
 	 * 發 API 開站
 	 *
@@ -225,7 +224,7 @@ abstract class FetchPowerCloud
 	/**
 	 * 取得經銷商允許的模板站（新架構 PowerCloud）
 	 * 會先判斷 transient 是否有資料，如果沒有則發 API 取得
-	 * 只在 fetch 成功且結果非空時寫入 transient，避免 API 失敗時把空陣列當有效快取存 7 天
+	 * 只在 fetch 成功且結果非空時寫入 transient（永不到期，手動清除快取或站長調整模板時才更新）
 	 *
 	 * @return array<string, string>
 	 */
@@ -241,7 +240,7 @@ abstract class FetchPowerCloud
 		$allowed_template_options = self::fetch_template_sites_by_user();
 
 		if (! empty($allowed_template_options)) {
-			\set_transient(self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+			\set_transient(self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options);
 		}
 
 		return $allowed_template_options;
@@ -305,7 +304,7 @@ abstract class FetchPowerCloud
 	/**
 	 * 取得開站方案（新架構 PowerCloud）
 	 * 會先判斷 transient 是否有資料，如果沒有則發 API 取得
-	 * 只在 fetch 成功且結果非空時寫入 transient，避免 API 失敗時把空陣列當有效快取存 7 天
+	 * 只在 fetch 成功且結果非空時寫入 transient（永不到期，手動清除快取或站長調整方案時才更新）
 	 *
 	 * @return array<string, string>
 	 */
@@ -321,7 +320,7 @@ abstract class FetchPowerCloud
 		$open_site_plan_options = self::fetch_open_site_plan_options_by_user();
 
 		if (! empty($open_site_plan_options)) {
-			\set_transient(self::OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY, $open_site_plan_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+			\set_transient(self::OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY, $open_site_plan_options);
 		}
 
 		return $open_site_plan_options;

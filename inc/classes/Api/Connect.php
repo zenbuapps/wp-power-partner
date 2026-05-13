@@ -158,7 +158,7 @@ final class Connect {
 		if ( ! empty( $partner_id ) ) {
 			\update_option( self::PARTNER_ID_OPTION_NAME, $partner_id );
 			\update_option( Plugin::$snake . '_account_info', $encrypted_account_info );
-			\set_transient( Fetch::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, (array) $allowed_template_options, Fetch::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME );
+			\set_transient( Fetch::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, (array) $allowed_template_options );
 			return \rest_ensure_response(
 				[
 					'status'  => 200,

@@ -10,8 +10,6 @@ use J7\PowerPartner\Bootstrap;
 abstract class Fetch {
 
 	const ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY = 'power_partner_allowed_template_options';
-	// phpstan:ignore
-	const ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME = 7 * 24 * HOUR_IN_SECONDS;
 
 	/**
 	 * 發 API 開站
@@ -193,7 +191,7 @@ abstract class Fetch {
 				$allowed_template_options[ (string) $site->ID ] = $site->post_title;
 			}
 
-			\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME );
+			\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options );
 		}
 
 		/** @var array<string, string> $allowed_template_options */
