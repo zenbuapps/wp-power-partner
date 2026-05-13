@@ -225,22 +225,25 @@ abstract class FetchPowerCloud
 	/**
 	 * 取得經銷商允許的模板站（新架構 PowerCloud）
 	 * 會先判斷 transient 是否有資料，如果沒有則發 API 取得
+	 * 只在 fetch 成功且結果非空時寫入 transient，避免 API 失敗時把空陣列當有效快取存 7 天
 	 *
 	 * @return array<string, string>
 	 */
 	public static function get_allowed_template_options(): array
 	{
-
 		$allowed_template_options = \get_transient(self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY);
-		$allowed_template_options = is_array($allowed_template_options) ? $allowed_template_options : [];
 
-		if (empty($allowed_template_options)) {
-			$allowed_template_options = self::fetch_template_sites_by_user();
+		if (is_array($allowed_template_options) && ! empty($allowed_template_options)) {
+			/** @var array<string, string> $allowed_template_options */
+			return $allowed_template_options;
 		}
 
-		\set_transient(self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+		$allowed_template_options = self::fetch_template_sites_by_user();
 
-		/** @var array<string, string> $allowed_template_options */
+		if (! empty($allowed_template_options)) {
+			\set_transient(self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, $allowed_template_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+		}
+
 		return $allowed_template_options;
 	}
 
@@ -270,6 +273,18 @@ abstract class FetchPowerCloud
 		]);
 
 		if (\is_wp_error($response)) {
+			Plugin::logger('fetch_template_sites_by_user wp_error', 'error', [
+				'error' => $response->get_error_message(),
+			]);
+			return [];
+		}
+
+		$response_code = (int) \wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			Plugin::logger('fetch_template_sites_by_user http error', 'error', [
+				'response_code' => $response_code,
+				'body'          => \wp_remote_retrieve_body($response),
+			]);
 			return [];
 		}
 
@@ -290,21 +305,25 @@ abstract class FetchPowerCloud
 	/**
 	 * 取得開站方案（新架構 PowerCloud）
 	 * 會先判斷 transient 是否有資料，如果沒有則發 API 取得
+	 * 只在 fetch 成功且結果非空時寫入 transient，避免 API 失敗時把空陣列當有效快取存 7 天
 	 *
 	 * @return array<string, string>
 	 */
 	public static function get_open_site_plan_options(): array
 	{
 		$open_site_plan_options = \get_transient(self::OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY);
-		$open_site_plan_options = is_array($open_site_plan_options) ? $open_site_plan_options : [];
 
-		if (empty($open_site_plan_options)) {
-			$open_site_plan_options = self::fetch_open_site_plan_options_by_user();
+		if (is_array($open_site_plan_options) && ! empty($open_site_plan_options)) {
+			/** @var array<string, string> $open_site_plan_options */
+			return $open_site_plan_options;
 		}
 
-		\set_transient(self::OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY, $open_site_plan_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+		$open_site_plan_options = self::fetch_open_site_plan_options_by_user();
 
-		/** @var array<string, string> $open_site_plan_options */
+		if (! empty($open_site_plan_options)) {
+			\set_transient(self::OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY, $open_site_plan_options, self::ALLOWED_TEMPLATE_OPTIONS_CACHE_TIME);
+		}
+
 		return $open_site_plan_options;
 	}
 
@@ -333,6 +352,18 @@ abstract class FetchPowerCloud
 		$response = \wp_remote_get(Bootstrap::instance()->powercloud_api . '/website-packages?page=1&limit=250&isActive=true', $args);
 
 		if (\is_wp_error($response)) {
+			Plugin::logger('fetch_open_site_plan_options_by_user wp_error', 'error', [
+				'error' => $response->get_error_message(),
+			]);
+			return [];
+		}
+
+		$response_code = (int) \wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			Plugin::logger('fetch_open_site_plan_options_by_user http error', 'error', [
+				'response_code' => $response_code,
+				'body'          => \wp_remote_retrieve_body($response),
+			]);
 			return [];
 		}
 
