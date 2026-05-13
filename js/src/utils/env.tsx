@@ -39,3 +39,5 @@ export const disable_site_after_n_days: number =
     window?.[APP_DOMAIN]?.env?.disable_site_after_n_days ?? 7
 
 export const POWERCLOUD_API = window?.[APP_DOMAIN]?.env?.POWERCLOUD_API || ''
+export const powercloud_api_key: string =
+    window?.[APP_DOMAIN]?.env?.powercloud_api_key || ''

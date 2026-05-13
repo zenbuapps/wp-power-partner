@@ -113,16 +113,36 @@ const Login = () => {
 const Logout = () => {
 	const setIdentity = useSetAtom(powercloudIdentityAtom)
 
+	const { mutate: deleteApiKey, isPending: isPendingDelete } = useMutation({
+		mutationFn: () => axios.delete(`/${kebab}/powercloud-api-key`),
+	})
+
 	const handleLogout = () => {
-		setIdentity({
-			status: EPowercloudIdentityStatusEnum.UN_LOGIN,
-			message: '',
-			apiKey: '',
+		deleteApiKey(undefined, {
+			onSuccess: () => {
+				setIdentity({
+					status: EPowercloudIdentityStatusEnum.UN_LOGIN,
+					message: '',
+					apiKey: '',
+				})
+			},
+			onError: (error: any) => {
+				notification.error({
+					message: '登出失敗',
+					description:
+						error?.response?.data?.message || error?.message || '請稍後再試',
+				})
+			},
 		})
 	}
 	return (
 		<div>
-			<Button variant="outlined" danger onClick={handleLogout}>
+			<Button
+				variant="outlined"
+				danger
+				onClick={handleLogout}
+				loading={isPendingDelete}
+			>
 				登出
 			</Button>
 		</div>

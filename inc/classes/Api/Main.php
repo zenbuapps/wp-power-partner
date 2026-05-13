@@ -185,6 +185,18 @@ final class Main
 				},
 			]
 		);
+
+		\register_rest_route(
+			Plugin::$kebab,
+			'powercloud-api-key',
+			[
+				'methods'             => 'DELETE',
+				'callback'            => [$this, 'delete_powercloud_api_key_callback'],
+				'permission_callback' => function () {
+					return \current_user_can('manage_options');
+				},
+			]
+		);
 	}
 
 	/**
@@ -914,6 +926,26 @@ final class Main
 			[
 				'status'  => 200,
 				'message' => 'update powercloud api key success',
+			],
+			200
+		);
+	}
+
+	/**
+	 * Delete powercloud API key callback
+	 * 清除全域 PowerCloud API Key transient
+	 *
+	 * @param \WP_REST_Request $request Request object.
+	 * @return \WP_REST_Response
+	 */
+	public function delete_powercloud_api_key_callback($request): \WP_REST_Response
+	{
+		\delete_transient(Main::POWERCLOUD_API_KEY_TRANSIENT_KEY);
+
+		return new \WP_REST_Response(
+			[
+				'status'  => 200,
+				'message' => 'delete powercloud api key success',
 			],
 			200
 		);

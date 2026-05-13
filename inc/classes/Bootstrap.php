@@ -94,6 +94,12 @@ final class Bootstrap {
 
 		$power_partner_settings = (array) \get_option( 'power_partner_settings', [] );
 
+		$powercloud_api_key = '';
+		if ( \current_user_can( 'manage_options' ) ) {
+			$stored_key         = \get_transient( Api\Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
+			$powercloud_api_key = \is_string( $stored_key ) ? $stored_key : '';
+		}
+
 		\wp_localize_script(
 			Plugin::$kebab,
 			Plugin::$snake . '_data',
@@ -119,6 +125,7 @@ final class Bootstrap {
 					't'                         => $this->t,
 					'cloudBaseUrl'              => $this->base_url,
 					'POWERCLOUD_API'            => $this->powercloud_api,
+					'powercloud_api_key'        => $powercloud_api_key,
 					'is_kiwissec'               => strpos( \site_url(), 'kiwissec.io' ) !== false,
 					'myAccountUrl'              => \get_permalink( \wc_get_page_id( 'myaccount' ) ),
 				],

@@ -1,4 +1,5 @@
-import { atomWithStorage } from 'jotai/utils'
+import { atom } from 'jotai'
+import { powercloud_api_key } from '@/utils'
 
 export enum EPowercloudIdentityStatusEnum {
   UN_LOGIN = 'unLogin',
@@ -12,15 +13,13 @@ export type TPowercloudIdentity = {
 }
 
 export const defaultPowercloudIdentity: TPowercloudIdentity = {
-  status: EPowercloudIdentityStatusEnum.UN_LOGIN,
+  status: powercloud_api_key
+    ? EPowercloudIdentityStatusEnum.LOGGED_IN
+    : EPowercloudIdentityStatusEnum.UN_LOGIN,
   message: '',
-  apiKey: '',
+  apiKey: powercloud_api_key,
 }
 
-const POWERCLOUD_IDENTITY_STORAGE_KEY = 'power-partner-powercloud-identity'
-
-export const powercloudIdentityAtom = atomWithStorage<TPowercloudIdentity>(
-	POWERCLOUD_IDENTITY_STORAGE_KEY,
+export const powercloudIdentityAtom = atom<TPowercloudIdentity>(
 	defaultPowercloudIdentity
 )
-
