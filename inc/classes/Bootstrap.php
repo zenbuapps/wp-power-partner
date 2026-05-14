@@ -94,8 +94,12 @@ final class Bootstrap {
 
 		$power_partner_settings = (array) \get_option( 'power_partner_settings', [] );
 
+		// AdminApp (wp-admin) 要 manage_options；UserApp (frontend shortcode) 只要登入即可
 		$powercloud_api_key = '';
-		if ( \current_user_can( 'manage_options' ) ) {
+		$can_access_key     = \is_admin()
+			? \current_user_can( 'manage_options' )
+			: \is_user_logged_in();
+		if ( $can_access_key ) {
 			$stored_key         = \get_transient( Api\Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
 			$powercloud_api_key = \is_string( $stored_key ) ? $stored_key : '';
 		}
