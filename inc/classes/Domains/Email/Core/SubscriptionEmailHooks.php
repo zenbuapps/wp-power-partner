@@ -52,18 +52,37 @@ final class SubscriptionEmailHooks {
 		// 網站訂閱創建後
 		\add_action('pp_site_sync_by_subscription', [ $this, 'schedule_site_sync_email' ], 10, 1);
 
-		// 以下六個時機點，用監聽的 hook 來發信，且只發一次，如果有修改要取消排程，重新排程
+		// 以下時間點，用監聽的 hook 來發信，且只發一次，如果有修改要取消排程，重新排程
 		$mapper = [
 			Action::TRIAL_END->value          => Action::WATCH_TRIAL_END,
 			Action::WATCH_TRIAL_END->value    => Action::WATCH_TRIAL_END,
-			Action::END->value                => Action::WATCH_END,
-			Action::WATCH_END->value          => Action::WATCH_END,
 			Action::NEXT_PAYMENT->value       => Action::WATCH_NEXT_PAYMENT,
 			Action::WATCH_NEXT_PAYMENT->value => Action::WATCH_NEXT_PAYMENT,
 		];
 
+		/**
+		 * 「客戶續訂失敗後」(subscription_failed) 與「訂閱結束」(end) 兩種信，
+		 * 改由真實的訂閱「狀態轉換」觸發，不再走 Powerhouse 的 Action hook。原因：
+		 *   - subscription_failed 原本綁在 Powerhouse「→ cancelled/expired」事件上，
+		 *     導致「已取消」被當成「續訂失敗」而誤寄催繳信。改為進入 on-hold(待處理) 時才寄。
+		 *   - end 原本綁在 watch_end(end 日期被更新) 上，連把訂閱設成「待取消」會動到 end 日期
+		 *     都會誤觸發停用通知。改為真正進入 cancelled/expired(已取消/已過期) 時才寄。
+		 * 觸發改寫見 on_status_updated()。
+		 * 注意：授權碼停用邏輯(LC\Core\LifeCycle) 仍綁 Powerhouse subscription_failed，與此互不影響。
+		 */
+		$rebound_actions = [
+			Action::SUBSCRIPTION_FAILED->value,
+			Action::END->value,
+			Action::WATCH_END->value,
+		];
+
 		// 取得訂閱生命週期勾點
 		foreach (Action::cases() as $action) {
+
+			// 上述兩種信改用訂閱狀態轉換觸發，這裡略過不綁 Powerhouse Action hook
+			if (in_array($action->value, $rebound_actions, true)) {
+				continue;
+			}
 
 			if (isset($mapper[ $action->value ])) {
 				\add_action(
@@ -89,7 +108,8 @@ final class SubscriptionEmailHooks {
 
 		}
 
-		\add_action(Action::SUBSCRIPTION_SUCCESS->get_action_hook(), [ $this, 'unschedule_email' ], 10, 2);
+		// 用真實的訂閱狀態轉換觸發 subscription_failed / end 兩種信，並在復活/結束時取消未寄出的催繳信
+		\add_action('woocommerce_subscription_status_updated', [ $this, 'on_status_updated' ], 10, 3);
 	}
 
 	/**
@@ -207,25 +227,59 @@ final class SubscriptionEmailHooks {
 	}
 
 	/**
-	 * 取消排程寄信
+	 * 用真實的訂閱狀態轉換觸發 subscription_failed / end 兩種信
 	 *
-	 * @param \WC_Subscription     $subscription 訂閱
-	 * @param array<string, mixed> $args 參數
+	 * 對應客戶心智(也修正先前綁錯觸發點造成的誤寄/重複寄)：
+	 *   - 進入 on-hold(待處理)                 → 寄「客戶續訂失敗後」(subscription_failed) 催繳信
+	 *   - 進入 cancelled/expired(已取消/已過期) → 寄「訂閱結束」(end) 停用通知，並取消尚未寄出的催繳信
+	 *   - 復活回到 active(續訂成功)             → 取消尚未寄出的催繳信
+	 * 設成「待取消」(pending-cancel) 不在此觸發，避免預付期還沒到就誤寄停用通知。
+	 *
+	 * @param mixed  $subscription 訂閱
+	 * @param string $to_status    新狀態(無 wc- 前綴)
+	 * @param string $from_status  舊狀態(無 wc- 前綴)
 	 * @return void
 	 */
-	public function unschedule_email( \WC_Subscription $subscription, $args ): void {
-		$unschedule_actions = [
-			Action::SUBSCRIPTION_FAILED,
-		];
-		$emails             = [];
-		foreach ($unschedule_actions as $action) {
-			$emails = array_merge($emails, $this->get_emails($action->value));
+	public function on_status_updated( $subscription, $to_status, $from_status ): void {
+		if ( ! ( $subscription instanceof \WC_Subscription ) ) {
+			return;
 		}
 
-		foreach ($emails as $email) {
-			$subscription_email           = new SubscriptionEmail($email, $subscription);
-			$subscription_email_scheduler = new SubscriptionEmailScheduler($subscription_email);
-			$subscription_email_scheduler->unschedule($email->action_name);
+		// 進入 on-hold(待處理)：重置並排程「客戶續訂失敗後」催繳信
+		if ( 'on-hold' === $to_status ) {
+			$this->unschedule_failed_emails( $subscription );
+			foreach ( $this->get_emails( Action::SUBSCRIPTION_FAILED->value ) as $email ) {
+				$this->schedule_email( $email, $subscription );
+			}
+			return;
+		}
+
+		// 進入 cancelled/expired(已取消/已過期)：取消未寄出的催繳信，排程「訂閱結束」停用通知
+		if ( in_array( $to_status, [ 'cancelled', 'expired' ], true ) ) {
+			$this->unschedule_failed_emails( $subscription );
+			foreach ( $this->get_emails( Action::END->value ) as $email ) {
+				$this->schedule_email( $email, $subscription );
+			}
+			return;
+		}
+
+		// 復活回到 active：取消未寄出的催繳信
+		if ( 'active' === $to_status && in_array( $from_status, [ 'on-hold', 'pending-cancel', 'cancelled', 'expired' ], true ) ) {
+			$this->unschedule_failed_emails( $subscription );
+		}
+	}
+
+	/**
+	 * 取消尚未寄出的「客戶續訂失敗後」(subscription_failed) 催繳信
+	 *
+	 * @param \WC_Subscription $subscription 訂閱
+	 * @return void
+	 */
+	private function unschedule_failed_emails( \WC_Subscription $subscription ): void {
+		foreach ( $this->get_emails( Action::SUBSCRIPTION_FAILED->value ) as $email ) {
+			$subscription_email           = new SubscriptionEmail( $email, $subscription );
+			$subscription_email_scheduler = new SubscriptionEmailScheduler( $subscription_email );
+			$subscription_email_scheduler->unschedule( $email->action_name );
 		}
 	}
 
