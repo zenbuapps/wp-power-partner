@@ -56,12 +56,10 @@ Customer buys subscription
          │  (time passes...)
          │
   SUBSCRIPTION_FAILED ────────────┬──── DisableHooks::schedule_disable_site()
-                                   │         └── DisableSiteScheduler::schedule_single(now + N days)
+  (Powerhouse: → cancelled/expired)│         └── DisableSiteScheduler::schedule_single(now + N days)
                                    │
                                    └──── LC\LifeCycle::subscription_failed()
-                                   │         └── ExpireHandler::schedule_single(now + 4h)
-                                   │
-                                   └──── SubscriptionEmailHooks (fires subscription_failed emails)
+                                             └── ExpireHandler::schedule_single(now + 4h)
 
          │
          │  (N days later via ActionScheduler)
@@ -74,11 +72,16 @@ Customer buys subscription
   SUBSCRIPTION_SUCCESS ───────────┬──── DisableHooks::cancel_disable_site_schedule()
                                    ├──── DisableHooks::restart_all_stopped_sites_scheduler()
                                    │         └── Fetch::enable_site() / FetchPowerCloud::enable_site()
-                                   ├──── LC\LifeCycle::subscription_success()
-                                   │         └── ExpireHandler::unschedule()
-                                   │         └── CloudApi: license-codes/recover
-                                   └──── SubscriptionEmailHooks::unschedule_email()
-                                             └── 取消 subscription_failed 的排程信件
+                                   └──── LC\LifeCycle::subscription_success()
+                                             └── ExpireHandler::unschedule()
+                                             └── CloudApi: license-codes/recover
+
+  woocommerce_subscription_status_updated ── SubscriptionEmailHooks::on_status_updated()
+         ├── → on-hold:            排程 subscription_failed 催繳信（最少延遲 10 分鐘，先清舊排程）
+         ├── → cancelled/expired:  排程 end 訂閱結束信 + 取消未寄出的催繳信
+         └── → active (復活):      取消未寄出的催繳信
+         （寄送當下 SubscriptionEmailScheduler::action_callback 會複查狀態：
+           催繳信須仍為 on-hold、end 信須仍為 cancelled/expired，否則跳過）
 ```
 
 ---

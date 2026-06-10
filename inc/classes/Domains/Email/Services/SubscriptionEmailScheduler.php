@@ -76,6 +76,33 @@ final class SubscriptionEmailScheduler extends Base {
 			return;
 		}
 
+		// 寄送當下做最終狀態檢查，排程後訂閱狀態可能已經改變（例如自動續訂短暫 on-hold 後馬上回到 active）
+		// 催繳信(subscription_failed)只在訂閱仍為 on-hold(待處理) 時寄送
+		if ( $email->action_name === Action::SUBSCRIPTION_FAILED->value && Status::ON_HOLD !== $status_enum ) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 已不在 on-hold(待處理) 狀態，不寄送催繳信",
+				'info',
+				[
+					'subscription_status' => $subscription_status,
+					'email'               => $email->to_array(),
+				]
+				);
+			return;
+		}
+
+		// 訂閱結束信(end)只在訂閱已為 cancelled/expired(已取消/已過期) 時寄送
+		if ( $email->action_name === Action::END->value && ! in_array( $status_enum, [ Status::CANCELLED, Status::EXPIRED ], true ) ) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 已不在 cancelled/expired(已取消/已過期) 狀態，不寄送訂閱結束信",
+				'info',
+				[
+					'subscription_status' => $subscription_status,
+					'email'               => $email->to_array(),
+				]
+				);
+			return;
+		}
+
 		$last_order = PowerhouseSubscriptionUtils::get_last_order( $subscription );
 		if ( ! $last_order) {
 			return;
