@@ -164,9 +164,10 @@ final class SubscriptionEmailHooks {
 	 *
 	 * @param Email            $email 信件
 	 * @param \WC_Subscription $subscription 訂閱
+	 * @param int              $min_delay 最少延遲秒數，排程時間不會早於 time() + $min_delay
 	 * @return void
 	 */
-	private function schedule_email( Email $email, \WC_Subscription $subscription ): void {
+	private function schedule_email( Email $email, \WC_Subscription $subscription, int $min_delay = 0 ): void {
 		if (!SubscriptionUtils::is_site_sync($subscription)) {
 			return;
 		}
@@ -178,8 +179,9 @@ final class SubscriptionEmailHooks {
 
 		$subscription_email           = new SubscriptionEmail($email, $subscription);
 		$subscription_email_scheduler = new SubscriptionEmailScheduler($subscription_email);
+		$timestamp                    = max( $subscription_email->get_timestamp(), time() + $min_delay );
 		$subscription_email_scheduler->maybe_unschedule($email->action_name, $email->unique);
-		$subscription_email_scheduler->schedule_single($subscription_email->get_timestamp(), $email->action_name);
+		$subscription_email_scheduler->schedule_single($timestamp, $email->action_name);
 	}
 
 	/**
@@ -246,10 +248,13 @@ final class SubscriptionEmailHooks {
 		}
 
 		// 進入 on-hold(待處理)：重置並排程「客戶續訂失敗後」催繳信
+		// 注意：WCS 每次排程續訂(自動扣款也一樣)都會先把訂閱短暫轉成 on-hold，
+		// 扣款成功後馬上轉回 active 並由下方 active 分支取消排程。
+		// 給最少 10 分鐘緩衝，避免 days=0 的催繳信在付款完成前被 ActionScheduler 搶先寄出。
 		if ( 'on-hold' === $to_status ) {
 			$this->unschedule_failed_emails( $subscription );
 			foreach ( $this->get_emails( Action::SUBSCRIPTION_FAILED->value ) as $email ) {
-				$this->schedule_email( $email, $subscription );
+				$this->schedule_email( $email, $subscription, 10 * MINUTE_IN_SECONDS );
 			}
 			return;
 		}
