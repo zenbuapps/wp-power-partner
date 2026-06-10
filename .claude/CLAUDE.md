@@ -179,10 +179,14 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 | 值 | 發送時機 |
 |---|---|
 | `site_sync` | 開站完成後 |
-| `subscription_failed` | 訂閱 active → cancelled/on-hold |
-| `subscription_success` | 訂閱 failed → active |
-| `trial_end` / `next_payment` / `end` | 訂閱里程碑時 |
-| `watch_trial_end` / `watch_next_payment` / `watch_end` | 前/後 N 天（unique，設定變更時重排） |
+| `subscription_failed` | 訂閱進入 on-hold（待處理/催繳階段），寄送當下仍須為 on-hold 才會真的寄出；回到 active 或進入 cancelled/expired 時取消排程 |
+| `subscription_success` | Powerhouse failed → active（stock WCS 不允許 cancelled/expired → active，此信實際上不會觸發，見 issue #14 follow-up） |
+| `end` | 訂閱進入 cancelled/expired（已取消/已過期），寄送當下仍須為 cancelled/expired |
+| `trial_end` / `next_payment` | 訂閱里程碑時 |
+| `watch_trial_end` / `watch_next_payment` | 前/後 N 天（unique，設定變更時重排） |
+| `watch_end` | **已停用**（v3.3.7 起 `end` 改由狀態轉換觸發，UI 從未提供此選項） |
+
+注意：`subscription_failed` / `end` 兩種信由 `woocommerce_subscription_status_updated`（`SubscriptionEmailHooks::on_status_updated()`）觸發，**不走** Powerhouse Action hook；其餘仍走 Powerhouse。WCS 每次排程續訂都會短暫 active → on-hold → active，催繳信因此固定有最少 10 分鐘排程緩衝 + 寄送當下狀態複查。
 
 ### 支援的 ##TOKEN## 值
 
