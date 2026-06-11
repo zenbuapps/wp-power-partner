@@ -261,6 +261,25 @@ Renders a React app (App2) showing the current logged-in customer's provisioned 
 
 ---
 
+## Changelog
+
+### Unreleased
+
+#### fix(email): 修正「客戶續訂成功後」信從未寄出的問題（issue #16）
+
+**問題根源**：`subscription_success` 信原本綁定 Powerhouse `SUBSCRIPTION_SUCCESS` hook，但 stock WCS 不允許 cancelled/expired → active 的狀態轉換，導致此 hook 在正常流程中從未觸發，此信件型別自上線以來實際上從未寄出。
+
+**行為變更**：
+
+- 訂閱從 on-hold（待處理）/ pending-cancel（待取消）等狀態恢復為 active 時觸發成功信排程，**每次成功續訂都會寄一封**（符合 UI 標籤「續訂成功後 N 天發送」語意）
+- pending → active（首次付款啟用）**不觸發**成功信，避免與開站信重疊
+- 防線機制：最少延遲 10 分鐘 + 寄送當下狀態複查（須仍為 active）+ 離開 active 時自動取消未寄成功信
+- 反向對稱取消：催繳信與成功信互相取消，防止 WCS 自動續訂 active → on-hold → active 震盪期間誤寄或兩封同時寄出
+
+**站長注意**：已勾選「客戶續訂成功後」Email 模板的站長，此為行為改變（過去靜默無作用，現在會實際寄出）。如不需要可至 **Powerhouse → Power Partner → Email 設定** 停用該模板。
+
+---
+
 ## Contributing
 
 All PHP must pass PHPCS (WPCS rules) and PHPStan (configured in `phpstan.neon`).  

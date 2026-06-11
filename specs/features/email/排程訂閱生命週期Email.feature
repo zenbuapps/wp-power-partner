@@ -45,12 +45,42 @@ Feature: 排程訂閱生命週期Email
       Then 系統為 key-2 建立 ActionScheduler 排程
       And 排程執行時間為「2026-04-11 - 3 天 = 2026-04-08 00:00:00」
 
-  Rule: 後置（狀態）- 訂閱恢復（SUBSCRIPTION_SUCCESS）時取消失敗相關 Email 排程
+  Rule: 後置（狀態）- 訂閱恢復（→ active）時排程成功信並取消催繳信
 
-    Example: 訂閱恢復後取消 subscription_failed 的 Email 排程
-      Given 訂閱 #500 有 pending 的 subscription_failed Email 排程
-      When WooCommerce 觸發 SUBSCRIPTION_SUCCESS hook
+    Example: 訂閱從 on-hold 恢復時排程 subscription_success Email
+      Given 系統中有以下 Email 模板：
+        | key   | enabled | action_name          | subject      | body          | days | operator |
+        | key-4 | 1       | subscription_success | 續訂成功通知 | 感謝您續訂... | 0    | after    |
+      And 訂閱 #500 有 pending 的 subscription_failed Email 排程
+      When 訂閱 #500 狀態從 on-hold 變更為 active
       Then 系統取消所有 subscription_failed 的 pending Email 排程
+      And 系統為 key-4 建立 ActionScheduler 排程
+      And 排程執行時間至少距現在 10 分鐘
+      And 排程 hook 為 "power_partner/3.1.0/email/scheduler"
+      And 排程參數包含 email_key: "key-4", subscription_id: 500, action_name: "subscription_success"
+
+    Example: pending → active（首次付款啟用）不排程成功信
+      Given 訂閱 #500 狀態為 wc-pending
+      When 訂閱 #500 狀態從 pending 變更為 active
+      Then 不會為 subscription_success 建立排程
+
+    Example: 離開 active（→ on-hold）時取消未寄出的成功信
+      Given 訂閱 #500 有 pending 的 subscription_success Email 排程
+      When 訂閱 #500 狀態從 active 變更為 on-hold
+      Then 系統取消所有 subscription_success 的 pending Email 排程
+
+    Example: WCS 自動續訂震盪（active→on-hold→active）最終只寄成功信
+      Given 訂閱 #500 狀態為 wc-active
+      And 系統中有催繳信（key-1）與成功信（key-4）模板
+      When WCS 觸發自動續訂流程（active → on-hold → active）
+      Then 催繳信排程被建立後隨即被取消
+      And 最終只有成功信排程存在
+
+    Example: 寄送當下複查狀態 — 訂閱已非 active 時跳過
+      Given 訂閱 #500 的成功信排程已到期，但訂閱當下狀態為 on-hold
+      When ActionScheduler 執行成功信排程回調
+      Then 系統跳過發送並記錄 log
+      And 不發送 Email
 
   Rule: 後置（狀態）- 排程到期後，發送 Email 並進行 Token 替換
 
