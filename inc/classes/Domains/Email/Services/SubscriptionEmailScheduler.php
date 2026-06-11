@@ -59,14 +59,14 @@ final class SubscriptionEmailScheduler extends Base {
 			return;
 		}
 
-		// 檢查訂閱是否成功
+		// 寄送當下做最終狀態檢查，排程後訂閱狀態可能已經改變（例如自動續訂短暫 on-hold 後馬上回到 active）
 		$subscription_status = $subscription->get_status();
 		$status_enum         = Status::tryFrom( $subscription_status );
-		$is_failed           = $status_enum?->is_failed() ?? true;
-		// 如果訂閱失敗，除了續訂成功的信件不寄送以外，其他都寄
-		if ( $is_failed && $email->action_name === Action::SUBSCRIPTION_SUCCESS->value ) {
+
+		// 續訂成功信(subscription_success)只在訂閱仍為 active(已啟用) 時寄送
+		if ( $email->action_name === Action::SUBSCRIPTION_SUCCESS->value && Status::ACTIVE !== $status_enum ) {
 			Plugin::logger(
-				"訂閱 #{$subscription->get_id()} 續訂失敗，不寄送續訂成功的信件",
+				"訂閱 #{$subscription->get_id()} 已不在 active(已啟用) 狀態，不寄送續訂成功信",
 				'info',
 				[
 					'subscription_status' => $subscription_status,
@@ -76,7 +76,6 @@ final class SubscriptionEmailScheduler extends Base {
 			return;
 		}
 
-		// 寄送當下做最終狀態檢查，排程後訂閱狀態可能已經改變（例如自動續訂短暫 on-hold 後馬上回到 active）
 		// 催繳信(subscription_failed)只在訂閱仍為 on-hold(待處理) 時寄送
 		if ( $email->action_name === Action::SUBSCRIPTION_FAILED->value && Status::ON_HOLD !== $status_enum ) {
 			Plugin::logger(
