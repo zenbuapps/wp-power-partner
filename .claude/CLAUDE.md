@@ -219,3 +219,5 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 9. **延遲寄信 4 分鐘** — PowerCloud 開站後透過 `as_schedule_single_action(time() + 240, ...)` 延遲 4 分鐘發送帳密 Email，暫存資料在 `email_payloads_tmp` meta。
 
 10. **Connect.php 底部有 `new Connect()`** — 這是舊代碼，Connect 類別同時使用 SingletonTrait 和底部 `new Connect()` 初始化。
+
+11. **PowerCloud 停用/啟用回傳 bool** — `FetchPowerCloud::disable_site()` / `enable_site()` 只有 HTTP 2xx 才回傳 `true`（issue #13）。呼叫端必須依回傳值決定訂單備註與 log 等級，不可無條件記成功。另外 PowerCloud API key 禁止 raw 落地 log，一律經 `mask_api_key()` 遮罩（len + sha256 前綴）。
