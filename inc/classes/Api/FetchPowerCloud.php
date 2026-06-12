@@ -136,9 +136,9 @@ abstract class FetchPowerCloud
 	 *
 	 * @param string $current_user_id 當前用戶 ID
 	 * @param string $website_id      網站 ID
-	 * @return void
+	 * @return bool 是否停用成功（HTTP 2xx 才視為成功）
 	 */
-	public static function disable_site(string $current_user_id, string $website_id): void
+	public static function disable_site(string $current_user_id, string $website_id): bool
 	{
 		$powercloud_api_key = self::get_powercloud_api_key((string) $current_user_id);
 
@@ -162,7 +162,22 @@ abstract class FetchPowerCloud
 					'websiteId'       => $website_id,
 				]
 			);
-			return;
+			return false;
+		}
+
+		$response_code = (int) \wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			Plugin::logger(
+				'disable_site http error',
+				'error',
+				[
+					'current_user_id' => $current_user_id,
+					'websiteId'       => $website_id,
+					'response_code'   => $response_code,
+					'body'            => \wp_remote_retrieve_body($response),
+				]
+			);
+			return false;
 		}
 
 		Plugin::logger(
@@ -171,9 +186,10 @@ abstract class FetchPowerCloud
 			[
 				'current_user_id' => $current_user_id,
 				'websiteId'       => $website_id,
-				'response'        => $response,
+				'response_code'   => $response_code,
 			]
 		);
+		return true;
 	}
 
 	/**
@@ -181,9 +197,9 @@ abstract class FetchPowerCloud
 	 *
 	 * @param string $current_user_id 當前用戶 ID
 	 * @param string $website_id      網站 ID
-	 * @return void
+	 * @return bool 是否啟用成功（HTTP 2xx 才視為成功）
 	 */
-	public static function enable_site(string $current_user_id, string $website_id): void
+	public static function enable_site(string $current_user_id, string $website_id): bool
 	{
 		$powercloud_api_key = self::get_powercloud_api_key((string) $current_user_id);
 
@@ -207,7 +223,22 @@ abstract class FetchPowerCloud
 					'websiteId'       => $website_id,
 				]
 			);
-			return;
+			return false;
+		}
+
+		$response_code = (int) \wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			Plugin::logger(
+				'enable_site http error',
+				'error',
+				[
+					'current_user_id' => $current_user_id,
+					'websiteId'       => $website_id,
+					'response_code'   => $response_code,
+					'body'            => \wp_remote_retrieve_body($response),
+				]
+			);
+			return false;
 		}
 
 		Plugin::logger(
@@ -216,9 +247,10 @@ abstract class FetchPowerCloud
 			[
 				'current_user_id' => $current_user_id,
 				'websiteId'       => $website_id,
-				'response'        => $response,
+				'response_code'   => $response_code,
 			]
 		);
+		return true;
 	}
 
 	/**
@@ -268,7 +300,7 @@ abstract class FetchPowerCloud
 
 		Plugin::logger("[GET] /templates/wordpress", 'debug', [
 			'response' => $response,
-			'powercloud_api_key' => $powercloud_api_key
+			'powercloud_api_key' => self::mask_api_key($powercloud_api_key)
 		]);
 
 		if (\is_wp_error($response)) {
@@ -452,6 +484,20 @@ abstract class FetchPowerCloud
 	}
 
 	/**
+	 * 遮罩 API Key，只記錄長度與 sha256 前綴供辨識，避免完整 key 落地 log
+	 *
+	 * @param mixed $key API Key
+	 * @return string
+	 */
+	private static function mask_api_key(mixed $key): string
+	{
+		if (!is_string($key) || '' === $key) {
+			return '(empty)';
+		}
+		return sprintf('len=%d sha256:%s', strlen($key), substr(hash('sha256', $key), 0, 8));
+	}
+
+	/**
 	 * 取得 PowerCloud API Key
 	 *
 	 * @param string $user_id 用戶 ID
@@ -464,8 +510,8 @@ abstract class FetchPowerCloud
 		$key = \get_transient(Main::POWERCLOUD_API_KEY_TRANSIENT_KEY);
 
 		Plugin::logger('powercloud_api_key', 'debug', [
-			'legacy' => $legacy,
-			'key' => $key,
+			'legacy' => self::mask_api_key($legacy),
+			'key' => self::mask_api_key($key),
 		]);
 
 		if ($key) {

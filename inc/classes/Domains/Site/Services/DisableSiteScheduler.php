@@ -111,11 +111,16 @@ final class DisableSiteScheduler extends Base {
 				// 優先從 pp_linked_site_ids 取 websiteId（涵蓋自動開站 + 手動綁定）
 				if (!empty($linked_site_ids)) {
 					foreach ($linked_site_ids as $site_id) {
-						$reason = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}";
-						FetchPowerCloud::disable_site((string) $current_user_id, (string) $site_id);
-						$subscription->add_order_note($reason);
+						$site_id = (string) $site_id;
+						$success = FetchPowerCloud::disable_site((string) $current_user_id, $site_id);
+						if ($success) {
+							$note = "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}";
+						} else {
+							$note = "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}，請檢查 PowerCloud API";
+						}
+						$subscription->add_order_note($note);
 						$subscription->save();
-						Plugin::logger($reason, 'info');
+						Plugin::logger($note, $success ? 'info' : 'error');
 					}
 					continue;
 				}
@@ -146,11 +151,15 @@ final class DisableSiteScheduler extends Base {
 					continue;
 				}
 
-				$reason = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}";
-				FetchPowerCloud::disable_site((string) $current_user_id, $website_id);
-				$subscription->add_order_note($reason);
+				$success = FetchPowerCloud::disable_site((string) $current_user_id, $website_id);
+				if ($success) {
+					$note = "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}";
+				} else {
+					$note = "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}，請檢查 PowerCloud API";
+				}
+				$subscription->add_order_note($note);
 				$subscription->save();
-				Plugin::logger($reason, 'info');
+				Plugin::logger($note, $success ? 'info' : 'error');
 				continue;
 			}
 		}

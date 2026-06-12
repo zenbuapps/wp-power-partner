@@ -97,12 +97,17 @@ final class DisableHooks {
 			if ($host_type === LinkedSites::DEFAULT_HOST_TYPE) {
 				if (!empty($linked_site_ids)) {
 					foreach ($linked_site_ids as $site_id) {
-						FetchPowerCloud::enable_site((string) $current_user_id, (string) $site_id);
+						$site_id = (string) $site_id;
+						$success = FetchPowerCloud::enable_site((string) $current_user_id, $site_id);
+						if (!$success) {
+							$subscription->add_order_note("重新啟用網站失敗，websiteId: {$site_id}，請檢查 PowerCloud API");
+							$subscription->save();
+						}
 						Plugin::logger(
-							'restart WordPress site success',
-							'info',
+							$success ? 'restart WordPress site success' : 'restart WordPress site failed',
+							$success ? 'info' : 'error',
 							[
-								'websiteId'       => (string) $site_id,
+								'websiteId'       => $site_id,
 								'subscription_id' => $subscription_id,
 							]
 						);
@@ -136,10 +141,14 @@ final class DisableHooks {
 					continue;
 				}
 
-				FetchPowerCloud::enable_site((string) $current_user_id, $website_id);
+				$success = FetchPowerCloud::enable_site((string) $current_user_id, $website_id);
+				if (!$success) {
+					$subscription->add_order_note("重新啟用網站失敗，websiteId: {$website_id}，請檢查 PowerCloud API");
+					$subscription->save();
+				}
 				Plugin::logger(
-					'restart WordPress site success',
-					'info',
+					$success ? 'restart WordPress site success' : 'restart WordPress site failed',
+					$success ? 'info' : 'error',
 					[
 						'websiteId'       => $website_id,
 						'subscription_id' => $subscription_id,
