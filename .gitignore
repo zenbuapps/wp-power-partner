@@ -42,3 +42,6 @@ release/*
 # WordPress 測試環境目錄
 wp-content/
 
+
+# wp-env 本機覆寫設定
+.wp-env.override.json
