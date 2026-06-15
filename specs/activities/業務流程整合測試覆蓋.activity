@@ -1,0 +1,21 @@
+[ACTIVITY] 業務流程整合測試覆蓋
+[ACTOR] WooCommerce -> {specs/actors/WooCommerce.md}
+[ACTOR] ActionScheduler -> {specs/actors/ActionScheduler.md}
+[ACTOR] PowerCloud -> {specs/actors/PowerCloud.md}
+[ACTOR] CloudServer -> {specs/actors/CloudServer.md}
+
+[STEP:1] @WooCommerce 訂閱首次付款完成觸發開站編排（缺口 #1） {features/it-coverage/開站編排整合測試.feature}
+
+[FORK:1a]
+  [PARALLEL:1a] @PowerCloud 開站成功（201）後暫存帳密並排程 4 分鐘延遲發信 {features/it-coverage/開站編排整合測試.feature}
+  [PARALLEL:1a] @CloudServer 首次付款建立授權碼並寄送開通信（缺口 #2） {features/it-coverage/授權碼生命週期整合測試.feature}
+[JOIN:1a]
+
+[STEP:2] @ActionScheduler 延遲發信 callback 讀取 email_payloads_tmp 發信後刪除 meta {features/it-coverage/開站編排整合測試.feature}
+
+[DECISION:2a] 訂閱後續狀態轉換
+  [BRANCH:2a:active 變為失敗狀態] @WooCommerce 排程 N 天後關站 + 4 小時後停用授權碼（缺口 #3 排程層） {features/it-coverage/關站排程編排整合測試.feature}
+  [BRANCH:2a:失敗狀態變回 active] @WooCommerce 取消關站排程並重新啟用所有停止的網站 {features/it-coverage/關站排程編排整合測試.feature}
+[MERGE:2a]
+
+[STEP:3] @ActionScheduler 恢復時逐站依架構呼叫 enable，失敗則寫「重新啟用網站失敗」備註（缺口 #3 啟用路徑） {features/it-coverage/關站排程編排整合測試.feature}
