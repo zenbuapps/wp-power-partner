@@ -105,8 +105,8 @@ Customer buys subscription
 ### `Domains\Site`
 管理網站停用/恢復排程。
 
-- **`Core\DisableHooks`** — Singleton。`SUBSCRIPTION_FAILED` → 排程停用；`SUBSCRIPTION_SUCCESS` → 取消排程 + 重新啟用。PowerCloud 啟用失敗（非 2xx / WP_Error）時寫入「重新啟用網站失敗」訂單備註 + error log。
-- **`Services\DisableSiteScheduler`** — ActionScheduler 包裝。args 包含 `{subscription_id}`。PowerCloud 停用依 `FetchPowerCloud::disable_site()` 回傳值寫入「已停用網站」或「停用網站失敗」訂單備註（issue #13：API 失敗不再被誤記為成功）。
+- **`Core\DisableHooks`** — Singleton。`SUBSCRIPTION_FAILED` → 排程停用；`SUBSCRIPTION_SUCCESS` → 取消排程 + 重新啟用。重新啟用時逐站以 `LinkedSites::resolve_host_type()` 判斷架構（與停用對齊），WPCD / PowerCloud 啟用失敗（非 2xx / WP_Error）時皆寫入「重新啟用網站失敗」訂單備註 + error log（issue #18）。
+- **`Services\DisableSiteScheduler`** — ActionScheduler 包裝。args 包含 `{subscription_id}`。停用時**逐站**以 `LinkedSites::resolve_host_type($product_host_type, $site_id)` 判斷架構（明確 host_type 優先；空值時依 site id 格式推斷：數字=WPCD、其餘=PowerCloud），不再「空值一律 powercloud」（issue #18）。WPCD 與 PowerCloud 路徑皆依回傳值寫入「已停用網站」或「停用網站失敗」訂單備註（issue #13 / #18：API 失敗不再被誤記為成功）。
 
 ### `Domains\LC`（License Codes）
 管理授權碼生命週期，透過 `cloud.luke.cafe` API（Powerhouse CloudApi）。
@@ -128,8 +128,8 @@ Customer buys subscription
 Abstract class。透過 HTTP Basic Auth 與 `cloud.luke.cafe` 通訊。
 
 - `site_sync(array $props)` — POST `/wp-json/power-partner-server/site-sync`
-- `disable_site(string $site_id, string $reason)` — POST `.../v2/disable-site`
-- `enable_site(string $site_id)` — POST `.../v2/enable-site`
+- `disable_site(string $site_id, string $reason): bool` — POST `.../v2/disable-site`，HTTP 2xx 才回傳 `true`；`partner_id` 為空時直接回 `false` 不送出（issue #18）
+- `enable_site(string $site_id): bool` — POST `.../v2/enable-site`，HTTP 2xx 才回傳 `true`；`partner_id` 為空時直接回 `false` 不送出（issue #18）
 - `get_allowed_template_options()` — 取得 + 快取模板列表（7 天 transient）
 
 ### `Api\FetchPowerCloud`（新架構）

@@ -86,82 +86,79 @@ final class DisableSiteScheduler extends Base {
 				continue;
 			}
 
-			// 從product獲取 host_type
-			$host_type = \get_post_meta( $product_id, LinkedSites::HOST_TYPE_FIELD_NAME, true );
-			if ( empty( $host_type ) ) {
-				$host_type = LinkedSites::DEFAULT_HOST_TYPE;
-			}
+			// 產品 host_type 欄位（migration 前的舊產品可能為空）
+			$product_host_type = (string) \get_post_meta( $product_id, LinkedSites::HOST_TYPE_FIELD_NAME, true );
 
-			// 如果 host_type 為 WPCD 舊架構
-			if ($host_type === LinkedSites::WPCD_HOST_TYPE) {
-				foreach ( $linked_site_ids as $site_id ) {
-					$site_id_str = (string) $site_id;
-					$reason      = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，網站ID: {$site_id_str}";
-					Fetch::disable_site( $site_id_str, $reason );
-					$subscription->add_order_note( $reason );
-					$subscription->save();
-					Plugin::logger($reason);
+			// 有 pp_linked_site_ids：逐站依實際架構停用
+			// 架構由 LinkedSites::resolve_host_type 判斷（明確 host_type 優先，空值時以 id 格式推斷：數字=WPCD、其餘=PowerCloud）
+			// 不再「空值一律 powercloud」，避免把舊 WPCD 站（數字 id）誤導去 PowerCloud API 而靜默失敗（issue #18）
+			if (!empty($linked_site_ids)) {
+				foreach ($linked_site_ids as $site_id) {
+					$site_id = (string) $site_id;
+					if ('' === $site_id) {
+						continue;
+					}
 
-				}
-				continue;
-			}
+					$host_type = LinkedSites::resolve_host_type($product_host_type, $site_id);
 
-			// 如果 host_type 為 PowerCloud 新架構
-			if ($host_type === LinkedSites::DEFAULT_HOST_TYPE) {
-				// 優先從 pp_linked_site_ids 取 websiteId（涵蓋自動開站 + 手動綁定）
-				if (!empty($linked_site_ids)) {
-					foreach ($linked_site_ids as $site_id) {
-						$site_id = (string) $site_id;
+					if (LinkedSites::WPCD_HOST_TYPE === $host_type) {
+						// WPCD 舊架構（cloud.luke.cafe）
+						$reason  = "停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，網站ID: {$site_id}";
+						$success = Fetch::disable_site($site_id, $reason);
+						$note    = $success
+							? "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，網站ID: {$site_id}"
+							: "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，網站ID: {$site_id}，請檢查 WPCD API 與 partner_id 設定";
+					} else {
+						// PowerCloud 新架構（api.wpsite.pro）
 						$success = FetchPowerCloud::disable_site((string) $current_user_id, $site_id);
-						if ($success) {
-							$note = "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}";
-						} else {
-							$note = "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}，請檢查 PowerCloud API";
-						}
-						$subscription->add_order_note($note);
-						$subscription->save();
-						Plugin::logger($note, $success ? 'info' : 'error');
+						$note    = $success
+							? "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}"
+							: "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$site_id}，請檢查 PowerCloud API";
 					}
-					continue;
-				}
 
-				// Fallback: 從 order item meta 提取 websiteId（相容舊資料）
-				$website_id = null;
-				$order_item = $item->get_meta(SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY);
-
-				if (is_string($order_item) && !empty($order_item)) {
-					$responses = json_decode($order_item, true);
-					if (is_array($responses) && !empty($responses)) {
-						$first_response = $responses[0];
-						if (is_array($first_response) && isset($first_response['data']) && is_array($first_response['data']) && isset($first_response['data']['websiteId'])) {
-							$website_id = (string) $first_response['data']['websiteId'];
-						}
-					}
+					$subscription->add_order_note($note);
+					$subscription->save();
+					Plugin::logger($note, $success ? 'info' : 'error');
 				}
-
-				if (empty($website_id)) {
-					Plugin::logger(
-						"訂閱 #{$subscription_id} 的訂單項目 #{$item->get_id()} 找不到 websiteId",
-						'error',
-						[
-							'order_item' => $order_item,
-							'item_id'    => $item->get_id(),
-						]
-					);
-					continue;
-				}
-
-				$success = FetchPowerCloud::disable_site((string) $current_user_id, $website_id);
-				if ($success) {
-					$note = "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}";
-				} else {
-					$note = "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}，請檢查 PowerCloud API";
-				}
-				$subscription->add_order_note($note);
-				$subscription->save();
-				Plugin::logger($note, $success ? 'info' : 'error');
 				continue;
 			}
+
+			// Fallback: 無 pp_linked_site_ids 時，從 order item meta 提取 PowerCloud websiteId（相容舊資料）
+			$website_id = null;
+			$order_item = $item->get_meta(SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY);
+
+			if (is_string($order_item) && !empty($order_item)) {
+				$responses = json_decode($order_item, true);
+				if (is_array($responses) && !empty($responses)) {
+					$first_response = $responses[0];
+					if (is_array($first_response) && isset($first_response['data']) && is_array($first_response['data']) && isset($first_response['data']['websiteId'])) {
+						$website_id = (string) $first_response['data']['websiteId'];
+					}
+				}
+			}
+
+			if (empty($website_id)) {
+				Plugin::logger(
+					"訂閱 #{$subscription_id} 的訂單項目 #{$item->get_id()} 找不到 websiteId",
+					'error',
+					[
+						'order_item' => $order_item,
+						'item_id'    => $item->get_id(),
+					]
+				);
+				continue;
+			}
+
+			$success = FetchPowerCloud::disable_site((string) $current_user_id, $website_id);
+			if ($success) {
+				$note = "已停用網站，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}";
+			} else {
+				$note = "停用網站失敗，訂閱ID: {$subscription_id}，上層訂單號碼: {$order_id}，websiteId: {$website_id}，請檢查 PowerCloud API";
+			}
+			$subscription->add_order_note($note);
+			$subscription->save();
+			Plugin::logger($note, $success ? 'info' : 'error');
+			continue;
 		}
 	}
 

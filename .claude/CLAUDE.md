@@ -221,3 +221,7 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 10. **Connect.php 底部有 `new Connect()`** — 這是舊代碼，Connect 類別同時使用 SingletonTrait 和底部 `new Connect()` 初始化。
 
 11. **PowerCloud 停用/啟用回傳 bool** — `FetchPowerCloud::disable_site()` / `enable_site()` 只有 HTTP 2xx 才回傳 `true`（issue #13）。呼叫端必須依回傳值決定訂單備註與 log 等級，不可無條件記成功。另外 PowerCloud API key 禁止 raw 落地 log，一律經 `mask_api_key()` 遮罩（len + sha256 前綴）。
+
+12. **停用/啟用架構判斷靠 `resolve_host_type`，不靠產品欄位** — 既有站的架構 ground truth 是**連結 site id 格式**，不是產品 `power_partner_host_type`（該欄位只決定新站開哪，且 migration 前舊產品多為空）。`DisableSiteScheduler` / `DisableHooks` 一律**逐站**呼叫 `LinkedSites::resolve_host_type($product_host_type, $site_id)`：明確 host_type 優先，空值時依 id 格式推斷（**純數字=WPCD、其餘=PowerCloud**）。禁止退回「空值預設 powercloud」——舊 WPCD 站（數字 id）會被導去 PowerCloud API 永遠 404、停用靜默失敗、卡照扣（issue #18）。`Fetch::disable_site()` / `enable_site()` 也已改為回傳 bool 並檢查 HTTP status，`partner_id` 為空時直接回 `false` 不送出。
+
+13. **WPCD site id 是數字、PowerCloud websiteId 非純數字** — `resolve_host_type` 的 `ctype_digit()` 推斷依賴此不變量；僅用於 host_type 為空時的世代區分。若未來 PowerCloud 改發純數字 websiteId，需改用更強的判別訊號（如 stored create-response shape）。治標可替舊 WPCD 客戶產品補 `power_partner_host_type = wpcd`。

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Api;
 
 use J7\PowerPartner\Bootstrap;
+use J7\PowerPartner\Plugin;
 
 /** Class Fetch */
 abstract class Fetch {
@@ -72,24 +73,29 @@ abstract class Fetch {
 	 *
 	 * @param string $site_id 網站 ID
 	 * @param string $reason  停用原因
-	 * @return mixed — The response object or WP_REST_Response on failure.
+	 * @return bool 是否停用成功（HTTP 2xx 才視為成功；partner_id 為空或連線失敗回 false）
 	 */
-	public static function disable_site( string $site_id, string $reason = '停用網站' ) {
+	public static function disable_site( string $site_id, string $reason = '停用網站' ): bool {
+		$partner_id = \get_option( Connect::PARTNER_ID_OPTION_NAME );
+		if ( empty( $partner_id ) ) {
+			Plugin::logger(
+				'disable_site 中止：partner_id 未設定，WPCD 後端無法辨識，停用請求不送出',
+				'error',
+				[ 'site_id' => $site_id ]
+			);
+			return false;
+		}
+
 		$body = \wp_json_encode(
 			[
 				'site_id'    => $site_id,
-				'partner_id' => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
+				'partner_id' => $partner_id,
 				'reason'     => $reason,
 			]
 		);
 		if ( false === $body ) {
-			return \rest_ensure_response(
-				[
-					'status'  => 500,
-					'message' => 'wp_json_encode failed',
-					'data'    => null,
-				]
-			);
+			Plugin::logger( 'disable_site wp_json_encode failed', 'error', [ 'site_id' => $site_id ] );
+			return false;
 		}
 		$args     = [
 			'body'    => $body,
@@ -102,41 +108,65 @@ abstract class Fetch {
 		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/disable-site', $args );
 
 		if ( \is_wp_error( $response ) ) {
-			ob_start();
-			print_r( $response ); // phpcs:ignore
-			return \rest_ensure_response(
-				[
-					'status'  => 500,
-					'message' => 'Request Error, the $response is ' . ob_get_clean(),
-					'data'    => null,
-				]
+			Plugin::logger(
+				"disable_site error: {$response->get_error_message()}",
+				'error',
+				[ 'site_id' => $site_id ]
 			);
+			return false;
 		}
 
-		return json_decode( $response['body'] );
+		$response_code = (int) \wp_remote_retrieve_response_code( $response );
+		if ( $response_code < 200 || $response_code >= 300 ) {
+			Plugin::logger(
+				'disable_site http error',
+				'error',
+				[
+					'site_id'       => $site_id,
+					'response_code' => $response_code,
+					'body'          => \wp_remote_retrieve_body( $response ),
+				]
+			);
+			return false;
+		}
+
+		Plugin::logger(
+			'disable_site success',
+			'info',
+			[
+				'site_id'       => $site_id,
+				'response_code' => $response_code,
+			]
+		);
+		return true;
 	}
 
 	/**
 	 * 發 API 啟用 WordPress 網站
 	 *
 	 * @param string $site_id 網站 ID
-	 * @return mixed — The response object or WP_REST_Response on failure.
+	 * @return bool 是否啟用成功（HTTP 2xx 才視為成功；partner_id 為空或連線失敗回 false）
 	 */
-	public static function enable_site( string $site_id ) {
+	public static function enable_site( string $site_id ): bool {
+		$partner_id = \get_option( Connect::PARTNER_ID_OPTION_NAME );
+		if ( empty( $partner_id ) ) {
+			Plugin::logger(
+				'enable_site 中止：partner_id 未設定，WPCD 後端無法辨識，啟用請求不送出',
+				'error',
+				[ 'site_id' => $site_id ]
+			);
+			return false;
+		}
+
 		$body = \wp_json_encode(
 			[
 				'site_id'    => $site_id,
-				'partner_id' => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
+				'partner_id' => $partner_id,
 			]
 		);
 		if ( false === $body ) {
-			return \rest_ensure_response(
-				[
-					'status'  => 500,
-					'message' => 'wp_json_encode failed',
-					'data'    => null,
-				]
-			);
+			Plugin::logger( 'enable_site wp_json_encode failed', 'error', [ 'site_id' => $site_id ] );
+			return false;
 		}
 		$args     = [
 			'body'    => $body,
@@ -149,18 +179,37 @@ abstract class Fetch {
 		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/enable-site', $args );
 
 		if ( \is_wp_error( $response ) ) {
-			ob_start();
-			print_r( $response ); // phpcs:ignore
-			return \rest_ensure_response(
-				[
-					'status'  => 500,
-					'message' => 'Request Error, the $response is ' . ob_get_clean(),
-					'data'    => null,
-				]
+			Plugin::logger(
+				"enable_site error: {$response->get_error_message()}",
+				'error',
+				[ 'site_id' => $site_id ]
 			);
+			return false;
 		}
 
-		return json_decode( $response['body'] );
+		$response_code = (int) \wp_remote_retrieve_response_code( $response );
+		if ( $response_code < 200 || $response_code >= 300 ) {
+			Plugin::logger(
+				'enable_site http error',
+				'error',
+				[
+					'site_id'       => $site_id,
+					'response_code' => $response_code,
+					'body'          => \wp_remote_retrieve_body( $response ),
+				]
+			);
+			return false;
+		}
+
+		Plugin::logger(
+			'enable_site success',
+			'info',
+			[
+				'site_id'       => $site_id,
+				'response_code' => $response_code,
+			]
+		);
+		return true;
 	}
 
 	/**

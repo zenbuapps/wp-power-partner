@@ -90,77 +90,89 @@ final class DisableHooks {
 
 		foreach ($items as $item) {
 			/** @var \WC_Order_Item_Product $item */
-			$product_id = $item->get_variation_id() ?: $item->get_product_id();
-			$host_type  = \get_post_meta($product_id, LinkedSites::HOST_TYPE_FIELD_NAME, true);
+			$product_id        = $item->get_variation_id() ?: $item->get_product_id();
+			$product_host_type = (string) \get_post_meta($product_id, LinkedSites::HOST_TYPE_FIELD_NAME, true);
 
-			// PowerCloud: 優先從 pp_linked_site_ids 啟用，fallback 到 order item meta
-			if ($host_type === LinkedSites::DEFAULT_HOST_TYPE) {
-				if (!empty($linked_site_ids)) {
-					foreach ($linked_site_ids as $site_id) {
-						$site_id = (string) $site_id;
+			// 有 pp_linked_site_ids：逐站依實際架構重新啟用
+			// 架構由 LinkedSites::resolve_host_type 判斷（明確 host_type 優先，空值時以 id 格式推斷：數字=WPCD、其餘=PowerCloud）
+			// 與停用路徑對齊，避免 enable/disable 對空值 host_type 判斷不一致（issue #18）
+			if (!empty($linked_site_ids)) {
+				foreach ($linked_site_ids as $site_id) {
+					$site_id = (string) $site_id;
+					if ('' === $site_id) {
+						continue;
+					}
+
+					$host_type = LinkedSites::resolve_host_type($product_host_type, $site_id);
+					$is_wpcd   = LinkedSites::WPCD_HOST_TYPE === $host_type;
+
+					if ($is_wpcd) {
+						// WPCD 舊架構（cloud.luke.cafe）
+						$success = Fetch::enable_site($site_id);
+					} else {
+						// PowerCloud 新架構（api.wpsite.pro）
 						$success = FetchPowerCloud::enable_site((string) $current_user_id, $site_id);
-						if (!$success) {
-							$subscription->add_order_note("重新啟用網站失敗，websiteId: {$site_id}，請檢查 PowerCloud API");
-							$subscription->save();
-						}
-						Plugin::logger(
-							$success ? 'restart WordPress site success' : 'restart WordPress site failed',
-							$success ? 'info' : 'error',
-							[
-								'websiteId'       => $site_id,
-								'subscription_id' => $subscription_id,
-							]
-						);
 					}
-					continue;
-				}
 
-				// Fallback: 從 order item meta 提取 websiteId（相容舊資料）
-				$website_id = null;
-				$order_item = $item->get_meta(SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY);
-
-				if (is_string($order_item) && !empty($order_item)) {
-					$responses = json_decode($order_item, true);
-					if (\is_array($responses) && !empty($responses)) {
-						$first_response = \reset($responses);
-						if (is_array($first_response) && isset($first_response['data']) && is_array($first_response['data']) && isset($first_response['data']['websiteId'])) {
-							$website_id = (string) $first_response['data']['websiteId'];
-						}
+					if (!$success) {
+						$hint = $is_wpcd ? '請檢查 WPCD API 與 partner_id 設定' : '請檢查 PowerCloud API';
+						$id_label = $is_wpcd ? "網站ID: {$site_id}" : "websiteId: {$site_id}";
+						$subscription->add_order_note("重新啟用網站失敗，{$id_label}，{$hint}");
+						$subscription->save();
 					}
-				}
-
-				if (empty($website_id)) {
 					Plugin::logger(
-						"訂閱 #{$subscription_id} 的訂單項目 #{$item->get_id()} 找不到 websiteId",
-						'error',
+						$success ? 'restart WordPress site success' : 'restart WordPress site failed',
+						$success ? 'info' : 'error',
 						[
-							'order_item' => $order_item,
-							'item_id'    => $item->get_id(),
+							'site_id'         => $site_id,
+							'host_type'       => $host_type,
+							'subscription_id' => $subscription_id,
 						]
 					);
-					continue;
 				}
+				continue;
+			}
 
-				$success = FetchPowerCloud::enable_site((string) $current_user_id, $website_id);
-				if (!$success) {
-					$subscription->add_order_note("重新啟用網站失敗，websiteId: {$website_id}，請檢查 PowerCloud API");
-					$subscription->save();
+			// Fallback: 無 pp_linked_site_ids 時，從 order item meta 提取 PowerCloud websiteId（相容舊資料）
+			$website_id = null;
+			$order_item = $item->get_meta(SiteSync::CREATE_SITE_RESPONSES_ITEM_META_KEY);
+
+			if (is_string($order_item) && !empty($order_item)) {
+				$responses = json_decode($order_item, true);
+				if (\is_array($responses) && !empty($responses)) {
+					$first_response = \reset($responses);
+					if (is_array($first_response) && isset($first_response['data']) && is_array($first_response['data']) && isset($first_response['data']['websiteId'])) {
+						$website_id = (string) $first_response['data']['websiteId'];
+					}
 				}
+			}
+
+			if (empty($website_id)) {
 				Plugin::logger(
-					$success ? 'restart WordPress site success' : 'restart WordPress site failed',
-					$success ? 'info' : 'error',
+					"訂閱 #{$subscription_id} 的訂單項目 #{$item->get_id()} 找不到 websiteId",
+					'error',
 					[
-						'websiteId'       => $website_id,
-						'subscription_id' => $subscription_id,
+						'order_item' => $order_item,
+						'item_id'    => $item->get_id(),
 					]
 				);
 				continue;
 			}
 
-			// WPCD: 從 pp_linked_site_ids 啟用
-			foreach ($linked_site_ids as $site_id) {
-				Fetch::enable_site( (string) $site_id);
+			$success = FetchPowerCloud::enable_site((string) $current_user_id, $website_id);
+			if (!$success) {
+				$subscription->add_order_note("重新啟用網站失敗，websiteId: {$website_id}，請檢查 PowerCloud API");
+				$subscription->save();
 			}
+			Plugin::logger(
+				$success ? 'restart WordPress site success' : 'restart WordPress site failed',
+				$success ? 'info' : 'error',
+				[
+					'websiteId'       => $website_id,
+					'subscription_id' => $subscription_id,
+				]
+			);
+			continue;
 		}
 	}
 }
