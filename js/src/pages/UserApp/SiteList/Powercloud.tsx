@@ -1,14 +1,21 @@
 import {
+	EditOutlined,
 	GlobalOutlined,
 	LinkOutlined,
+	LoadingOutlined,
 	PlayCircleOutlined,
 	ReloadOutlined,
 	StopOutlined,
 } from '@ant-design/icons'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
+	Alert,
 	Button,
 	Empty,
+	Form,
+	Input,
+	Modal,
+	notification,
 	Popconfirm,
 	Space,
 	Spin,
@@ -19,7 +26,7 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { useSetAtom } from 'jotai'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { powerCloudAxios, usePowerCloudAxiosWithApiKey } from '@/api'
 import { globalLoadingAtom } from '@/pages/UserApp/atom'
@@ -83,6 +90,13 @@ interface IWebsiteResponse {
 	total: number
 }
 
+/** 變更域名 mutation variables（oldDomain 用於產生通知明細文案） */
+type TChangeDomainVariables = {
+	id: string
+	oldDomain: string
+	newDomain: string
+}
+
 const getDomain = (website: IWebsite): string => {
 	return (
 		website.primaryDomain ||
@@ -125,6 +139,84 @@ const Powercloud = () => {
 		},
 		onSuccess: () => refetch(),
 	})
+
+	// Shadow DOM 容器與通知 context（App2 前臺包在 react-shadow Shadow Root 內，
+	// antd 彈層需綁定 containerRef 才不會逸出而樣式失效）
+	const containerRef = useRef<HTMLDivElement>(null)
+	const [api, contextHolder] = notification.useNotification({
+		placement: 'bottomRight',
+		duration: 10,
+		getContainer: () => containerRef.current as HTMLElement,
+	})
+
+	// 變更域名 Modal 狀態與表單
+	const [isChangeDomainModalOpen, setIsChangeDomainModalOpen] = useState(false)
+	const [selectedWebsite, setSelectedWebsite] = useState<IWebsite | null>(null)
+	const [form] = Form.useForm()
+
+	/**
+	 * 變更域名 mutation（詳細進度通知）
+	 * 使用相同 notification key（`cd-${id}`）讓進行中通知被成功/失敗覆蓋
+	 */
+	const { mutate: changeDomain, isPending: isChangingDomain } = useMutation({
+		mutationFn: ({ id, newDomain }: TChangeDomainVariables) => {
+			return powerCloudInstance.patch(`/wordpress/${id}/domain`, {
+				domain: newDomain,
+			})
+		},
+		onMutate: ({ id, oldDomain, newDomain }: TChangeDomainVariables) => {
+			setIsChangeDomainModalOpen(false)
+			api.open({
+				key: `cd-${id}`,
+				duration: 0,
+				icon: <LoadingOutlined className="text-primary" />,
+				message: '域名變更中...',
+				description: `正在將 ${oldDomain} 變更為 ${newDomain}，網域變更有可能需要等待 2~3 分鐘左右的時間，請先不要關閉視窗`,
+			})
+		},
+		onSuccess: (
+			_data,
+			{ id, oldDomain, newDomain }: TChangeDomainVariables
+		) => {
+			api.success({
+				key: `cd-${id}`,
+				message: '域名變更成功',
+				description: `${oldDomain} 已成功變更為 ${newDomain}`,
+			})
+			refetch()
+			form.resetFields()
+		},
+		onError: (_error, { id, oldDomain, newDomain }: TChangeDomainVariables) => {
+			api.error({
+				key: `cd-${id}`,
+				message: '域名變更失敗',
+				description: `${oldDomain} 變更為 ${newDomain} 失敗`,
+			})
+		},
+	})
+
+	/**
+	 * 開啟變更域名 Modal
+	 * @param website 目標站台
+	 */
+	const handleShowChangeDomainModal = (website: IWebsite) => {
+		setSelectedWebsite(website)
+		setIsChangeDomainModalOpen(true)
+		form.setFieldsValue({ newDomain: '' })
+	}
+
+	/** 送出變更域名（前置表單驗證後觸發 mutation） */
+	const handleChangeDomain = () => {
+		form.validateFields().then((values) => {
+			if (selectedWebsite) {
+				changeDomain({
+					id: selectedWebsite.id,
+					oldDomain: getDomain(selectedWebsite),
+					newDomain: values.newDomain,
+				})
+			}
+		})
+	}
 
 	// 用 adminEmail 過濾當前客戶的網站
 	const allWebsites = data?.data?.data || []
@@ -241,13 +333,28 @@ const Powercloud = () => {
 			render: (_, record) => {
 				return (
 					<Space>
-						<Tooltip title="前往後台">
+						<Tooltip
+							title="前往後台"
+							getPopupContainer={() => containerRef.current as HTMLElement}
+						>
 							<Button
 								type="link"
 								size="small"
 								icon={<GlobalOutlined />}
 								href={`https://${getDomain(record)}/wp-admin`}
 								target="_blank"
+							/>
+						</Tooltip>
+						<Tooltip
+							title="變更域名"
+							getPopupContainer={() => containerRef.current as HTMLElement}
+						>
+							<Button
+								type="link"
+								size="small"
+								icon={<EditOutlined />}
+								disabled={record.status !== 'running'}
+								onClick={() => handleShowChangeDomainModal(record)}
 							/>
 						</Tooltip>
 						{record.status === 'stopped' && (
@@ -257,9 +364,17 @@ const Powercloud = () => {
 								onConfirm={() => startWebsite(record.id)}
 								okText="確認啟動"
 								cancelText="取消"
+								getPopupContainer={() => containerRef.current as HTMLElement}
 							>
-								<Tooltip title="啟動站台">
-									<Button type="link" size="small" icon={<PlayCircleOutlined />} />
+								<Tooltip
+									title="啟動站台"
+									getPopupContainer={() => containerRef.current as HTMLElement}
+								>
+									<Button
+										type="link"
+										size="small"
+										icon={<PlayCircleOutlined />}
+									/>
 								</Tooltip>
 							</Popconfirm>
 						)}
@@ -271,8 +386,12 @@ const Powercloud = () => {
 								okText="確認停止"
 								cancelText="取消"
 								okButtonProps={{ danger: true }}
+								getPopupContainer={() => containerRef.current as HTMLElement}
 							>
-								<Tooltip title="停止站台">
+								<Tooltip
+									title="停止站台"
+									getPopupContainer={() => containerRef.current as HTMLElement}
+								>
 									<Button
 										type="link"
 										size="small"
@@ -306,7 +425,8 @@ const Powercloud = () => {
 	}
 
 	return (
-		<div>
+		<div ref={containerRef}>
+			{contextHolder}
 			<div
 				style={{
 					marginBottom: 16,
@@ -338,6 +458,57 @@ const Powercloud = () => {
 						`第 ${range[0]}-${range[1]} 筆，共 ${total} 筆`,
 				}}
 			/>
+
+			<Modal
+				title="變更域名 (Domain Name)"
+				open={isChangeDomainModalOpen}
+				onCancel={() => {
+					setIsChangeDomainModalOpen(false)
+					form.resetFields()
+				}}
+				onOk={handleChangeDomain}
+				confirmLoading={isChangingDomain}
+				okText="確認變更域名"
+				cancelText="取消"
+				okButtonProps={{ danger: true }}
+				getContainer={() => containerRef.current as HTMLElement}
+			>
+				<Form form={form} layout="vertical" className="mt-8">
+					<Alert
+						message="提醒："
+						description={`請先將網域 DNS 設定中的 A 紀錄 (A Record) 指向 ${selectedWebsite?.ipAddress}，再變更網域`}
+						type="info"
+						showIcon
+						className="mb-4"
+					/>
+					<div className="mb-6">
+						<p className="mt-0 mb-2 text-sm font-medium">當前域名</p>
+						<div className="px-3 py-2 bg-gray-100 rounded-md border border-gray-300">
+							<Text copyable>
+								{selectedWebsite ? getDomain(selectedWebsite) : ''}
+							</Text>
+						</div>
+					</div>
+					<Form.Item
+						label="新域名"
+						name="newDomain"
+						rules={[
+							{ required: true, message: '請輸入新的 domain name' },
+							{
+								pattern:
+									/^(?!http(s)?:\/\/)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/g,
+								message: (
+									<>
+										請輸入不含 <Tag>http(s)://</Tag> 的合格的網址
+									</>
+								),
+							},
+						]}
+					>
+						<Input placeholder="example.com" />
+					</Form.Item>
+				</Form>
+			</Modal>
 		</div>
 	)
 }
