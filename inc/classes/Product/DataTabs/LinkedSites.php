@@ -67,32 +67,39 @@ final class LinkedSites {
 	/**
 	 * 解析「既有連結站」的實際架構
 	 *
-	 * 停用/啟用的對象是已開好的站，其架構的 ground truth 是「連結站 id 格式」，
-	 * 而非產品 host_type 欄位（該欄位只決定「新站開在哪」，且 migration 前的舊產品多為空）。
+	 * 停用/啟用的對象是已開好的站，其架構的 ground truth 是「連結站 id 格式」。
+	 * 此格式是不可變事實，優先於可能被改動或誤設的產品 host_type 欄位
+	 * （該欄位只決定「新站開在哪」）。
+	 *
+	 * 不變量（站長確認）：
+	 *  - WPCD（舊架構，cloud.luke.cafe）site id 一律為「純數字」。
+	 *  - PowerCloud（新架構，api.wpsite.pro）websiteId 一律為「UUID」（非純數字）。
 	 *
 	 * 規則：
-	 *  1. 產品 host_type 有明確值（wpcd / powercloud）→ 直接採用，不覆寫站長設定。
-	 *  2. host_type 為空（或非法值）→ 依連結站 id 格式推斷：
-	 *     純數字 = WPCD 舊架構（WPCD site_id 為數字 DB id），其餘（slug / UUID）= PowerCloud 新架構。
+	 *  1. site id 為純數字 → 一定是 WPCD，覆寫一切（含產品被設成 powercloud 的情形）。
+	 *  2. site id 非純數字（UUID）→ 尊重明確 host_type；為空 / 非法值時預設 PowerCloud。
 	 *
-	 * 為什麼不沿用「空 = powercloud」：host_type 欄位是後來才加的，2026-02 PowerCloud 遷移前
-	 * 開的舊站產品多半為空，這些站全在 WPCD；數字 site id 丟到 PowerCloud API 永遠 404
-	 * → 停用靜默失敗、站照跑、卡照扣（issue #18）。同時，2026 後以空值預設開的站才是 PowerCloud
-	 * （id 為非數字 slug），故空值時改以 id 格式區分兩個世代。
+	 * 為什麼數字一律 WPCD、且覆寫明確 powercloud：純數字 id 不可能是 PowerCloud 的 UUID，
+	 * 故為最強訊號。若放任產品 host_type=powercloud 把數字（WPCD）站導去 PowerCloud，
+	 * PowerCloud 的 /wordpress/{id}/start|stop 會回 HTTP 400 "Validation failed (uuid is expected)"
+	 * → 停用/啟用靜默失敗、站照跑、卡照扣（issue #18 後續：sopro.tw 訂閱 #38621）。
 	 *
-	 * 注意：只在 host_type 為空時才用 id 格式推斷；明確標記 powercloud 的站即使 id 為數字也採用
-	 * 其標記，避免「數字一律 WPCD」把正常 PowerCloud 站反向誤導。
-	 *
-	 * @param string $product_host_type 產品 meta 的 host_type（可能為空）
+	 * @param string $product_host_type 產品 meta 的 host_type（僅在 id 非純數字時參考）
 	 * @param string $site_id           連結站 id
 	 * @return string self::WPCD_HOST_TYPE 或 self::DEFAULT_HOST_TYPE（powercloud）
 	 */
 	public static function resolve_host_type( string $product_host_type, string $site_id ): string {
+		// 純數字 site id 一定是 WPCD（PowerCloud 為 UUID），最強訊號，覆寫產品 host_type 設定。
+		if ( \ctype_digit( $site_id ) ) {
+			return self::WPCD_HOST_TYPE;
+		}
+
+		// 非純數字（UUID 或空）：尊重明確 host_type，否則預設 PowerCloud。
 		if ( self::WPCD_HOST_TYPE === $product_host_type || self::DEFAULT_HOST_TYPE === $product_host_type ) {
 			return $product_host_type;
 		}
 
-		return \ctype_digit( $site_id ) ? self::WPCD_HOST_TYPE : self::DEFAULT_HOST_TYPE;
+		return self::DEFAULT_HOST_TYPE;
 	}
 
 	/**
