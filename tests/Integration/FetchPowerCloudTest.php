@@ -120,7 +120,9 @@ class FetchPowerCloudTest extends TestCase {
 		);
 		$this->assertInstanceOf( \WC_Subscription::class, $subscription, '建立訂閱失敗' );
 
-		$subscription->update_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, '3022602' );
+		// PowerCloud websiteId 為 UUID（非純數字）。純數字 id 會被 LinkedSites::resolve_host_type
+		// 一律判為 WPCD，故要讓排程路由到 PowerCloud，linked id 必須是 UUID（issue #18 / #38621）。
+		$subscription->update_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' );
 		$subscription->save();
 
 		return $subscription;
