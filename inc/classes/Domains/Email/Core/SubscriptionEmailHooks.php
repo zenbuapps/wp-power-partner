@@ -265,13 +265,23 @@ final class SubscriptionEmailHooks {
 			return;
 		}
 
-		// 進入 cancelled/expired(已取消/已過期)：取消未寄出的催繳信與成功信，排程「訂閱結束」停用通知
+		// 進入 cancelled/expired(已取消/已過期)：取消未寄出的催繳信、成功信與「即將扣款」信，排程「訂閱結束」停用通知
+		// 已取消/過期不會再有下次扣款，未寄出的「即將扣款」(next_payment) 信若不清除會誤寄(issue #20)。
 		if ( in_array( $to_status, [ 'cancelled', 'expired' ], true ) ) {
 			$this->unschedule_failed_emails( $subscription );
 			$this->unschedule_success_emails( $subscription );
+			$this->unschedule_next_payment_emails( $subscription );
 			foreach ( $this->get_emails( Action::END->value ) as $email ) {
 				$this->schedule_email( $email, $subscription );
 			}
+			return;
+		}
+
+		// 進入 pending-cancel(待取消)：取消未寄出的「即將扣款」信。
+		// 待取消訂閱在預付期結束後就停止，期末不會再自動扣款，因此不該再寄「即將扣款」通知(issue #20)。
+		// 不在此排程 end 信(維持原設計，避免預付期未到就誤寄停用通知)。
+		if ( 'pending-cancel' === $to_status ) {
+			$this->unschedule_next_payment_emails( $subscription );
 			return;
 		}
 
@@ -308,6 +318,27 @@ final class SubscriptionEmailHooks {
 	 */
 	private function unschedule_success_emails( \WC_Subscription $subscription ): void {
 		foreach ( $this->get_emails( Action::SUBSCRIPTION_SUCCESS->value ) as $email ) {
+			$subscription_email           = new SubscriptionEmail( $email, $subscription );
+			$subscription_email_scheduler = new SubscriptionEmailScheduler( $subscription_email );
+			$subscription_email_scheduler->unschedule( $email->action_name );
+		}
+	}
+
+	/**
+	 * 取消尚未寄出的「即將扣款」(next_payment / watch_next_payment) 信
+	 *
+	 * 「即將扣款」信由 next_payment 與 watch_next_payment 兩種 action_name 觸發排程，
+	 * 兩者皆 unique，這裡一併清除以涵蓋兩種設定。
+	 *
+	 * @param \WC_Subscription $subscription 訂閱
+	 * @return void
+	 */
+	private function unschedule_next_payment_emails( \WC_Subscription $subscription ): void {
+		$next_payment_emails = array_merge(
+			$this->get_emails( Action::NEXT_PAYMENT->value ),
+			$this->get_emails( Action::WATCH_NEXT_PAYMENT->value )
+		);
+		foreach ( $next_payment_emails as $email ) {
 			$subscription_email           = new SubscriptionEmail( $email, $subscription );
 			$subscription_email_scheduler = new SubscriptionEmailScheduler( $subscription_email );
 			$subscription_email_scheduler->unschedule( $email->action_name );

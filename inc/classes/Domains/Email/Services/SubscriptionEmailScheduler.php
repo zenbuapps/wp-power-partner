@@ -89,6 +89,24 @@ final class SubscriptionEmailScheduler extends Base {
 			return;
 		}
 
+		// 「即將扣款」信(next_payment / watch_next_payment) 在訂閱已 pending-cancel/cancelled/expired
+		// (待取消/已取消/已過期) 時不寄送——這些狀態不會再有下次自動扣款，預告扣款會誤導客戶(issue #20)。
+		// 防禦排程清除遺漏的漏網信件(主清除在 SubscriptionEmailHooks::on_status_updated)。
+		if (
+			in_array( $email->action_name, [ Action::NEXT_PAYMENT->value, Action::WATCH_NEXT_PAYMENT->value ], true )
+			&& in_array( $status_enum, [ Status::PENDING_CANCEL, Status::CANCELLED, Status::EXPIRED ], true )
+		) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 已為 {$subscription_status}(不會再扣款)，不寄送即將扣款信",
+				'info',
+				[
+					'subscription_status' => $subscription_status,
+					'email'               => $email->to_array(),
+				]
+				);
+			return;
+		}
+
 		// 訂閱結束信(end)只在訂閱已為 cancelled/expired(已取消/已過期) 時寄送
 		if ( $email->action_name === Action::END->value && ! in_array( $status_enum, [ Status::CANCELLED, Status::EXPIRED ], true ) ) {
 			Plugin::logger(

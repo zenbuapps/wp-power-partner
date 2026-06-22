@@ -79,12 +79,14 @@ Customer buys subscription
   woocommerce_subscription_status_updated ── SubscriptionEmailHooks::on_status_updated()
          ├── → on-hold:            排程 subscription_failed 催繳信（最少延遲 10 分鐘，先清舊排程）
          │                          + 取消未寄出的成功信
-         ├── → cancelled/expired:  排程 end 訂閱結束信 + 取消未寄出的催繳信 + 取消未寄出的成功信
+         ├── → pending-cancel:     取消未寄出的「即將扣款」(next_payment) 信（期末不再扣款，issue #20）
+         ├── → cancelled/expired:  排程 end 訂閱結束信 + 取消未寄出的催繳信 + 成功信 + 即將扣款信（issue #20）
          └── → active (復活，from ∈ on-hold/pending-cancel/cancelled/expired，不含 pending):
                                     取消未寄出的催繳信
                                     + 排程 subscription_success 成功信（最少延遲 10 分鐘）
          （寄送當下 SubscriptionEmailScheduler::action_callback 會複查狀態：
-           催繳信須仍為 on-hold、end 信須仍為 cancelled/expired、成功信須仍為 active，否則跳過）
+           催繳信須仍為 on-hold、end 信須仍為 cancelled/expired、成功信須仍為 active；
+           即將扣款信在 pending-cancel/cancelled/expired 時跳過，否則跳過）
 
   SUBSCRIPTION_SUCCESS (Powerhouse hook) ─── DisableHooks / LC\LifeCycle（網站恢復/授權碼恢復）
          注意：Email 不走此路徑（Email 改由 woocommerce_subscription_status_updated 觸發）
