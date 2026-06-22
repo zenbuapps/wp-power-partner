@@ -2,13 +2,13 @@
 /**
  * 停用/啟用網站架構路由測試（issue #18）
  *
- * 驗證 DisableSiteScheduler 不再單純依產品 host_type 欄位、也不再
- * 「空值預設 powercloud」，而是：
- *  - 產品 host_type 有明確值（wpcd / powercloud）→ 直接採用
- *  - host_type 為空 → 依連結站 id 格式推斷（純數字 = WPCD、其餘 = PowerCloud）
+ * 驗證 DisableSiteScheduler / DisableHooks 以「連結站 id 格式」為架構 ground truth：
+ *  - site id 為純數字 → 一定 WPCD（覆寫產品 host_type，含被設成 powercloud 的情形）
+ *  - site id 非純數字（UUID）→ 尊重明確 host_type，為空時預設 PowerCloud
  *
- * 核心症狀：舊 WPCD 站（數字 id、產品 host_type 空）停用時被導去
- * PowerCloud API（api.wpsite.pro）而靜默失敗，站照跑、卡照扣。
+ * 核心症狀：舊 WPCD 站（數字 id）停用/啟用時被導去 PowerCloud API（api.wpsite.pro）
+ * 而靜默失敗，站照跑、卡照扣。無論產品 host_type 為空（issue #18）或被誤設為
+ * powercloud（sopro.tw 訂閱 #38621：PowerCloud 回 400 "uuid is expected"）皆然。
  *
  * 同時驗證 WPCD 停用路徑現在依回應寫成功/失敗備註，且 partner_id 為空時擋下。
  */
@@ -165,14 +165,25 @@ class SiteDisableRoutingTest extends TestCase {
 	}
 
 	/**
-	 * 明確 powercloud 即使連結 id 是數字也採用，不被 id 格式覆寫（避免反向誤導）
+	 * 純數字 site id 一定是 WPCD，覆寫產品 host_type=powercloud 的誤設
+	 * （回歸 sopro.tw 訂閱 #38621：數字 WPCD 站被導去 PowerCloud → 400 "uuid is expected"）
 	 *
 	 * @group smoke
+	 * @group error
 	 */
-	public function test_resolve_host_type_honors_explicit_powercloud_even_for_numeric_id(): void {
+	public function test_resolve_host_type_numeric_id_always_wpcd_even_if_product_powercloud(): void {
 		$this->assertSame(
-			LinkedSites::DEFAULT_HOST_TYPE,
+			LinkedSites::WPCD_HOST_TYPE,
 			LinkedSites::resolve_host_type( 'powercloud', '3022602' )
+		);
+		// #38621 實際連結站 id
+		$this->assertSame(
+			LinkedSites::WPCD_HOST_TYPE,
+			LinkedSites::resolve_host_type( 'powercloud', '3085232' )
+		);
+		$this->assertSame(
+			LinkedSites::WPCD_HOST_TYPE,
+			LinkedSites::resolve_host_type( 'powercloud', '5509542' )
 		);
 	}
 
@@ -226,11 +237,13 @@ class SiteDisableRoutingTest extends TestCase {
 	}
 
 	/**
-	 * 無回歸：明確 powercloud + 數字 id → 仍送 PowerCloud
+	 * 回歸（#38621）：產品 host_type=powercloud + 數字 id → 仍依 id 格式送 WPCD，
+	 * 不可被產品設定導去 PowerCloud（數字 id 不可能是 PowerCloud UUID）。
 	 *
 	 * @group happy
+	 * @group error
 	 */
-	public function test_explicit_powercloud_routes_to_powercloud(): void {
+	public function test_numeric_id_routes_to_wpcd_even_if_product_powercloud(): void {
 		$this->skip_if_no_subscriptions();
 		$subscription = $this->create_subscription( 'powercloud', '3022602' );
 		$this->mock_http( 200 );
@@ -239,9 +252,14 @@ class SiteDisableRoutingTest extends TestCase {
 
 		$this->assertNotNull( $this->last_request, '應發出 HTTP 請求' );
 		$this->assertStringContainsString(
+			'/wp-json/power-partner-server/v2/disable-site',
+			$this->last_request['url'],
+			'數字 site id 一定是 WPCD，必須送往 WPCD disable API（覆寫產品 powercloud 設定）'
+		);
+		$this->assertStringNotContainsString(
 			'/wordpress/3022602/stop',
 			$this->last_request['url'],
-			'明確設定 powercloud 的站必須送往 PowerCloud API'
+			'不可被產品 host_type=powercloud 導去 PowerCloud API（#38621 症狀）'
 		);
 	}
 

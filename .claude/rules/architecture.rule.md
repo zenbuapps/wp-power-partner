@@ -108,7 +108,7 @@ Customer buys subscription
 管理網站停用/恢復排程。
 
 - **`Core\DisableHooks`** — Singleton。`SUBSCRIPTION_FAILED` → 排程停用；`SUBSCRIPTION_SUCCESS` → 取消排程 + 重新啟用。重新啟用時逐站以 `LinkedSites::resolve_host_type()` 判斷架構（與停用對齊），WPCD / PowerCloud 啟用失敗（非 2xx / WP_Error）時皆寫入「重新啟用網站失敗」訂單備註 + error log（issue #18）。
-- **`Services\DisableSiteScheduler`** — ActionScheduler 包裝。args 包含 `{subscription_id}`。停用時**逐站**以 `LinkedSites::resolve_host_type($product_host_type, $site_id)` 判斷架構（明確 host_type 優先；空值時依 site id 格式推斷：數字=WPCD、其餘=PowerCloud），不再「空值一律 powercloud」（issue #18）。WPCD 與 PowerCloud 路徑皆依回傳值寫入「已停用網站」或「停用網站失敗」訂單備註（issue #13 / #18：API 失敗不再被誤記為成功）。
+- **`Services\DisableSiteScheduler`** — ActionScheduler 包裝。args 包含 `{subscription_id}`。停用時**逐站**以 `LinkedSites::resolve_host_type($product_host_type, $site_id)` 判斷架構（**純數字 site id 一律 WPCD，覆寫產品 host_type；非純數字 UUID 才參考明確 host_type，空值預設 PowerCloud**），不靠產品欄位覆寫 id 格式（issue #18；#38621：產品被誤設 powercloud 但站是數字 WPCD id → PowerCloud 回 400 "uuid is expected"）。WPCD 與 PowerCloud 路徑皆依回傳值寫入「已停用網站」或「停用網站失敗」訂單備註（issue #13 / #18：API 失敗不再被誤記為成功）。
 
 ### `Domains\LC`（License Codes）
 管理授權碼生命週期，透過 `cloud.luke.cafe` API（Powerhouse CloudApi）。
