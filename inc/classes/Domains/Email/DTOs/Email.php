@@ -44,7 +44,10 @@ final class Email extends DTO {
 	protected function validate(): void {
 		Enums\Operator::from( $this->operator );
 
-		if ( !Action::tryFrom( $this->action_name ) && 'site_sync' !== $this->action_name ) {
+		// site_sync 與 customer_cancelled 不是 Powerhouse Action enum 的成員，
+		// 但都是本外掛合法的信件觸發點，需一併放行（customer_cancelled 見 issue #20）。
+		$non_enum_actions = [ 'site_sync', 'customer_cancelled' ];
+		if ( !Action::tryFrom( $this->action_name ) && !in_array( $this->action_name, $non_enum_actions, true ) ) {
 			throw new \Exception('Invalid action_name, got: ' . $this->action_name);
 		}
 

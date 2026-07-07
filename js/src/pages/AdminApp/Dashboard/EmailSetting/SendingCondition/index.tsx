@@ -45,6 +45,12 @@ const actions = [
 		value: 'end',
 		helper: '訂閱結束後 N 天發送',
 	},
+	{
+		label: '客戶手動取消訂閱後',
+		value: 'customer_cancelled',
+		helper:
+			'客戶於「我的帳號」自行取消訂閱後立即發送給經銷商（網站管理員信箱），非通知終端客戶；後台取消或扣款失敗不觸發',
+	},
 ]
 
 const actionNameOptions = actions.map(({ label, value }) => ({
@@ -76,12 +82,13 @@ const SendingCondition = ({
 				'subscription_success',
 				'date_created',
 				'renewal_order_created',
+				'customer_cancelled',
 			].includes(watchActionName),
 		},
 	]
 
 	useEffect(() => {
-		if ('site_sync' === watchActionName) {
+		if (['site_sync', 'customer_cancelled'].includes(watchActionName)) {
 			form.setFieldValue(daysName, 0)
 			form.setFieldValue(operatorName, 'after')
 		}
@@ -123,7 +130,9 @@ const SendingCondition = ({
 					<InputNumber
 						className="w-16"
 						min={0}
-						disabled={'site_sync' === watchActionName}
+						disabled={['site_sync', 'customer_cancelled'].includes(
+							watchActionName
+						)}
 					/>
 				</Item>
 				<Item

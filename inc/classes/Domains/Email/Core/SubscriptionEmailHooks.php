@@ -114,6 +114,23 @@ final class SubscriptionEmailHooks {
 
 		// 用真實的訂閱狀態轉換觸發 subscription_failed / subscription_success / end 三種信，並在狀態離開時取消對應的未寄信件
 		\add_action('woocommerce_subscription_status_updated', [ $this, 'on_status_updated' ], 10, 3);
+
+		/**
+		 * 「客戶自行取消訂閱通知」(customer_cancelled)：終端客戶於「我的帳號」頁自行取消訂閱時，
+		 * 寄通知信給經銷商本人（站台 admin_email，收件人分流見 SubscriptionEmailScheduler::action_callback()）。
+		 *
+		 * 綁在 WCS 的 woocommerce_customer_changed_subscription_to_cancelled hook 上——此 hook 由
+		 * WCS_User_Change_Status_Handler::change_users_subscription() 在「客戶前台操作」時才 fire
+		 * （先 cancel_order() 再 do_action，且只帶 $subscription 一個參數），因此天然排除：
+		 *   - 管理員後台改狀態（走 woocommerce_subscription_status_updated，不走此 hook）
+		 *   - 金流自動扣款失敗導致的狀態變動（同上）
+		 * 注意：hook 名取自「客戶請求的狀態」（My Account 取消一律請求 cancelled），不是落地狀態——
+		 * cancel_order() 依剩餘預付期落地 pending-cancel 或 cancelled，兩種情形 fire 的都是
+		 * ..._to_cancelled，單一綁定即涵蓋；..._to_pending-cancel 在 WCS 現行取消流程永不觸發
+		 * （change_users_subscription() 的 switch 無此 case），故不綁。
+		 * 此信立即寄（days=0）、不 unique（每次取消都寄），見 issue #20。
+		 */
+		\add_action('woocommerce_customer_changed_subscription_to_cancelled', [ $this, 'schedule_customer_cancelled_email' ], 10, 1);
 	}
 
 	/**
@@ -233,6 +250,30 @@ final class SubscriptionEmailHooks {
 	}
 
 	/**
+	 * 客戶自行取消訂閱後，排程通知信給經銷商
+	 *
+	 * 綁定於 WCS 的 woocommerce_customer_changed_subscription_to_cancelled hook（見 constructor），
+	 * 只在終端客戶於「我的帳號」頁自行取消訂閱時觸發（落地 pending-cancel 或 cancelled 皆 fire 此 hook），
+	 * 排除管理員後台操作與金流扣款失敗。同一次取消只 fire 一次，不會重複排程。
+	 * 收件人為經銷商本人（站台 admin_email），分流邏輯見 SubscriptionEmailScheduler::action_callback()。
+	 * 此信立即寄、不 unique（每次取消都寄），見 issue #20。
+	 *
+	 * schedule_email() 內建 is_site_sync() 守門（非開站訂閱不寄）與 maybe_unschedule，此處不重複檢查。
+	 *
+	 * @param mixed $subscription 訂閱（WCS hook 傳入，仍做 instanceof 守門）
+	 * @return void
+	 */
+	public function schedule_customer_cancelled_email( $subscription ): void {
+		if ( ! ( $subscription instanceof \WC_Subscription ) ) {
+			return;
+		}
+
+		foreach ( $this->get_emails( 'customer_cancelled' ) as $email ) {
+			$this->schedule_email( $email, $subscription );
+		}
+	}
+
+	/**
 	 * 用真實的訂閱狀態轉換觸發 subscription_failed / subscription_success / end 三種信
 	 *
 	 * 對應客戶心智(也修正先前綁錯觸發點造成的誤寄/重複寄)：
@@ -266,7 +307,7 @@ final class SubscriptionEmailHooks {
 		}
 
 		// 進入 cancelled/expired(已取消/已過期)：取消未寄出的催繳信、成功信與「即將扣款」信，排程「訂閱結束」停用通知
-		// 已取消/過期不會再有下次扣款，未寄出的「即將扣款」(next_payment) 信若不清除會誤寄(issue #20)。
+		// 已取消/過期不會再有下次扣款，未寄出的「即將扣款」(next_payment) 信若不清除會誤寄(修復見 commit 4d3763c)。
 		if ( in_array( $to_status, [ 'cancelled', 'expired' ], true ) ) {
 			$this->unschedule_failed_emails( $subscription );
 			$this->unschedule_success_emails( $subscription );
@@ -278,7 +319,7 @@ final class SubscriptionEmailHooks {
 		}
 
 		// 進入 pending-cancel(待取消)：取消未寄出的「即將扣款」信。
-		// 待取消訂閱在預付期結束後就停止，期末不會再自動扣款，因此不該再寄「即將扣款」通知(issue #20)。
+		// 待取消訂閱在預付期結束後就停止，期末不會再自動扣款，因此不該再寄「即將扣款」通知(修復見 commit 4d3763c)。
 		// 不在此排程 end 信(維持原設計，避免預付期未到就誤寄停用通知)。
 		if ( 'pending-cancel' === $to_status ) {
 			$this->unschedule_next_payment_emails( $subscription );

@@ -90,7 +90,7 @@ final class SubscriptionEmailScheduler extends Base {
 		}
 
 		// 「即將扣款」信(next_payment / watch_next_payment) 在訂閱已 pending-cancel/cancelled/expired
-		// (待取消/已取消/已過期) 時不寄送——這些狀態不會再有下次自動扣款，預告扣款會誤導客戶(issue #20)。
+		// (待取消/已取消/已過期) 時不寄送——這些狀態不會再有下次自動扣款，預告扣款會誤導客戶(修復見 commit 4d3763c)。
 		// 防禦排程清除遺漏的漏網信件(主清除在 SubscriptionEmailHooks::on_status_updated)。
 		if (
 			in_array( $email->action_name, [ Action::NEXT_PAYMENT->value, Action::WATCH_NEXT_PAYMENT->value ], true )
@@ -128,12 +128,23 @@ final class SubscriptionEmailScheduler extends Base {
 		$tokens = array_merge( Token::get_order_tokens( $last_order ), Token::get_subscription_tokens( $subscription ) );
 
 		$admin_email = (string) \get_option('admin_email');
-		$headers     = [];
-		$headers[]   = 'Content-Type: text/html; charset=UTF-8';
-		$headers[]   = "Bcc: {$admin_email}";
+
+		// 收件人分流（issue #20）：
+		// 「客戶自行取消訂閱通知」(customer_cancelled) 是寄給經銷商本人的信，
+		// 收件人為站台 admin_email，且不再 Bcc 自己（避免同一封信寄兩次）。
+		// 其餘信件維持原行為——寄給終端客戶(billing email)，並 Bcc 站台管理員留存。
+		$is_customer_cancelled = 'customer_cancelled' === $email->action_name;
+
+		$headers   = [];
+		$headers[] = 'Content-Type: text/html; charset=UTF-8';
+		if ( ! $is_customer_cancelled ) {
+			$headers[] = "Bcc: {$admin_email}";
+		}
+
+		$to = $is_customer_cancelled ? $admin_email : $last_order->get_billing_email();
 
 		$success = \wp_mail(
-			$last_order->get_billing_email(),
+			$to,
 			Token::replace( $email->subject, $tokens ),
 			Token::replace( $email->body, $tokens ),
 			$headers,
