@@ -79,14 +79,21 @@ Customer buys subscription
   woocommerce_subscription_status_updated ── SubscriptionEmailHooks::on_status_updated()
          ├── → on-hold:            排程 subscription_failed 催繳信（最少延遲 10 分鐘，先清舊排程）
          │                          + 取消未寄出的成功信
-         ├── → pending-cancel:     取消未寄出的「即將扣款」(next_payment) 信（期末不再扣款，issue #20）
-         ├── → cancelled/expired:  排程 end 訂閱結束信 + 取消未寄出的催繳信 + 成功信 + 即將扣款信（issue #20）
+         ├── → pending-cancel:     取消未寄出的「即將扣款」(next_payment) 信（期末不再扣款，commit 4d3763c）
+         ├── → cancelled/expired:  排程 end 訂閱結束信 + 取消未寄出的催繳信 + 成功信 + 即將扣款信（commit 4d3763c）
          └── → active (復活，from ∈ on-hold/pending-cancel/cancelled/expired，不含 pending):
                                     取消未寄出的催繳信
                                     + 排程 subscription_success 成功信（最少延遲 10 分鐘）
          （寄送當下 SubscriptionEmailScheduler::action_callback 會複查狀態：
            催繳信須仍為 on-hold、end 信須仍為 cancelled/expired、成功信須仍為 active；
-           即將扣款信在 pending-cancel/cancelled/expired 時跳過，否則跳過）
+           即將扣款信在 pending-cancel/cancelled/expired 時跳過，否則照寄）
+
+  woocommerce_customer_changed_subscription_to_cancelled ── SubscriptionEmailHooks::schedule_customer_cancelled_email()
+         （客戶於「我的帳號」自行取消訂閱，issue #20）
+         └── 排程 customer_cancelled 通知信給經銷商（收件人 admin_email、不 Bcc，立即寄、不 unique、寄送當下不複查狀態）
+         注意：hook 名取自「客戶請求的狀態」（取消一律請求 cancelled），非落地狀態——
+               落地 pending-cancel 或 cancelled 皆 fire 此 hook（..._to_pending-cancel 永不觸發，不綁）；
+               管理員後台取消與金流失敗只走 woocommerce_subscription_status_updated，不觸發此信
 
   SUBSCRIPTION_SUCCESS (Powerhouse hook) ─── DisableHooks / LC\LifeCycle（網站恢復/授權碼恢復）
          注意：Email 不走此路徑（Email 改由 woocommerce_subscription_status_updated 觸發）
@@ -99,8 +106,8 @@ Customer buys subscription
 ### `Domains\Email`
 管理所有外發 Email 排程與發送。
 
-- **`Core\SubscriptionEmailHooks`** — Singleton。將每個 `Action` enum hook 連接到排程發信。從 `power_partner_settings['emails']` 讀取模板。
-- **`DTOs\Email`** — 繼承 `J7\WpUtils\Classes\DTO`。建構時驗證 `action_name`、`operator`、`days`。`unique` 自動為 true（trial_end/next_payment/end）。
+- **`Core\SubscriptionEmailHooks`** — Singleton。將每個 `Action` enum hook 連接到排程發信。從 `power_partner_settings['emails']` 讀取模板。另綁 WCS `woocommerce_customer_changed_subscription_to_cancelled` → `schedule_customer_cancelled_email()`（issue #20，客戶自行取消 → 通知經銷商）。
+- **`DTOs\Email`** — 繼承 `J7\WpUtils\Classes\DTO`。建構時驗證 `action_name`、`operator`、`days`（enum 外白名單：`site_sync`、`customer_cancelled`）。`unique` 自動為 true（trial_end/next_payment/end）。
 - **`Models\SubscriptionEmail`** — 結合 Email DTO + Subscription 計算最終發送 timestamp。使用 Powerhouse 的 `Times` DTO。
 - **`Services\SubscriptionEmailScheduler`** — 繼承 `Powerhouse\Domains\AsSchedulerHandler\Shared\Base`。hook: `power_partner/3.1.0/email/scheduler`。`register()` 必須在 Bootstrap 中呼叫。
 

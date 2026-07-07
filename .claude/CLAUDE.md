@@ -182,11 +182,12 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 | `subscription_failed` | 訂閱進入 on-hold（待處理/催繳階段），寄送當下仍須為 on-hold 才會真的寄出；回到 active 或進入 cancelled/expired 時取消排程 |
 | `subscription_success` | 訂閱從 on-hold（待處理）/ pending-cancel（待取消）/ cancelled / expired 恢復為 active 時觸發（**不含** pending → active 首次付款）；每次成功續訂寄一封；10 分鐘緩衝 + 寄送當下須仍為 active；離開 active 時自動取消未寄成功信（issue #16） |
 | `end` | 訂閱進入 cancelled/expired（已取消/已過期），寄送當下仍須為 cancelled/expired |
-| `trial_end` / `next_payment` | 訂閱里程碑時。`next_payment`（即將扣款）在訂閱進入 pending-cancel/cancelled/expired 時取消排程，且寄送當下複查狀態：pending-cancel/cancelled/expired 不寄（期末不再扣款，issue #20） |
-| `watch_trial_end` / `watch_next_payment` | 前/後 N 天（unique，設定變更時重排）。`watch_next_payment` 同 `next_payment` 的取消排程與寄送狀態複查（issue #20） |
+| `trial_end` / `next_payment` | 訂閱里程碑時。`next_payment`（即將扣款）在訂閱進入 pending-cancel/cancelled/expired 時取消排程，且寄送當下複查狀態：pending-cancel/cancelled/expired 不寄（期末不再扣款，修復見 commit 4d3763c；註：該 commit 訊息誤引 "issue #20"，實際無對應 issue——#20 是 customer_cancelled feature） |
+| `watch_trial_end` / `watch_next_payment` | 前/後 N 天（unique，設定變更時重排）。`watch_next_payment` 同 `next_payment` 的取消排程與寄送狀態複查（commit 4d3763c） |
 | `watch_end` | **已停用**（v3.3.7 起 `end` 改由狀態轉換觸發，UI 從未提供此選項） |
+| `customer_cancelled` | 終端客戶於「我的帳號」**自行**取消訂閱時觸發（issue #20）。收件人是**經銷商**（站台 `admin_email`，不 Bcc），非終端客戶；立即寄出（UI 鎖 days=0/after）、不 unique（每次取消都寄）、寄送當下不複查狀態（取消是歷史事實）。管理員後台取消與金流扣款失敗**不**觸發。觸發 hook 是 WCS `woocommerce_customer_changed_subscription_to_cancelled`——hook 名取自「客戶請求的狀態」（取消一律請求 cancelled），非落地狀態；落地 pending-cancel 或 cancelled 皆 fire 同一 hook，`_to_pending-cancel` 永不觸發（不綁）。客戶照舊另收 `end` 信（若有啟用），互不影響 |
 
-注意：`subscription_failed` / `subscription_success` / `end` 三種信由 `woocommerce_subscription_status_updated`（`SubscriptionEmailHooks::on_status_updated()`）觸發，**不走** Powerhouse Action hook；其餘仍走 Powerhouse。WCS 每次排程續訂都會短暫 active → on-hold → active，催繳信與成功信因此固定有最少 10 分鐘排程緩衝 + 寄送當下狀態複查（催繳信須仍 on-hold、成功信須仍 active）；兩者亦互為反向取消，防止震盪期間同時寄出。`SUBSCRIPTION_SUCCESS` Powerhouse hook 仍用於 DisableHooks / LC，Email 不走此路徑。
+注意：`subscription_failed` / `subscription_success` / `end` 三種信由 `woocommerce_subscription_status_updated`（`SubscriptionEmailHooks::on_status_updated()`）觸發，`customer_cancelled` 由 WCS customer hook（`SubscriptionEmailHooks::schedule_customer_cancelled_email()`）觸發，皆**不走** Powerhouse Action hook；其餘仍走 Powerhouse。WCS 每次排程續訂都會短暫 active → on-hold → active，催繳信與成功信因此固定有最少 10 分鐘排程緩衝 + 寄送當下狀態複查（催繳信須仍 on-hold、成功信須仍 active）；兩者亦互為反向取消，防止震盪期間同時寄出。`SUBSCRIPTION_SUCCESS` Powerhouse hook 仍用於 DisableHooks / LC，Email 不走此路徑。
 
 ### 支援的 ##TOKEN## 值
 
