@@ -12,6 +12,10 @@ abstract class FetchPowerCloud
 {
 	const ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY = 'power_partner_allowed_template_options_powercloud';
 	const OPEN_SITE_PLAN_OPTIONS_TRANSIENT_KEY   = 'power_partner_open_site_plan_options_powercloud';
+	/** @var int /websites 單頁筆數上限 */
+	const WEBSITES_PAGE_LIMIT = 250;
+	/** @var int /websites 分頁保護上限，避免對端回報錯誤 total 時無限迴圈 */
+	const WEBSITES_MAX_PAGES  = 100;
 	/**
 	 * 發 API 開站
 	 *
@@ -251,6 +255,124 @@ abstract class FetchPowerCloud
 			]
 		);
 		return true;
+	}
+
+	/**
+	 * 取得本 API Key 所屬帳號下的網站全量清單（依回應 total 分頁拉完）
+	 *
+	 * 回傳值語義（呼叫端務必區分）：
+	 *  - array：成功。內容為全量網站，空陣列代表該帳號確實沒有站
+	 *  - null ：失敗（無 API Key／連線錯誤／非 2xx／回應格式異常／分頁未拉完）
+	 *
+	 * 失敗時**不可**退化成空陣列 —— 少送站等於少收錢，呼叫端必須據此進入重試流程，
+	 * 不得以殘缺清單推送計費資料。
+	 *
+	 * 元素型別刻意保持 mixed —— 這是外部 API 解碼後的未信任資料，
+	 * 呼叫端必須逐筆 is_array() 後才取用欄位。
+	 *
+	 * @param string|null $user_id 用戶 ID（預設取當前用戶；cron 情境為 '0'，會 fallback 到全域 key）
+	 * @return array<int, mixed>|null
+	 */
+	public static function fetch_websites( ?string $user_id = null ): ?array
+	{
+		$user_id            = null === $user_id ? (string) \get_current_user_id() : $user_id;
+		$powercloud_api_key = self::get_powercloud_api_key($user_id);
+
+		if (empty($powercloud_api_key)) {
+			Plugin::logger('fetch_websites 中止：PowerCloud API Key 不存在，不以空 key 呼叫 API', 'error');
+			return null;
+		}
+
+		$args = [
+			'headers' => [
+				'Content-Type' => 'application/json',
+				'X-API-Key'    => $powercloud_api_key,
+			],
+			'timeout' => 600,
+		];
+
+		$websites = [];
+		$total    = 0;
+		$page     = 1;
+
+		do {
+			$url      = sprintf(
+				'%1$s/websites?page=%2$d&limit=%3$d',
+				Bootstrap::instance()->powercloud_api,
+				$page,
+				self::WEBSITES_PAGE_LIMIT
+			);
+			$response = \wp_remote_get($url, $args);
+
+			if (\is_wp_error($response)) {
+				Plugin::logger('fetch_websites wp_error', 'error', [
+					'page'               => $page,
+					'error'              => $response->get_error_message(),
+					'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
+				]);
+				return null;
+			}
+
+			$response_code = (int) \wp_remote_retrieve_response_code($response);
+			if ($response_code < 200 || $response_code >= 300) {
+				Plugin::logger('fetch_websites http error', 'error', [
+					'page'               => $page,
+					'response_code'      => $response_code,
+					'body'               => \wp_remote_retrieve_body($response),
+					'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
+				]);
+				return null;
+			}
+
+			$response_body = json_decode(\wp_remote_retrieve_body($response), true);
+			if (!is_array($response_body) || !isset($response_body['data']) || !is_array($response_body['data'])) {
+				Plugin::logger('fetch_websites 回應格式異常', 'error', [
+					'page'               => $page,
+					'body'               => \wp_remote_retrieve_body($response),
+					'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
+				]);
+				return null;
+			}
+
+			$page_data = array_values($response_body['data']);
+			$total     = (int) ($response_body['total'] ?? count($page_data));
+			$websites  = [ ...$websites, ...$page_data ];
+
+			// 已取完 total 筆
+			if (count($websites) >= $total) {
+				break;
+			}
+
+			// 尚未取完卻回空頁：分頁停滯，視為取得失敗（不可送出殘缺清單）
+			if (!$page_data) {
+				Plugin::logger('fetch_websites 分頁停滯，清單不完整', 'error', [
+					'page'     => $page,
+					'fetched'  => count($websites),
+					'total'    => $total,
+				]);
+				return null;
+			}
+
+			++$page;
+		} while ($page <= self::WEBSITES_MAX_PAGES);
+
+		if (count($websites) < $total) {
+			Plugin::logger('fetch_websites 超過最大分頁數仍未取完，清單不完整', 'error', [
+				'max_pages' => self::WEBSITES_MAX_PAGES,
+				'fetched'   => count($websites),
+				'total'     => $total,
+			]);
+			return null;
+		}
+
+		Plugin::logger('[GET] /websites', 'debug', [
+			'count'              => count($websites),
+			'total'              => $total,
+			'pages'              => $page,
+			'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
+		]);
+
+		return $websites;
 	}
 
 	/**

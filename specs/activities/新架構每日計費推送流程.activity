@@ -1,0 +1,31 @@
+[ACTIVITY] 新架構每日計費推送流程
+[ACTOR] ActionScheduler -> {specs/actors/ActionScheduler.md}
+[ACTOR] PowerCloud -> {specs/actors/PowerCloud.md}
+[ACTOR] CloudServer -> {specs/actors/CloudServer.md}
+
+[STEP:1] @ActionScheduler 每日 UTC+8 05:00 觸發計費推送排程 {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:1a] 推送前置條件檢查
+  [BRANCH:1a:PowerCloud API Key 不存在] @ActionScheduler 中止推送並寫 error log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:1a:partner_id 未設定] @ActionScheduler 中止推送並寫 error log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:1a:前置條件皆滿足] @ActionScheduler 繼續取得網站清單 {features/billing/推送新架構網站計費資料.feature}
+[MERGE:1a]
+
+[STEP:2] @ActionScheduler 呼叫 PowerCloud 取得經銷商帳號下的網站全量清單（分頁拉完） {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:2a] 網站清單取得結果
+  [BRANCH:2a:API 呼叫失敗] @ActionScheduler 進入重試流程 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單為空] @ActionScheduler 跳過本日推送並寫 info log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單含多個相異 userId] @ActionScheduler 視為異常，中止推送並寫告警 log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單正常] @ActionScheduler 過濾出 status 為 running 的網站 {features/billing/推送新架構網站計費資料.feature}
+[MERGE:2a]
+
+[STEP:3] @ActionScheduler 組裝 payload（partner_id / cloud_user_id / billing_date / sites） {features/billing/推送新架構網站計費資料.feature}
+
+[STEP:4] @ActionScheduler 以 Basic Auth 推送 payload 給 CloudServer {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:4a] 推送結果
+  [BRANCH:4a:HTTP 2xx] @ActionScheduler 寫入成功 log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:失敗且重試次數未達上限] @ActionScheduler 排程 30 分鐘後重試 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:失敗且重試次數已達上限] @ActionScheduler 寄信通知站台管理員並寫 error log {features/billing/推送新架構網站計費資料.feature}
+[MERGE:4a]

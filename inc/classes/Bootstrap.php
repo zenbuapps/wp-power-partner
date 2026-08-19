@@ -29,6 +29,7 @@ final class Bootstrap {
 
 		Domains\Email\Core\SubscriptionEmailHooks::instance();
 		Domains\Site\Core\DisableHooks::instance();
+		Domains\Billing\Core\DailyBillingCron::instance();
 		// 環境變數，調整 api auth
 		Base::set_api_auth( $this );
 
