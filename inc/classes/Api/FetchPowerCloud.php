@@ -292,6 +292,7 @@ abstract class FetchPowerCloud
 		];
 
 		$websites = [];
+		$seen     = [];
 		$total    = 0;
 		$page     = 1;
 
@@ -313,42 +314,90 @@ abstract class FetchPowerCloud
 				return null;
 			}
 
+			// /websites 的回應本身帶站台憑證（adminPassword / databaseRootPassword 等），
+			// 原文寫進 wc-logs 等同把該經銷商全部網站的明文密碼外洩，只留可診斷指紋
+			$raw_body    = (string) \wp_remote_retrieve_body($response);
+			$fingerprint = self::body_fingerprint($raw_body);
+
 			$response_code = (int) \wp_remote_retrieve_response_code($response);
 			if ($response_code < 200 || $response_code >= 300) {
 				Plugin::logger('fetch_websites http error', 'error', [
 					'page'               => $page,
 					'response_code'      => $response_code,
-					'body'               => \wp_remote_retrieve_body($response),
+					'body_length'        => $fingerprint['body_length'],
+					'body_keys'          => $fingerprint['body_keys'],
 					'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
 				]);
 				return null;
 			}
 
-			$response_body = json_decode(\wp_remote_retrieve_body($response), true);
+			$response_body = json_decode($raw_body, true);
 			if (!is_array($response_body) || !isset($response_body['data']) || !is_array($response_body['data'])) {
 				Plugin::logger('fetch_websites 回應格式異常', 'error', [
 					'page'               => $page,
-					'body'               => \wp_remote_retrieve_body($response),
+					'response_code'      => $response_code,
+					'body_length'        => $fingerprint['body_length'],
+					'body_keys'          => $fingerprint['body_keys'],
 					'powercloud_api_key' => self::mask_api_key($powercloud_api_key),
 				]);
 				return null;
 			}
 
 			$page_data = array_values($response_body['data']);
-			$total     = (int) ($response_body['total'] ?? count($page_data));
-			$websites  = [ ...$websites, ...$page_data ];
+
+			// total 只認第 1 頁 —— 對端「只在第 1 頁給 total」是常見實作，
+			// 每頁重讀會讓後續頁 fallback 成該頁筆數，累計數瞬間「達標」而 break，
+			// 1000 站只送 500 站且回報成功、無任何 error log（少送站 = 少收錢）
+			if (1 === $page) {
+				if (!isset($response_body['total']) || !is_numeric($response_body['total'])) {
+					Plugin::logger('fetch_websites 回應缺少 total，無法確認是否取完清單', 'error', [
+						'page'        => $page,
+						'body_length' => $fingerprint['body_length'],
+						'body_keys'   => $fingerprint['body_keys'],
+					]);
+					return null;
+				}
+				$total = (int) $response_body['total'];
+			}
+
+			// 逐筆去重 —— 對端若因改版／快取層／WAF 剝掉 query string 而忽略 page 參數，
+			// 每頁都回同一批資料，只看累計筆數會把同一批站累加 N 次，
+			// payload 送出重複 domain 後接收端逐筆加總，該經銷商會被多扣 N 倍
+			$added = 0;
+			foreach ($page_data as $website) {
+				$key = self::website_key($website);
+				if (isset($seen[$key])) {
+					continue;
+				}
+				$seen[$key] = true;
+				$websites[] = $website;
+				++$added;
+			}
 
 			// 已取完 total 筆
 			if (count($websites) >= $total) {
 				break;
 			}
 
-			// 尚未取完卻回空頁：分頁停滯，視為取得失敗（不可送出殘缺清單）
-			if (!$page_data) {
+			// 尚未取完卻沒有帶來任何新資料（空頁，或對端回同一批）：
+			// 分頁停滯，視為取得失敗（不可送出殘缺或重複的清單）
+			if (!$added) {
 				Plugin::logger('fetch_websites 分頁停滯，清單不完整', 'error', [
-					'page'     => $page,
-					'fetched'  => count($websites),
-					'total'    => $total,
+					'page'       => $page,
+					'page_count' => count($page_data),
+					'fetched'    => count($websites),
+					'total'      => $total,
+				]);
+				return null;
+			}
+
+			// 回傳筆數不足單頁上限即為最後一頁；此時仍未達 total 代表 total 與實際資料不一致
+			if (count($page_data) < self::WEBSITES_PAGE_LIMIT) {
+				Plugin::logger('fetch_websites 已無後續分頁但未取滿 total，清單不完整', 'error', [
+					'page'       => $page,
+					'page_count' => count($page_data),
+					'fetched'    => count($websites),
+					'total'      => $total,
 				]);
 				return null;
 			}
@@ -603,6 +652,57 @@ abstract class FetchPowerCloud
 		$random_animal_index = \array_rand($random_animals);
 
 		return $random_adjs[$random_adj_index] . '-' . $random_animals[$random_animal_index];
+	}
+
+	/**
+	 * 取得網站的去重鍵
+	 *
+	 * 以 id 為主；id 缺漏或非純量時退回整筆資料的雜湊 ——
+	 * 少了鍵就無法去重，而重複資料會讓經銷商被重複扣款，寧可用較弱的鍵也不能不去重。
+	 *
+	 * @param mixed $website 網站資料（外部 API 解碼後的未信任資料）
+	 * @return string
+	 */
+	private static function website_key(mixed $website): string
+	{
+		if (is_array($website) && isset($website['id']) && is_scalar($website['id'])) {
+			$id = trim((string) $website['id']);
+			if ('' !== $id) {
+				return 'id:' . $id;
+			}
+		}
+
+		return 'hash:' . sha1((string) \wp_json_encode($website));
+	}
+
+	/**
+	 * 回應 body 的可診斷指紋：只留長度與頂層鍵名，不含任何 value
+	 *
+	 * 專供 /websites 這種「回應本身帶憑證」的端點使用 —— 該端點回應含 adminEmail、
+	 * adminPassword、databaseUsername、databasePassword、databaseRootPassword，
+	 * 原文寫進 wc-logs 後對任何 manage_woocommerce 使用者可讀，也會進站台備份。
+	 * 指紋足以辨識「envelope 從 {data,total} 改成裸陣列或改名」這類格式改版。
+	 *
+	 * @param string $body 回應 body 原文
+	 * @return array{body_length: int, body_keys: array<int, string>}
+	 */
+	private static function body_fingerprint(string $body): array
+	{
+		$decoded = json_decode($body, true);
+
+		if (!is_array($decoded)) {
+			$keys = [];
+		} elseif (array_is_list($decoded)) {
+			// 裸陣列：鍵名全是流水號，記筆數即可
+			$keys = [ 'list:' . count($decoded) ];
+		} else {
+			$keys = array_map('strval', array_keys($decoded));
+		}
+
+		return [
+			'body_length' => strlen($body),
+			'body_keys'   => $keys,
+		];
 	}
 
 	/**
