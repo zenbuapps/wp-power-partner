@@ -62,8 +62,8 @@ final class DailyBillingCron {
 	/** @var string 已排程首推的外掛版本 option */
 	const BOOTSTRAP_VERSION_OPTION = 'power_partner_billing_bootstrap_version';
 
-	/** @var string 本地記錄的 cloud_user_id 綁定值 option */
-	const BOUND_CLOUD_USER_ID_OPTION = 'power_partner_billing_cloud_user_id';
+	/** @var string 本地記錄的經銷商 id（dealerId）綁定值 option */
+	const BOUND_DEALER_ID_OPTION = 'power_partner_billing_dealer_id';
 
 	/** @var int 啟用／升級後首推的延遲秒數 */
 	const BOOTSTRAP_DELAY = 60;
@@ -125,7 +125,7 @@ final class DailyBillingCron {
 	 * 外掛啟用或版本升級後立刻排一次首推
 	 *
 	 * 接收端以 Trust On First Use 綁定身分：首次收到某 partner_id 的推送時，才把 payload 的
-	 * cloud_user_id 存為該經銷商的綁定值。若等到隔日 05:00 才首推，功能發布當天全體經銷商
+	 * dealer_id 存為該經銷商的綁定值。若等到隔日 05:00 才首推，功能發布當天全體經銷商
 	 * 都處於「未綁定」狀態，會出現最長 24 小時、橫跨所有經銷商的搶綁窗口 —— 而 partner_id
 	 * 可由未認證的 GET /partner-id 讀出。立即排一次可把窗口壓到約 1 分鐘。
 	 *
@@ -255,9 +255,9 @@ final class DailyBillingCron {
 			return self::result( false, 'fetch_failed', $billing_date );
 		}
 
-		// 本地綁定值比對：接收端首推即綁定 cloud_user_id，之後不符就拒絕扣點。
+		// 本地綁定值比對：接收端首推即綁定 dealer_id，之後不符就拒絕扣點。
 		// 本地留一份對照，讓「PowerCloud 帳號被換掉」或「本地狀態異常」在送出前就被擋下
-		$bound = (string) \get_option( self::BOUND_CLOUD_USER_ID_OPTION, '' );
+		$bound = (string) \get_option( self::BOUND_DEALER_ID_OPTION, '' );
 
 		// 邊界：清單完全為空 → 仍需推送空 sites，不可跳過。
 		// 接收端的新架構合計 user meta 只在成功扣點時更新，且刻意設計成 stale 時沿用舊值不歸零
@@ -266,11 +266,11 @@ final class DailyBillingCron {
 		// 已無新架構站的經銷商被永久認定為大型經銷商，欠費時多拖 23 天才停用，且不會自我修復。
 		// 照常推送空 sites 之後接收端會把 meta 更新為 0，兩種情況即可區分。
 		if ( ! $websites ) {
-			// 沒有站就取不到 userId；接收端要求 cloud_user_id 為非空字串，只能取本地綁定值。
+			// 沒有站就取不到 dealerId；接收端要求 dealer_id 為非空字串，只能取本地綁定值。
 			// 沒有綁定值代表從未成功推送過，接收端也還沒有任何合計 meta 需要更新為 0
 			if ( '' === $bound ) {
 				Plugin::logger(
-					'新架構每日計費推送跳過：PowerCloud 網站清單為空，且本地尚無 cloud_user_id 綁定值',
+					'新架構每日計費推送跳過：PowerCloud 網站清單為空，且本地尚無經銷商 id（dealerId）綁定值',
 					'info',
 					[ 'billing_date' => $billing_date ]
 				);
@@ -281,18 +281,18 @@ final class DailyBillingCron {
 				'新架構每日計費：PowerCloud 網站清單為空，以本地綁定值推送空 sites，讓接收端把合計歸零',
 				'info',
 				[
-					'billing_date'  => $billing_date,
-					'cloud_user_id' => $bound,
+					'billing_date' => $billing_date,
+					'dealer_id'    => $bound,
 				]
 			);
 		}
 
-		$cloud_user_ids = $websites ? self::collect_cloud_user_ids( $websites ) : [ $bound ];
+		$dealer_ids = $websites ? self::collect_dealer_ids( $websites ) : [ $bound ];
 
-		// cloud_user_id 是接收端 TOFU 身分綁定的依據，取不到就必定被拒絕扣點，不推送
-		if ( ! $cloud_user_ids ) {
+		// dealer_id 是接收端 TOFU 身分綁定的依據，取不到就必定被拒絕扣點，不推送
+		if ( ! $dealer_ids ) {
 			Plugin::logger(
-				'新架構每日計費推送中止：網站清單取不到 cloud_user_id',
+				'新架構每日計費推送中止：網站清單取不到經銷商 id（dealerId）',
 				'error',
 				[
 					'billing_date'  => $billing_date,
@@ -301,45 +301,47 @@ final class DailyBillingCron {
 			);
 			self::notify_admin(
 				$billing_date,
-				'no_cloud_user_id',
-				'<p>PowerCloud 網站清單中所有網站都取不到 <code>userId</code>，本日計費資料未送出。</p><p>接收端以 cloud_user_id 做身分綁定比對，空值必定被拒絕扣點。這通常代表 PowerCloud 的 /websites 回應欄位已改版，請通知開發者確認。</p>'
+				'no_dealer_id',
+				'<p>PowerCloud 網站清單中所有網站都取不到經銷商 id（<code>user.dealerId</code>），本日計費資料未送出。</p><p>接收端以 dealer_id 做身分綁定比對，空值必定被拒絕扣點。這通常代表 PowerCloud 的 /websites 回應欄位已改版，請通知開發者確認。</p>'
 			);
-			return self::result( false, 'no_cloud_user_id', $billing_date );
+			return self::result( false, 'no_dealer_id', $billing_date );
 		}
 
-		// 同一把 API key 底下所有站應屬同一個 userId。出現多個代表該 key 權限範圍超出預期，
-		// 推送會把不屬於本經銷商的站算到他頭上，必須中止而非靜默取第一筆
-		if ( count( $cloud_user_ids ) > 1 ) {
+		// 同一把 API key 底下所有站應屬同一個經銷商（user.dealerId 相同）。出現多個代表該 key
+		// 權限範圍超出預期，推送會把不屬於本經銷商的站算到他頭上，必須中止而非靜默取第一筆。
+		// 注意識別的是「經銷商」不是「開站用戶」—— 同一經銷商底下有多個開站用戶是常態，
+		// user.id / userId 本來就會出現多個相異值，拿來當識別會讓本守衛每天誤觸發
+		if ( count( $dealer_ids ) > 1 ) {
 			Plugin::logger(
-				'新架構每日計費推送中止：網站清單出現多個相異 userId，API key 權限範圍異常',
+				'新架構每日計費推送中止：網站清單出現多個相異經銷商 id（dealerId），API key 權限範圍異常',
 				'error',
 				[
-					'billing_date'   => $billing_date,
-					'cloud_user_ids' => $cloud_user_ids,
+					'billing_date' => $billing_date,
+					'dealer_ids'   => $dealer_ids,
 				]
 			);
 			self::notify_admin(
 				$billing_date,
-				'multiple_cloud_user_ids',
+				'multiple_dealer_ids',
 				sprintf(
-					'<p>PowerCloud 網站清單出現多個相異 <code>userId</code>（%1$s），本日計費資料未送出。</p><p>正常情況下同一把 API key 底下所有站都屬同一個帳號，出現多個代表這把 key 的<strong>權限範圍</strong>已超出預期（例如被換成管理員層級的 key），權限模型可能已變更。若照推會把不屬於貴站的網站算到貴站頭上，因此直接中止。請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
-					\esc_html( implode( ', ', $cloud_user_ids ) )
+					'<p>PowerCloud 網站清單出現多個相異經銷商 id（<code>user.dealerId</code>：%1$s），本日計費資料未送出。</p><p>正常情況下同一把 API key 底下所有站都屬同一個經銷商，出現多個代表這把 key 的<strong>權限範圍</strong>已超出預期（例如被換成管理員層級的 key），權限模型可能已變更。若照推會把不屬於貴站的網站算到貴站頭上，因此直接中止。請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
+					\esc_html( implode( ', ', $dealer_ids ) )
 				)
 			);
-			return self::result( false, 'multiple_cloud_user_ids', $billing_date );
+			return self::result( false, 'multiple_dealer_ids', $billing_date );
 		}
 
-		// 多租戶守衛的旁路：collect_cloud_user_ids() 對取不到 id 的站一律略過，
-		// build_sites() 又完全不看 userId，因此「API key 權限範圍意外放大、且多出來的站
-		// userId 與 user 皆為 null」時，相異 id 集合仍只有一個 → 上面的守衛不觸發 →
+		// 多租戶守衛的旁路：collect_dealer_ids() 對取不到 id 的站一律略過，
+		// build_sites() 又完全不看 dealerId，因此「API key 權限範圍意外放大、且多出來的站
+		// user 為 null 或缺 dealerId」時，相異 id 集合仍只有一個 → 上面的守衛不觸發 →
 		// 不屬於本經銷商的站被算進 payload 並以本經銷商身分推送，接收端只驗 TOFU 綁定值照扣。
 		// 同一把 key 範圍內出現「沒有 owner 的可計費網站」本身就是異常訊號，中止而非靜默納入。
-		// 注意：這裡只做「中止或放行」，不得改成用 cloud_user_id 過濾清單 ——
+		// 注意：這裡只做「中止或放行」，不得改成用 dealer_id 過濾清單 ——
 		// 既有規格明確不做二次過濾（見 feature 的「不做二次過濾」Rule）
 		$orphan_count = $websites ? self::count_billable_sites_without_owner( $websites ) : 0;
 		if ( $orphan_count > 0 ) {
 			Plugin::logger(
-				'新架構每日計費推送中止：可計費網站中有站解析不出 user id，API key 權限範圍可能已放大',
+				'新架構每日計費推送中止：可計費網站中有站解析不出經銷商 id（dealerId），API key 權限範圍可能已放大',
 				'error',
 				[
 					'billing_date'  => $billing_date,
@@ -351,7 +353,7 @@ final class DailyBillingCron {
 				$billing_date,
 				'billable_site_without_owner',
 				sprintf(
-					'<p>PowerCloud 網站清單中有 %1$d 個 status 為 <code>%2$s</code> 的網站，其 <code>userId</code> 與 <code>user</code> 皆為空，無法確認擁有者，本日計費資料未送出。</p><p>同一把 API key 底下的站都應該有 owner。出現沒有 owner 的站，代表這把 key 的<strong>權限範圍</strong>可能已放大到其他帳號 —— 這類站若照推，會被以貴站的身分算進計費（接收端只比對 cloud_user_id，比對得過就照扣）。</p><p>請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
+					'<p>PowerCloud 網站清單中有 %1$d 個 status 為 <code>%2$s</code> 的網站，其經銷商 id（<code>user.dealerId</code>）為空，無法確認擁有者，本日計費資料未送出。</p><p>同一把 API key 底下的站都應該有 owner。出現沒有 owner 的站，代表這把 key 的<strong>權限範圍</strong>可能已放大到其他帳號 —— 這類站若照推，會被以貴站的身分算進計費（接收端只比對 dealer_id，比對得過就照扣）。</p><p>請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
 					$orphan_count,
 					self::BILLABLE_STATUS
 				)
@@ -359,29 +361,29 @@ final class DailyBillingCron {
 			return self::result( false, 'billable_site_without_owner', $billing_date );
 		}
 
-		$cloud_user_id = $cloud_user_ids[0];
+		$dealer_id = $dealer_ids[0];
 
-		if ( '' !== $bound && $bound !== $cloud_user_id ) {
+		if ( '' !== $bound && $bound !== $dealer_id ) {
 			Plugin::logger(
-				'新架構每日計費推送中止：cloud_user_id 與本地綁定值不符',
+				'新架構每日計費推送中止：經銷商 id（dealerId）與本地綁定值不符',
 				'error',
 				[
-					'billing_date'  => $billing_date,
-					'bound'         => $bound,
-					'cloud_user_id' => $cloud_user_id,
+					'billing_date' => $billing_date,
+					'bound'        => $bound,
+					'dealer_id'    => $dealer_id,
 				]
 			);
 			self::notify_admin(
 				$billing_date,
-				'cloud_user_id_changed',
+				'dealer_id_changed',
 				sprintf(
-					'<p>本次從 PowerCloud 網站清單解析出的 cloud_user_id（%1$s）與本地記錄的綁定值（%2$s）不符，本日計費資料未送出。</p><p>這代表 PowerCloud 帳號可能已更換，或本地狀態異常。接收端的身分綁定同樣不會自動換綁，硬推只會被拒絕，因此直接中止。</p><p>若確認是正常換綁，請聯絡 cloud.luke.cafe 管理員清除綁定，並刪除本站的 <code>%3$s</code> option 後重推。</p>',
-					\esc_html( $cloud_user_id ),
+					'<p>本次從 PowerCloud 網站清單解析出的經銷商 id（dealerId：%1$s）與本地記錄的綁定值（%2$s）不符，本日計費資料未送出。</p><p>這代表 PowerCloud 帳號可能已更換，或本地狀態異常。接收端的身分綁定同樣不會自動換綁，硬推只會被拒絕，因此直接中止。</p><p>若確認是正常換綁，請聯絡 cloud.luke.cafe 管理員清除綁定，並刪除本站的 <code>%3$s</code> option 後重推。</p>',
+					\esc_html( $dealer_id ),
 					\esc_html( $bound ),
-					self::BOUND_CLOUD_USER_ID_OPTION
+					self::BOUND_DEALER_ID_OPTION
 				)
 			);
-			return self::result( false, 'cloud_user_id_changed', $billing_date );
+			return self::result( false, 'dealer_id_changed', $billing_date );
 		}
 
 		$sites = $websites ? self::build_sites( $websites ) : [];
@@ -417,10 +419,10 @@ final class DailyBillingCron {
 		$total_amount = round( (float) array_sum( array_column( $sites, 'dailyCost' ) ), 2 );
 
 		$payload = [
-			'partner_id'    => (int) $partner_id,
-			'cloud_user_id' => $cloud_user_id,
-			'billing_date'  => $billing_date,
-			'sites'         => $sites,
+			'partner_id'   => (int) $partner_id,
+			'dealer_id'    => $dealer_id,
+			'billing_date' => $billing_date,
+			'sites'        => $sites,
 		];
 
 		$push = BillingPushClient::push( $payload );
@@ -433,7 +435,7 @@ final class DailyBillingCron {
 					'error',
 					[
 						'billing_date'  => $billing_date,
-						'cloud_user_id' => $cloud_user_id,
+						'dealer_id'     => $dealer_id,
 						'response_code' => $push['response_code'],
 					]
 				);
@@ -441,11 +443,31 @@ final class DailyBillingCron {
 					$billing_date,
 					'identity_mismatch',
 					sprintf(
-						'<p>cloud.luke.cafe 以 HTTP 403 拒絕本次推送，原因是 cloud_user_id 與該經銷商<strong>已綁定</strong>的值不符。本次推送的 cloud_user_id 為 %1$s。</p><p>接收端的綁定採 Trust On First Use（首次收到即綁定），不會自動換綁。重試三次也不會成功，因此不進入重試流程。</p><p>可能原因：(1) 貴站的 PowerCloud 帳號已更換；(2) 有人以貴站的 partner_id 搶先完成綁定。請立刻聯絡 cloud.luke.cafe 管理員核對綁定值。</p>',
-						\esc_html( $cloud_user_id )
+						'<p>cloud.luke.cafe 以 HTTP 403 拒絕本次推送，原因是經銷商 id（dealer_id）與該經銷商<strong>已綁定</strong>的值不符。本次推送的 dealer_id 為 %1$s。</p><p>接收端的綁定採 Trust On First Use（首次收到即綁定），不會自動換綁。重試三次也不會成功，因此不進入重試流程。</p><p>可能原因：(1) 貴站的 PowerCloud 帳號已更換；(2) 有人以貴站的 partner_id 搶先完成綁定。請立刻聯絡 cloud.luke.cafe 管理員核對綁定值。</p>',
+						\esc_html( $dealer_id )
 					)
 				);
 				return self::result( false, 'identity_mismatch', $billing_date, count( $sites ), $total_amount );
+			}
+
+			// 其餘永久性錯誤：接收端以 data.error_code 標示。重試三次也不會成功，
+			// 白重試只會讓管理員晚 90 分鐘才知道（資安審查 M2）
+			if ( $push['permanent'] ) {
+				Plugin::logger(
+					sprintf( '新架構每日計費推送遭拒：接收端回報永久性錯誤 %1$s，不進入重試流程', $push['error_code'] ),
+					'error',
+					[
+						'billing_date'  => $billing_date,
+						'error_code'    => $push['error_code'],
+						'response_code' => $push['response_code'],
+					]
+				);
+				self::notify_admin(
+					$billing_date,
+					$push['error_code'],
+					self::permanent_error_detail( $push['error_code'], $push['response_code'], $push['message'] )
+				);
+				return self::result( false, $push['error_code'], $billing_date, count( $sites ), $total_amount );
 			}
 
 			Plugin::logger(
@@ -465,13 +487,13 @@ final class DailyBillingCron {
 
 		// 首推成功才建立本地綁定 —— 之後每次推送都會先與此值比對
 		if ( '' === $bound ) {
-			\update_option( self::BOUND_CLOUD_USER_ID_OPTION, $cloud_user_id, true );
+			\update_option( self::BOUND_DEALER_ID_OPTION, $dealer_id, true );
 			Plugin::logger(
-				sprintf( '新架構每日計費：已記錄本地 cloud_user_id 綁定值 %1$s', $cloud_user_id ),
+				sprintf( '新架構每日計費：已記錄本地經銷商 id（dealerId）綁定值 %1$s', $dealer_id ),
 				'info',
 				[
-					'billing_date'  => $billing_date,
-					'cloud_user_id' => $cloud_user_id,
+					'billing_date' => $billing_date,
+					'dealer_id'    => $dealer_id,
 				]
 			);
 		}
@@ -486,7 +508,7 @@ final class DailyBillingCron {
 			'info',
 			[
 				'billing_date'   => $billing_date,
-				'cloud_user_id'  => $cloud_user_id,
+				'dealer_id'      => $dealer_id,
 				'website_count'  => count( $websites ),
 				'billable_count' => count( $sites ),
 				'total_amount'   => $total_amount,
@@ -658,10 +680,65 @@ final class DailyBillingCron {
 	}
 
 	/**
+	 * 永久性錯誤（接收端的 data.error_code）對應的通知信內文
+	 *
+	 * 代碼清單見 BillingPushClient::PERMANENT_ERROR_CODES。接收端未來新增代碼時，
+	 * 這裡沒對到就走 default 的通用文案，不會漏寄信。
+	 *
+	 * 一律附上接收端回的 message —— 光給管理員一個 `missing_field` 之類的代碼，
+	 * 他無從得知是哪一個參數出問題，等於查不下去。
+	 *
+	 * @param string $error_code    接收端回報的錯誤代碼
+	 * @param int    $response_code HTTP status code
+	 * @param string $message       接收端回報的 message（僅供顯示）
+	 * @return string
+	 */
+	private static function permanent_error_detail( string $error_code, int $response_code, string $message = '' ): string {
+		$detail = match ( $error_code ) {
+			'partner_not_found'    => '<p>cloud.luke.cafe 找不到本站 <code>partner_id</code> 對應的經銷商帳號，本日計費資料未送出。</p><p>可能是 partner_id 設錯，或該帳號已被刪除。請至後台重新連結 cloud.luke.cafe 取得正確的 partner_id。</p>',
+			'not_a_dealer'         => '<p>cloud.luke.cafe 回報本站 <code>partner_id</code> 對應的帳號<strong>不是經銷商</strong>，無法扣點，本日計費資料未送出。</p><p>請聯絡 cloud.luke.cafe 管理員確認該帳號的角色設定。</p>',
+			'invalid_billing_date' => '<p>cloud.luke.cafe 認為本次推送的 <code>billing_date</code> 超出可接受範圍，本日計費資料未送出。</p><p>這通常代表排程嚴重落後，或本站的主機時間不正確。請檢查 ActionScheduler 佇列與主機時間，並通知開發者。</p>',
+			'missing_field'        => '<p>cloud.luke.cafe 回報推送內容<strong>缺少</strong>必填欄位，本日計費資料未送出。</p><p>欄位整個沒送出，通常代表兩端的契約版本不一致（例如一端已改欄位名、另一端尚未更新）。請通知開發者核對 Power Partner 與 cloud.luke.cafe 的版本。</p>',
+			'invalid_field'        => '<p>cloud.luke.cafe 回報推送內容有欄位<strong>型別或格式不符</strong>，本日計費資料未送出。</p><p>欄位有送出但值不合法，代表發送端組出的資料有誤。請檢查資料組裝邏輯與 PowerCloud 回應格式，並看下方 message 確認是哪一個參數。</p>',
+			default                => '<p>cloud.luke.cafe 以永久性錯誤拒絕本次推送，本日計費資料未送出。</p><p>這類錯誤重試不會成功，請通知開發者確認。</p>',
+		};
+
+		$detail .= sprintf(
+			'<p>接收端回報：HTTP %1$d，錯誤代碼 <code>%2$s</code>。重試三次也不會成功，因此不進入重試流程。</p>',
+			$response_code,
+			\esc_html( $error_code )
+		);
+
+		if ( '' !== $message ) {
+			$detail .= sprintf( '<p>接收端 message：<code>%1$s</code></p>', \esc_html( self::truncate( $message ) ) );
+		}
+
+		return $detail;
+	}
+
+	/**
+	 * 截斷過長的字串（供通知信顯示用）
+	 *
+	 * 接收端的 message 長度不受本站控制，中介設備也可能塞入大量內容，
+	 * 原樣貼進信件會產生無法閱讀的巨信。
+	 *
+	 * @param string $text  原字串
+	 * @param int    $limit 上限字元數
+	 * @return string
+	 */
+	private static function truncate( string $text, int $limit = 300 ): string {
+		if ( mb_strlen( $text ) <= $limit ) {
+			return $text;
+		}
+
+		return mb_substr( $text, 0, $limit ) . '…';
+	}
+
+	/**
 	 * 推送中止／失敗：寄信通知站台管理員 + error log
 	 *
 	 * 漏推一天等於少收一天錢，必須有人看得見 —— 設定類的中止路徑（缺 partner_id、缺 API Key、
-	 * 缺 cloud_user_id、多個 cloud_user_id）不會自行復原，只寫 log 等於沒人知道。
+	 * 缺 dealer_id、多個 dealer_id）不會自行復原，只寫 log 等於沒人知道。
 	 *
 	 * @param string $billing_date 業務日期
 	 * @param string $reason       原因
@@ -694,15 +771,15 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 收集網站清單中出現過的相異 cloud user id（解析不出的站略過）
+	 * 收集網站清單中出現過的相異經銷商 id（解析不出的站略過）
 	 *
-	 * 注意：略過的站不會出現在這個集合裡，所以「多個相異 userId」守衛看不到它們 ——
+	 * 注意：略過的站不會出現在這個集合裡，所以「多個相異 dealerId」守衛看不到它們 ——
 	 * 那條旁路由 count_billable_sites_without_owner() 補上。
 	 *
 	 * @param array<int, mixed> $websites 網站清單
 	 * @return array<int, string>
 	 */
-	private static function collect_cloud_user_ids( array $websites ): array {
+	private static function collect_dealer_ids( array $websites ): array {
 		$ids = [];
 
 		foreach ( $websites as $website ) {
@@ -710,7 +787,7 @@ final class DailyBillingCron {
 				continue;
 			}
 
-			$id = self::resolve_cloud_user_id( $website );
+			$id = self::resolve_dealer_id( $website );
 			if ( '' === $id ) {
 				continue;
 			}
@@ -722,22 +799,34 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 解析單一網站的 cloud user id（取不到時回空字串）
+	 * 解析單一網站的經銷商 id（取不到時回空字串）
 	 *
-	 * 以 userId 為主要來源；部分回應只帶巢狀的 user.id，沿用既有前端的 fallback 慣例
-	 * （見 js/src/pages/AdminApp/Dashboard/SiteList/WebsiteEditor/WebsiteEditorForm.tsx 的 `userId ?? user?.id`）。
+	 * 取值一律是巢狀的 `user.dealerId`，**不是** `userId`、也不是 `user.id`。
+	 * PowerCloud 的帳號是三層階層：
+	 *
+	 *   經銷商（dealer）  dealerId: 181f2bbe-1292-459a-a814-0baa72423636  ← 計費／綁定對象
+	 *     └─ 開站用戶      user.id:  e77dcfa2-0687-49a5-a54a-50f721fef8bd  ← 只是操作者
+	 *          └─ 網站      vibrant-panda-34812
+	 *
+	 * 一個經銷商底下可以有多個開站用戶，因此 `userId` / `user.id` 在同一批回應中本來就會出現
+	 * 多個相異值。拿那兩個欄位當識別，會讓「多個相異識別值視為異常」的守衛每天誤觸發、
+	 * 整天一行都推不出去，同時 TOFU 綁定也會綁到錯的 id。**請勿改回 userId。**
+	 *
+	 * `user` 的 API 型別是 `{...} | null`，故不預設它是陣列。刻意不做 fallback ——
+	 * 解析不出經銷商 id 時寧可中止並通知，也不要猜一個 id 去扣別人的點。
 	 *
 	 * 鍵型保持 mixed —— 這是外部 API 解碼後的未信任資料，不保證是字串鍵。
 	 *
 	 * @param array<mixed, mixed> $website 網站資料
 	 * @return string
 	 */
-	private static function resolve_cloud_user_id( array $website ): string {
-		$raw = $website['userId'] ?? null;
-		if ( ( null === $raw || '' === $raw ) && isset( $website['user'] ) && is_array( $website['user'] ) ) {
-			$raw = $website['user']['id'] ?? null;
+	private static function resolve_dealer_id( array $website ): string {
+		$user = $website['user'] ?? null;
+		if ( ! is_array( $user ) ) {
+			return '';
 		}
 
+		$raw = $user['dealerId'] ?? null;
 		if ( ! is_scalar( $raw ) ) {
 			return '';
 		}
@@ -746,7 +835,7 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 統計「可計費（status 為 running）但解析不出 owner」的網站數
+	 * 統計「可計費（status 為 running）但解析不出 owner（經銷商 id）」的網站數
 	 *
 	 * 只看可計費網站 —— 非 running 的站本來就不進 payload，缺 owner 不影響計費。
 	 *
@@ -766,7 +855,7 @@ final class DailyBillingCron {
 				continue;
 			}
 
-			if ( '' === self::resolve_cloud_user_id( $website ) ) {
+			if ( '' === self::resolve_dealer_id( $website ) ) {
 				++$count;
 			}
 		}

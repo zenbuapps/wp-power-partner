@@ -12,15 +12,18 @@
  *   前置（狀態）- 外掛啟用／版本升級後立刻排一次首推（壓縮 TOFU 搶綁窗口）
  *   前置（狀態）- API Key / partner_id 缺漏時中止推送
  *   後置（狀態）- 分頁拉完全量、total 只認第 1 頁、分頁以 id 去重、不做二次過濾、只計 running、
- *                cloud_user_id、billing_date 取自最近一次排程 slot、首推成功後記錄本地綁定值、
+ *                dealer_id、billing_date 取自最近一次排程 slot、首推成功後記錄本地綁定值、
  *                domain 優先序、Basic Auth
  *   後置（事件）- 成功寫 info log（含計費站數與總金額）、排程漂移超過門檻寫 error log
- *   錯誤處理    - 無 cloud_user_id / 清單取得失敗 / 推送重試 3 次 / 重試上限寄信 /
+ *   錯誤處理    - 無 dealer_id / 清單取得失敗 / 推送重試 3 次 / 重試上限寄信 /
  *                dailyCost 異常值 / API Key 不落地 log / /websites 回應原文不落地 log /
  *                設定類中止一律通知管理員 / 本地綁定值不符 / 接收端回 403 綁定不符
- *   邊界條件    - 清單為空仍推送空 sites（無本地綁定值才跳過）、多個相異 userId 中止、
- *                可計費網站解析不出 owner 時中止、全部非 running 仍推送金額 0、
- *                清單非空卻無可計費網站時告警
+ *   邊界條件    - 清單為空仍推送空 sites（無本地綁定值才跳過）、多個開站用戶共用一個 dealerId
+ *                仍正常推送、多個相異 dealerId 中止、可計費網站解析不出 dealerId 時中止、
+ *                全部非 running 仍推送金額 0、清單非空卻無可計費網站時告警
+ *
+ * 網站 mock 的形狀很關鍵：識別值是巢狀的 `user.dealerId`，**不是** `userId` / `user.id`。
+ * 詳見 make_website() 的說明與 DailyBillingCron::resolve_dealer_id() 的階層圖。
  */
 
 declare( strict_types=1 );
@@ -40,9 +43,25 @@ use J7\PowerPartner\Domains\Billing\Core\DailyBillingCron;
  */
 class DailyBillingPushTest extends TestCase {
 
-	private const API_KEY       = 'pk_test_123';
-	private const PARTNER_ID    = '174';
-	private const CLOUD_USER_ID = 'cu-1111-aaaa';
+	private const API_KEY    = 'pk_test_123';
+	private const PARTNER_ID = '174';
+
+	/**
+	 * 經銷商 id（website.user.dealerId）—— 計費與 TOFU 綁定的識別值
+	 *
+	 * 值取自站長提供的真實 GET /websites 回應，刻意不用 'cu-1111-aaaa' 這種假格式：
+	 * 假格式看不出「dealerId 與 userId 是兩個不同層級的 id」，本次 bug 正是因此漏測。
+	 */
+	private const DEALER_ID = '181f2bbe-1292-459a-a814-0baa72423636';
+
+	/** @var string 開站用戶 id（website.userId / website.user.id）—— **不是**計費識別值 */
+	private const USER_ID = 'e77dcfa2-0687-49a5-a54a-50f721fef8bd';
+
+	/** @var string 同一經銷商底下的第二個開站用戶（production 的實際樣貌） */
+	private const USER_ID_2 = 'a1b2c3d4-1111-2222-3333-444455556666';
+
+	/** @var string 同一經銷商底下的第三個開站用戶 */
+	private const USER_ID_3 = 'f9e8d7c6-9999-8888-7777-666655554444';
 
 	/** @var array<int, array{url: string, args: array<string, mixed>}> 攔截到的所有 HTTP 請求 */
 	private array $requests = [];
@@ -83,7 +102,7 @@ class DailyBillingPushTest extends TestCase {
 		\as_unschedule_all_actions( DailyBillingCron::RETRY_HOOK );
 
 		// bootstrap 的 init 可能已寫入這些 option，逐一清掉以免干擾斷言
-		\delete_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION );
+		\delete_option( DailyBillingCron::BOUND_DEALER_ID_OPTION );
 		\delete_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION );
 		\delete_option( DailyBillingCron::SCHEDULE_VERSION_OPTION );
 	}
@@ -94,7 +113,7 @@ class DailyBillingPushTest extends TestCase {
 	public function tear_down(): void {
 		\delete_transient( Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
 		\delete_option( Connect::PARTNER_ID_OPTION_NAME );
-		\delete_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION );
+		\delete_option( DailyBillingCron::BOUND_DEALER_ID_OPTION );
 		\delete_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION );
 		\delete_option( DailyBillingCron::SCHEDULE_VERSION_OPTION );
 
@@ -242,21 +261,79 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * 建立一筆 PowerCloud 網站資料
+	 * 建立一筆 PowerCloud 網站資料（真實巢狀結構）
 	 *
-	 * @param array<string, mixed> $overrides 覆寫欄位
+	 * 結構取自站長提供的真實 GET /websites 回應（2026-08-20，total: 358）：
+	 *
+	 *   {
+	 *     "id": "58c46391-…", "primaryDomain": "vibrant-panda-34812.wpsite.pro",
+	 *     "status": "running", "dailyCost": "7.67", "dailyCostDate": "2026-08-20",
+	 *     "userId": "e77dcfa2-…",
+	 *     "user": { "id": "e77dcfa2-…", "role": "dealer", "dealerId": "181f2bbe-…", "email": "…" }
+	 *   }
+	 *
+	 * 刻意保留頂層 `userId` 與 `user.id`：計費識別值必須取 `user.dealerId`，
+	 * 若哪天有人把取值改回 userId，「多個開站用戶共用一個 dealerId」那條測試就會紅。
+	 * mock 務必維持這個巢狀形狀 —— 舊版扁平 mock 每筆 userId 都一樣，
+	 * 相異值永遠只有 1 個，守衛永遠不觸發，正是本次 bug 漏測的原因。
+	 *
+	 * @param array<string, mixed> $overrides 覆寫欄位（`user` 可整個換掉，含設為 null）
 	 * @return array<string, mixed>
 	 */
 	private function make_website( array $overrides = [] ): array {
 		return array_merge(
 			[
-				'id'             => 'ws-' . \wp_generate_password( 8, false ),
-				'primaryDomain'  => 'a.wpsite.pro',
-				'status'         => 'running',
-				'dailyCost'      => 10.5,
-				'userId'         => self::CLOUD_USER_ID,
+				'id'            => 'ws-' . \wp_generate_password( 8, false ),
+				'primaryDomain' => 'a.wpsite.pro',
+				'status'        => 'running',
+				'dailyCost'     => 10.5,
+				'dailyCostDate' => '2026-08-20',
+				'userId'        => self::USER_ID,
+				'user'          => $this->make_user( self::USER_ID ),
 			],
 			$overrides
+		);
+	}
+
+	/**
+	 * 組出 website.user 節點（經銷商底下的一個開站用戶）
+	 *
+	 * @param string      $user_id   開站用戶 id
+	 * @param string|null $dealer_id 經銷商 id；null 表示回應中根本沒有 dealerId 欄位
+	 * @return array<string, mixed>
+	 */
+	private function make_user( string $user_id, ?string $dealer_id = self::DEALER_ID ): array {
+		$user = [
+			'id'   => $user_id,
+			'role' => 'dealer',
+		];
+
+		if ( null !== $dealer_id ) {
+			$user['dealerId'] = $dealer_id;
+		}
+
+		$user['email'] = "ops-{$user_id}@example.com";
+
+		return $user;
+	}
+
+	/**
+	 * 建立一筆「屬於指定開站用戶」的網站（頂層 userId 與 user.id 同步）
+	 *
+	 * @param string               $user_id   開站用戶 id
+	 * @param array<string, mixed> $overrides 其餘覆寫欄位
+	 * @param string|null          $dealer_id 經銷商 id；null 表示缺 dealerId 欄位
+	 * @return array<string, mixed>
+	 */
+	private function make_website_of_user( string $user_id, array $overrides = [], ?string $dealer_id = self::DEALER_ID ): array {
+		return $this->make_website(
+			array_merge(
+				[
+					'userId' => $user_id,
+					'user'   => $this->make_user( $user_id, $dealer_id ),
+				],
+				$overrides
+			)
 		);
 	}
 
@@ -546,11 +623,11 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * Rule: 網站清單的範圍即為計費集合，不以 cloud_user_id 二次過濾
+	 * Rule: 網站清單的範圍即為計費集合，不以 dealer_id 二次過濾
 	 *
 	 * @group happy
 	 */
-	public function test_does_not_filter_list_by_cloud_user_id(): void {
+	public function test_does_not_filter_list_by_dealer_id(): void {
 		$this->mock_http(
 			[
 				$this->make_website(
@@ -609,11 +686,11 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * Rule: cloud_user_id 取自網站清單的 userId 欄位
+	 * Rule: dealer_id 取自網站清單的 user.dealerId 欄位（不是 userId、不是 user.id）
 	 *
 	 * @group happy
 	 */
-	public function test_cloud_user_id_comes_from_website_list(): void {
+	public function test_dealer_id_comes_from_nested_user_dealer_id(): void {
 		$this->mock_http(
 			[
 				$this->make_website(
@@ -636,7 +713,51 @@ class DailyBillingPushTest extends TestCase {
 
 		$payload = $this->push_payload();
 		$this->assertNotNull( $payload );
-		$this->assertSame( self::CLOUD_USER_ID, $payload['cloud_user_id'] );
+		$this->assertSame( self::DEALER_ID, $payload['dealer_id'] );
+		$this->assertNotSame( self::USER_ID, $payload['dealer_id'], 'dealer_id 不得取成開站用戶 id' );
+	}
+
+	/**
+	 * Rule（本次 bug 的迴歸測試）: 同一經銷商底下有多個開站用戶時仍正常推送
+	 *
+	 * production 的實際樣貌就是這樣 —— 一個經銷商 358 個站分屬多個開站用戶。
+	 * 舊實作取 userId / user.id 當識別，這個情境會湊出多個相異值 →
+	 * 觸發「多個相異識別值視為異常」守衛 → 每天中止推送，一行都推不出去。
+	 *
+	 * @group smoke
+	 * @group happy
+	 */
+	public function test_pushes_when_multiple_users_share_one_dealer(): void {
+		$this->mock_http(
+			[
+				$this->make_website_of_user( self::USER_ID, [ 'primaryDomain' => 'a.wpsite.pro' ] ),
+				$this->make_website_of_user(
+					self::USER_ID_2,
+					[
+						'primaryDomain' => 'b.wpsite.pro',
+						'dailyCost'     => 20.0,
+					]
+				),
+				$this->make_website_of_user(
+					self::USER_ID_3,
+					[
+						'primaryDomain' => 'c.wpsite.pro',
+						'dailyCost'     => 0.25,
+					]
+				),
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertTrue( $result['pushed'], '同一經銷商底下有多個開站用戶是常態，不得誤判為權限異常而中止' );
+		$this->assertSame( 3, $result['billable_count'] );
+		$this->assertEqualsWithDelta( 30.75, $result['total_amount'], 0.001 );
+
+		$payload = $this->push_payload();
+		$this->assertNotNull( $payload );
+		$this->assertSame( self::DEALER_ID, $payload['dealer_id'], '三個開站用戶共用同一個 dealerId' );
+		$this->assertCount( 3, $payload['sites'] );
 	}
 
 	/**
@@ -840,21 +961,39 @@ class DailyBillingPushTest extends TestCase {
 	// ========================================================================
 
 	/**
-	 * Rule: 無法取得 cloud_user_id 時中止推送並寫 error log
+	 * Rule: 無法取得 dealer_id 時中止推送並寫 error log
 	 *
+	 * 刻意保留頂層 userId：它不是識別值，有沒有都不能讓推送成立。
+	 *
+	 * @dataProvider provide_missing_dealer_id
 	 * @group error
+	 *
+	 * @param string $shape user 節點的形狀
 	 */
-	public function test_aborts_when_no_cloud_user_id(): void {
-		$site = $this->make_website();
-		unset( $site['userId'] );
+	public function test_aborts_when_no_dealer_id( string $shape ): void {
+		$site         = $this->make_website();
+		$site['user'] = 'null' === $shape ? null : $this->make_user( self::USER_ID, null );
+
 		$this->mock_http( [ $site ] );
 
 		$result = DailyBillingCron::run();
 
 		$this->assertFalse( $result['pushed'] );
-		$this->assertSame( 'no_cloud_user_id', $result['reason'] );
-		$this->assert_not_pushed( '取不到 cloud_user_id 時不得以空值推送' );
+		$this->assertSame( 'no_dealer_id', $result['reason'] );
+		$this->assert_not_pushed( '取不到 dealer_id 時不得以空值推送' );
 		$this->assert_log( 'error' );
+	}
+
+	/**
+	 * 兩種取不到 dealerId 的形狀（API 型別為 user: {...} | null）
+	 *
+	 * @return array<string, array{0: string}>
+	 */
+	public function provide_missing_dealer_id(): array {
+		return [
+			'user 為 null'   => [ 'null' ],
+			'user 缺 dealerId' => [ 'no_dealer_id' ],
+		];
 	}
 
 	/**
@@ -1015,6 +1154,42 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
+	 * Rule 邊界: 真實回應的 dailyCost 是**數值字串**（"7.67"），須照常計入而非退回 0
+	 *
+	 * 站長提供的真實 /websites 回應帶的是字串；其餘 mock 為求可讀性用 float。
+	 * 這條測試補上那個型別落差，避免哪天有人把 is_numeric() 收緊成 is_float() 而靜默漏收。
+	 *
+	 * @group edge
+	 */
+	public function test_numeric_string_daily_cost_is_counted(): void {
+		$this->mock_http(
+			[
+				$this->make_website(
+					[
+						'primaryDomain' => 'a.wpsite.pro',
+						'dailyCost'     => '7.67',
+					]
+				),
+				$this->make_website(
+					[
+						'primaryDomain' => 'b.wpsite.pro',
+						'dailyCost'     => '2.33',
+					]
+				),
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertTrue( $result['pushed'] );
+		$this->assertEqualsWithDelta( 10.0, $result['total_amount'], 0.001, '數值字串的 dailyCost 不得被當成異常值以 0 計' );
+
+		$payload = $this->push_payload();
+		$this->assertNotNull( $payload );
+		$this->assertEqualsWithDelta( 7.67, $payload['sites'][0]['dailyCost'], 0.001 );
+	}
+
+	/**
 	 * Rule: API Key 一律不得以原文寫入 log
 	 *
 	 * @group error
@@ -1050,7 +1225,7 @@ class DailyBillingPushTest extends TestCase {
 	 * @group edge
 	 */
 	public function test_pushes_empty_sites_when_list_empty_and_binding_known(): void {
-		\update_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION, self::CLOUD_USER_ID );
+		\update_option( DailyBillingCron::BOUND_DEALER_ID_OPTION, self::DEALER_ID );
 		$this->mock_http( [] );
 
 		$result = DailyBillingCron::run();
@@ -1062,15 +1237,15 @@ class DailyBillingPushTest extends TestCase {
 		$this->assertNotNull( $payload );
 		$this->assertSame( [], $payload['sites'] );
 		$this->assertSame(
-			self::CLOUD_USER_ID,
-			$payload['cloud_user_id'],
-			'清單為空時取不到 userId，cloud_user_id 改用本地綁定值'
+			self::DEALER_ID,
+			$payload['dealer_id'],
+			'清單為空時取不到 dealerId，dealer_id 改用本地綁定值'
 		);
 	}
 
 	/**
 	 * Rule: 清單為空且從未成功推送過時跳過本日推送
-	 * 沒有本地綁定值就湊不出 cloud_user_id（接收端要求非空字串），
+	 * 沒有本地綁定值就湊不出 dealer_id（接收端要求非空字串），
 	 * 而且從未推送成功代表接收端也還沒有任何合計 meta 需要更新為 0
 	 *
 	 * @group edge
@@ -1082,31 +1257,30 @@ class DailyBillingPushTest extends TestCase {
 
 		$this->assertFalse( $result['pushed'] );
 		$this->assertSame( 'empty_list', $result['reason'] );
-		$this->assert_not_pushed( '沒有 cloud_user_id 可用時不得送出 payload' );
+		$this->assert_not_pushed( '沒有 dealer_id 可用時不得送出 payload' );
 		$this->assert_log( 'info' );
 		$this->assertNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), '清單為空不是失敗，不應重試' );
 	}
 
 	/**
-	 * Rule: 網站清單出現多個相異 userId 時視為異常，中止推送並寫告警 log
+	 * Rule: 網站清單出現多個相異 dealerId 時視為異常，中止推送並寫告警 log
+	 *
+	 * 對照 test_pushes_when_multiple_users_share_one_dealer：多個開站用戶正常，
+	 * 多個經銷商才異常 —— 兩條測試合起來才鎖得住識別值取哪一層。
 	 *
 	 * @group edge
 	 */
-	public function test_aborts_when_multiple_distinct_user_ids(): void {
+	public function test_aborts_when_multiple_distinct_dealer_ids(): void {
 		$this->mock_http(
 			[
-				$this->make_website(
-					[
-						'primaryDomain' => 'a.wpsite.pro',
-						'userId'        => 'cu-1111-aaaa',
-					]
-				),
-				$this->make_website(
+				$this->make_website_of_user( self::USER_ID, [ 'primaryDomain' => 'a.wpsite.pro' ] ),
+				$this->make_website_of_user(
+					self::USER_ID_2,
 					[
 						'primaryDomain' => 'b.wpsite.pro',
-						'userId'        => 'cu-9999-zzzz',
 						'dailyCost'     => 20.0,
-					]
+					],
+					'99999999-dead-beef-0000-000000000000'
 				),
 			]
 		);
@@ -1114,8 +1288,8 @@ class DailyBillingPushTest extends TestCase {
 		$result = DailyBillingCron::run();
 
 		$this->assertFalse( $result['pushed'] );
-		$this->assertSame( 'multiple_cloud_user_ids', $result['reason'] );
-		$this->assert_not_pushed( '多個 userId 時不得靜默取第一筆推送' );
+		$this->assertSame( 'multiple_dealer_ids', $result['reason'] );
+		$this->assert_not_pushed( '多個 dealerId 時不得靜默取第一筆推送' );
 		$this->assert_log( 'error' );
 	}
 
@@ -1260,7 +1434,7 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * Rule: 首次推送成功後把 cloud_user_id 存為本地綁定值
+	 * Rule: 首次推送成功後把 dealer_id 存為本地綁定值
 	 *
 	 * @group happy
 	 */
@@ -1271,39 +1445,39 @@ class DailyBillingPushTest extends TestCase {
 
 		$this->assertTrue( $result['pushed'] );
 		$this->assertSame(
-			self::CLOUD_USER_ID,
-			\get_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION ),
-			'首推成功後應記下本次使用的 cloud_user_id'
+			self::DEALER_ID,
+			\get_option( DailyBillingCron::BOUND_DEALER_ID_OPTION ),
+			'首推成功後應記下本次使用的 dealer_id（經銷商 id，不是開站用戶 id）'
 		);
 	}
 
 	/**
-	 * Rule: 本次解析出的 cloud_user_id 與本地綁定值不符時中止推送並通知管理員
+	 * Rule: 本次解析出的 dealer_id 與本地綁定值不符時中止推送並通知管理員
 	 * 代表 PowerCloud 帳號被換或本地狀態異常，不可自動改推新值
 	 *
 	 * @group error
 	 */
-	public function test_aborts_when_cloud_user_id_differs_from_local_binding(): void {
-		\update_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION, 'cu-0000-old' );
+	public function test_aborts_when_dealer_id_differs_from_local_binding(): void {
+		\update_option( DailyBillingCron::BOUND_DEALER_ID_OPTION, '00000000-old0-old0-old0-000000000000' );
 		$this->mock_http( [ $this->make_website() ] );
 
 		$result = DailyBillingCron::run();
 
 		$this->assertFalse( $result['pushed'] );
-		$this->assertSame( 'cloud_user_id_changed', $result['reason'] );
+		$this->assertSame( 'dealer_id_changed', $result['reason'] );
 		$this->assert_not_pushed( '本地綁定值不符時不得推送' );
 		$this->assert_log( 'error' );
 		$this->assertNotEmpty( $this->mails, '綁定值變動須立即通知管理員' );
 		$this->assertNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), '非暫時性錯誤，不應重試' );
 		$this->assertSame(
-			'cu-0000-old',
-			\get_option( DailyBillingCron::BOUND_CLOUD_USER_ID_OPTION ),
+			'00000000-old0-old0-old0-000000000000',
+			\get_option( DailyBillingCron::BOUND_DEALER_ID_OPTION ),
 			'不得以新值覆寫既有綁定'
 		);
 	}
 
 	/**
-	 * Rule: 接收端回 403 且訊息表示身分綁定不符時，立即通知管理員、不進入一般重試
+	 * Rule: 接收端回 403 且 data.error_code 為 identity_mismatch 時，立即通知管理員、不進入一般重試
 	 *
 	 * @group error
 	 */
@@ -1314,8 +1488,8 @@ class DailyBillingPushTest extends TestCase {
 				'cloud_status' => 403,
 				'cloud_body'   => [
 					'status'  => 403,
-					'message' => 'cloud_user_id 與已綁定值不符',
-					'data'    => [],
+					'message' => 'dealer_id 與已綁定值不符',
+					'data'    => [ 'error_code' => 'identity_mismatch' ],
 				],
 			]
 		);
@@ -1330,6 +1504,226 @@ class DailyBillingPushTest extends TestCase {
 			'綁定不符重試三次也不會成功，不得當成一般 push_failed'
 		);
 		$this->assert_log( 'error' );
+	}
+
+	/**
+	 * Rule: 判定身分綁定不符只認 data.error_code，**不得**比對 message 文案
+	 *
+	 * 舊實作比對「cloud_user_id」字串，接收端隨 dealer_id 改名換掉文案之後整條就失效了。
+	 * 文案不是契約的一部分 —— 這條測試鎖住「文案對得上但沒有 error_code 時不得判為綁定不符」。
+	 *
+	 * @group error
+	 */
+	public function test_identity_mismatch_not_inferred_from_message_text(): void {
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_status' => 403,
+				'cloud_body'   => [
+					'status'  => 403,
+					'message' => 'dealer_id 與已綁定值不符',
+					'data'    => [],
+				],
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertFalse( $result['pushed'] );
+		$this->assertSame( 'push_failed', $result['reason'], '沒有 error_code 就維持既有的一般失敗行為' );
+		$this->assertNotNull(
+			$this->next_scheduled( DailyBillingCron::RETRY_HOOK ),
+			'取不到 error_code 時不得改變既有路徑，仍須進重試流程'
+		);
+	}
+
+	/**
+	 * Rule: 中介 WAF／反向代理擋下的 403（非 JSON body）不得被誤判為永久性錯誤
+	 *
+	 * 誤判成永久性錯誤會讓一次暫時性的 403 完全不重試，當天就此漏推。
+	 *
+	 * @group error
+	 */
+	public function test_waf_style_403_still_retries(): void {
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_status' => 403,
+				'cloud_body'   => '<html><body>403 Forbidden</body></html>',
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertFalse( $result['pushed'] );
+		$this->assertSame( 'push_failed', $result['reason'] );
+		$this->assertNotNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), 'WAF 的 403 是暫時性的，須重試' );
+	}
+
+	/**
+	 * Rule: 其餘永久性錯誤代碼一律立即通知管理員且不重試（資安審查 M2）
+	 *
+	 * @dataProvider provide_permanent_error_code
+	 * @group error
+	 *
+	 * @param string $error_code       接收端回報的錯誤代碼
+	 * @param int    $response_code    HTTP status code
+	 * @param string $needle           通知信中應出現的關鍵字
+	 * @param string $upstream_message 接收端回報的 message
+	 */
+	public function test_permanent_error_notifies_admin_without_retry(
+		string $error_code,
+		int $response_code,
+		string $needle,
+		string $upstream_message
+	): void {
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_status' => $response_code,
+				'cloud_body'   => [
+					'status'  => $response_code,
+					'message' => $upstream_message,
+					'data'    => [ 'error_code' => $error_code ],
+				],
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertFalse( $result['pushed'] );
+		$this->assertSame( $error_code, $result['reason'] );
+		$this->assertNotEmpty( $this->mails, "永久性錯誤 {$error_code} 須立即通知管理員" );
+		$this->assertNull(
+			$this->next_scheduled( DailyBillingCron::RETRY_HOOK ),
+			"永久性錯誤 {$error_code} 重試三次也不會成功，不得進重試流程"
+		);
+
+		$mail_body = (string) ( $this->mails[0]['message'] ?? '' );
+		$this->assertStringContainsString( $needle, $mail_body );
+		$this->assertStringContainsString( $error_code, $mail_body, '通知信須帶錯誤代碼供比對' );
+		$this->assertStringContainsString(
+			$upstream_message,
+			$mail_body,
+			'通知信須帶接收端的 message —— 只給代碼管理員查不出是哪個參數'
+		);
+		$this->assert_log( 'error' );
+	}
+
+	/**
+	 * 接收端定義的永久性錯誤代碼（message 取自接收端 DailyBilling.php 的實際文案）
+	 *
+	 * 代碼**刻意寫死字面值**，不引用自家常數 —— 這是跨系統契約，字面值才是契約本身。
+	 * 若改成拿本專案的常數來比對，比較的兩邊會來自同一個來源，改常數兩邊一起變，
+	 * 契約破裂時測試照樣綠燈（已用 mutation test 驗證過本組測試會紅）。
+	 *
+	 * @return array<string, array{0: string, 1: int, 2: string, 3: string}>
+	 */
+	public function provide_permanent_error_code(): array {
+		return [
+			'用戶不存在 404'      => [ 'partner_not_found', 404, 'partner_id', '找不到 partner_id #174 對應的用戶' ],
+			'非經銷商 500'       => [ 'not_a_dealer', 500, '不是經銷商', '用戶 #174 非初階或高階經銷商，不扣點' ],
+			'billing_date 越界' => [ 'invalid_billing_date', 400, '主機時間', 'billing_date 超出允許區間' ],
+			'必填欄位缺漏 400'    => [ 'missing_field', 400, '契約版本', '缺少必要參數: dealer_id' ],
+			'欄位型別不符 400'    => [ 'invalid_field', 400, '資料組裝邏輯', 'partner_id 必須為正整數' ],
+		];
+	}
+
+	/**
+	 * Rule: missing_field 與 invalid_field 的診斷方向必須不同
+	 *
+	 * 兩者處置相同（通知 + 不重試）但**診斷不同**：前者是欄位整個沒送出（多半是兩端版本
+	 * 不一致），後者是欄位有送但值不合法（發送端資料組裝有誤）。文案混用會把管理員導向
+	 * 錯的排查方向，這正是接收端拆出 invalid_field 的理由。
+	 *
+	 * @group error
+	 */
+	public function test_missing_and_invalid_field_give_different_guidance(): void {
+		$bodies = [];
+
+		foreach ( [ 'missing_field', 'invalid_field' ] as $code ) {
+			$this->mails    = [];
+			$this->requests = [];
+			\as_unschedule_all_actions( DailyBillingCron::RETRY_HOOK );
+
+			$this->mock_http(
+				[ $this->make_website() ],
+				[
+					'cloud_status' => 400,
+					'cloud_body'   => [
+						'status' => 400,
+						'data'   => [ 'error_code' => $code ],
+					],
+				]
+			);
+
+			DailyBillingCron::run();
+			$bodies[ $code ] = (string) ( $this->mails[0]['message'] ?? '' );
+
+			\remove_filter( 'pre_http_request', $this->http_mock, 10 );
+			$this->http_mock = null;
+		}
+
+		$this->assertStringContainsString( '契約版本', $bodies['missing_field'] );
+		$this->assertStringNotContainsString( '契約版本', $bodies['invalid_field'], 'invalid_field 不得沿用版本不一致的說法' );
+		$this->assertStringContainsString( '資料組裝邏輯', $bodies['invalid_field'] );
+		$this->assertStringNotContainsString( '資料組裝邏輯', $bodies['missing_field'] );
+	}
+
+	/**
+	 * Rule: 接收端 message 過長時截斷，避免產生無法閱讀的巨信
+	 *
+	 * message 長度不受本站控制，中介設備也可能塞入大量內容。
+	 *
+	 * @group edge
+	 */
+	public function test_long_upstream_message_is_truncated_in_mail(): void {
+		$long = str_repeat( '長', 800 );
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_status' => 404,
+				'cloud_body'   => [
+					'status'  => 404,
+					'message' => $long,
+					'data'    => [ 'error_code' => 'partner_not_found' ],
+				],
+			]
+		);
+
+		DailyBillingCron::run();
+
+		$mail_body = (string) ( $this->mails[0]['message'] ?? '' );
+		$this->assertNotEmpty( $this->mails );
+		$this->assertStringContainsString( str_repeat( '長', 300 ) . '…', $mail_body, '應截斷到 300 字並加省略號' );
+		$this->assertStringNotContainsString( str_repeat( '長', 301 ), $mail_body, '不得整段貼進信件' );
+	}
+
+	/**
+	 * Rule: 不認得的 error_code 維持既有行為（進重試），不得因為有代碼就一律不重試
+	 *
+	 * 接收端可能為暫時性錯誤（例如限流）也加代碼；硬性依賴「有代碼就是永久性」會把
+	 * 一次限流變成當天漏推。
+	 *
+	 * @group error
+	 */
+	public function test_unknown_error_code_still_retries(): void {
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_status' => 429,
+				'cloud_body'   => [
+					'status' => 429,
+					'data'   => [ 'error_code' => 'rate_limited' ],
+				],
+			]
+		);
+
+		$result = DailyBillingCron::run();
+
+		$this->assertFalse( $result['pushed'] );
+		$this->assertSame( 'push_failed', $result['reason'] );
+		$this->assertNotNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), '未列為永久性的代碼仍須重試' );
 	}
 
 	// ========================================================================
@@ -1487,19 +1881,18 @@ class DailyBillingPushTest extends TestCase {
 			case 'no_api_key':
 				\delete_transient( Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
 				break;
-			case 'no_cloud_user_id':
-				$site = $this->make_website();
-				unset( $site['userId'] );
-				$websites = [ $site ];
+			case 'no_dealer_id':
+				$site         = $this->make_website();
+				$site['user'] = null;
+				$websites     = [ $site ];
 				break;
-			case 'multiple_cloud_user_ids':
+			case 'multiple_dealer_ids':
 				$websites = [
-					$this->make_website( [ 'userId' => 'cu-1111-aaaa' ] ),
-					$this->make_website(
-						[
-							'primaryDomain' => 'b.wpsite.pro',
-							'userId'        => 'cu-9999-zzzz',
-						]
+					$this->make_website_of_user( self::USER_ID ),
+					$this->make_website_of_user(
+						self::USER_ID_2,
+						[ 'primaryDomain' => 'b.wpsite.pro' ],
+						'99999999-dead-beef-0000-000000000000'
 					),
 				];
 				break;
@@ -1532,10 +1925,10 @@ class DailyBillingPushTest extends TestCase {
 	 */
 	public function provide_config_abort(): array {
 		return [
-			'partner_id 未設定'      => [ 'no_partner_id', 'no_partner_id', 'partner_id' ],
-			'API Key 不存在'         => [ 'no_api_key', 'no_api_key', '新架構權限' ],
-			'取不到 cloud_user_id'   => [ 'no_cloud_user_id', 'no_cloud_user_id', 'cloud_user_id' ],
-			'多個相異 cloud_user_id' => [ 'multiple_cloud_user_ids', 'multiple_cloud_user_ids', '權限' ],
+			'partner_id 未設定'   => [ 'no_partner_id', 'no_partner_id', 'partner_id' ],
+			'API Key 不存在'      => [ 'no_api_key', 'no_api_key', '新架構權限' ],
+			'取不到 dealer_id'    => [ 'no_dealer_id', 'no_dealer_id', 'dealer_id' ],
+			'多個相異 dealer_id'  => [ 'multiple_dealer_ids', 'multiple_dealer_ids', '權限' ],
 		];
 	}
 
@@ -1722,19 +2115,23 @@ class DailyBillingPushTest extends TestCase {
 	// ========================================================================
 
 	/**
-	 * Rule: 可計費（running）網站中出現解析不出 user id 的站時中止推送
+	 * Rule: 可計費（running）網站中出現解析不出經銷商 id 的站時中止推送
 	 *
-	 * collect_cloud_user_ids() 對取不到 id 的站一律略過，build_sites() 又完全不看 userId，
-	 * 因此「API key 權限範圍意外放大、且多出來的站 userId 與 user 皆為 null」時，
+	 * collect_dealer_ids() 對取不到 id 的站一律略過，build_sites() 又完全不看 dealerId，
+	 * 因此「API key 權限範圍意外放大、且多出來的站 user 為 null（或缺 dealerId）」時，
 	 * 相異 id 集合仍只有一個 → 多租戶守衛不觸發 → 不屬於本經銷商的站被算進 payload
 	 * 並以本經銷商的身分推送，接收端只驗 TOFU 綁定值（相符）照扣。
 	 *
+	 * orphan 刻意保留頂層 userId 與 user.id：證明識別值只認 user.dealerId。
+	 *
+	 * @dataProvider provide_missing_dealer_id
 	 * @group error
+	 *
+	 * @param string $shape orphan 站的 user 節點形狀
 	 */
-	public function test_aborts_when_billable_site_has_no_resolvable_owner(): void {
-		$orphan = $this->make_website( [ 'primaryDomain' => 'b.wpsite.pro' ] );
-		unset( $orphan['userId'] );
-		$orphan['user'] = null;
+	public function test_aborts_when_billable_site_has_no_resolvable_owner( string $shape ): void {
+		$orphan         = $this->make_website( [ 'primaryDomain' => 'b.wpsite.pro' ] );
+		$orphan['user'] = 'null' === $shape ? null : $this->make_user( self::USER_ID_2, null );
 
 		$this->mock_http(
 			[
@@ -1753,18 +2150,21 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * Rule 邊界: 非 running 的站沒有 userId 不影響推送（它本來就不進 payload）
+	 * Rule 邊界: 非 running 的站缺 dealerId 不影響推送（它本來就不進 payload）
 	 *
+	 * @dataProvider provide_missing_dealer_id
 	 * @group edge
+	 *
+	 * @param string $shape orphan 站的 user 節點形狀
 	 */
-	public function test_does_not_abort_when_only_non_billable_site_has_no_owner(): void {
+	public function test_does_not_abort_when_only_non_billable_site_has_no_owner( string $shape ): void {
 		$orphan = $this->make_website(
 			[
 				'primaryDomain' => 'b.wpsite.pro',
 				'status'        => 'stopped',
 			]
 		);
-		unset( $orphan['userId'] );
+		$orphan['user'] = 'null' === $shape ? null : $this->make_user( self::USER_ID_2, null );
 
 		$this->mock_http(
 			[
@@ -1775,12 +2175,16 @@ class DailyBillingPushTest extends TestCase {
 
 		$result = DailyBillingCron::run();
 
-		$this->assertTrue( $result['pushed'], '非計費對象缺 userId 不應中止推送' );
+		$this->assertTrue( $result['pushed'], '非計費對象缺 dealerId 不應中止推送' );
 		$this->assertSame( 1, $result['billable_count'] );
+
+		$payload = $this->push_payload();
+		$this->assertNotNull( $payload );
+		$this->assertSame( self::DEALER_ID, $payload['dealer_id'] );
 	}
 
 	/**
-	 * Rule 反向: 既有規格「不以 cloud_user_id 二次過濾清單」不得被本守衛改寫
+	 * Rule 反向: 既有規格「不以 dealer_id 二次過濾清單」不得被本守衛改寫
 	 *
 	 * @group edge
 	 */

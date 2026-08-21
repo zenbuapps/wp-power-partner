@@ -23,7 +23,7 @@ cloud.luke.cafe 沒有對應 post，因此完全不進 `Partner::deduct_sites_po
 | # | 決策 | 結論 | 決策者 |
 |---|------|------|--------|
 | Q1 | 是否共用既有扣點路徑 | **獨立路徑 + 獨立 log type `cron_powercloud`**，不共用 6 小時守衛 | orchestrator |
-| Q2 | `cloud_user_id` 來源 | 取自 `/websites` 回應的 `userId`；無站台時跳過推送 | orchestrator |
+| Q2 | `dealer_id` 來源 | 取自 `/websites` 回應的 `user.dealerId`；無站台時以本地綁定值推送空 sites | orchestrator |
 | Q3 | `dailyCost` 定價權威 | **直接採用，不套經銷商等級折扣** | 使用者 |
 | Q4 | 計費的 site status | **只有 `running` 計費** | 使用者 |
 | Q5 | 冪等鍵 | `partner_id` + `billing_date`(UTC+8)，重複推送回 200 `already_deducted` | orchestrator |
@@ -35,6 +35,18 @@ cloud.luke.cafe 沒有對應 post，因此完全不進 `Partner::deduct_sites_po
 | Q11 | `consecutive_negative_days` | **新架構路徑不碰**，由既有 00:30 cron 統一判定 | orchestrator |
 | Q12 | 大型經銷商判定口徑 | `is_high_volume_partner()` 扣點量**納入新架構**，與通知信同一口徑 | orchestrator（Q8 衍生） |
 
+### Q2 更正（2026-08-20）：識別值是 `user.dealerId`，不是 `userId`
+
+訪談當下（2026-08-19）誤以為 `/websites` 的 `userId` 就是經銷商識別，欄位名也定成語義模糊的
+`cloud_user_id`，實作因此合理地取了 `userId`。站長提供真實回應後確認取錯了層級。
+
+PowerCloud 的階層是「經銷商 `dealerId` → 開站用戶 `user.id` → 網站」。同一經銷商底下有多個
+開站用戶，取 `userId` 會得到多個相異值而觸發中止守衛 —— 一天都推不出去，且 TOFU 會綁到錯的 id。
+
+定案：payload 欄位改名為 `dealer_id`，值取自 `website.user.dealerId`（`user` 型別為 `{…} | null`，
+取不到一律中止並通知，不做 fallback）。詳見 `specs/features/billing/推送新架構網站計費資料.feature`
+的「dealer_id 取自網站清單的 user.dealerId 欄位」Rule。
+
 ### Q6 補充：TOFU 身分綁定（必須實作，非選配）
 
 Basic Auth 帳密由所有經銷商站共用，身分辨識實際只靠 `partner_id`（可猜的 WP user_id）。
@@ -42,11 +54,11 @@ Basic Auth 帳密由所有經銷商站共用，身分辨識實際只靠 `partner
 連續負數達停用門檻 → 對手服務中斷、客戶斷線，攻擊者從中得利。
 
 Trust On First Use 綁定：
-1. 首次收到某 `partner_id` 的推送時，將 `cloud_user_id` 寫入該用戶 meta 作為綁定值
+1. 首次收到某 `partner_id` 的推送時，將 `dealer_id` 寫入該用戶 meta 作為綁定值
 2. 後續每次推送比對；**不符則拒絕扣點（403）+ error log + 通知管理員**
 3. 換綁時由管理員手動清除該 meta
 
-`cloud_user_id` 是 PowerCloud 的不公開 UUID，攻擊者須同時知道兩者。
+`dealer_id` 是 PowerCloud 的不公開 UUID，攻擊者須同時知道兩者。
 成本僅一個 meta 加一次比對，遠低於金鑰註冊流程。該 meta 對帳與 debug 亦可用。
 
 ### Q10 補充：接收端須驗證 `billing_date`（必須實作）
@@ -100,7 +112,7 @@ Q11 讓 `consecutive_negative_days` 完全交給既有 00:30 cron 判定。此�
 | 操作 | 目標 | 說明 |
 |------|------|------|
 | modify | `Utils\Log` 類常數 | 新增 `CRON_POWERCLOUD = 'cron_powercloud'`（現有僅 `PURCHASE`/`MODIFY`/`CRON`）。**必要條件**，見上方風險說明 |
-| create | user meta：TOFU 綁定值 | 例 `pp_powercloud_cloud_user_id`。首次推送寫入，後續比對 |
+| create | user meta：TOFU 綁定值 | 例 `pp_powercloud_dealer_id`。首次推送寫入，後續比對 |
 | create | user meta：新架構每日扣點量 / 計費站數 / 對應 billing_date | 供既有 CRON 計算「新舊合計」用（低點數通知、大型經銷商判定） |
 | none | 自訂 log 表結構 | 沿用既有 `power_partner_server_logs`，欄位不變 |
 

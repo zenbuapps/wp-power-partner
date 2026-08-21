@@ -59,7 +59,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
   Rule: 前置（狀態）- 外掛啟用或版本升級後立刻排一次首推
     # 接收端以 Trust On First Use 綁定身分：首次收到某 partner_id 的推送時，才把 payload 的
-    # cloud_user_id 存為該經銷商的綁定值，之後必須相符才受理。
+    # dealer_id 存為該經銷商的綁定值，之後必須相符才受理。
     # 若等到隔日 UTC+8 05:00 才首推，功能發布當天全體經銷商都處於「未綁定」狀態，
     # 會出現一個橫跨所有經銷商、最長 24 小時的搶綁窗口 —— 而 partner_id 可由未認證的
     # GET /partner-id 讀出、Basic Auth 帳密隨外掛散布，攻擊門檻極低。
@@ -162,13 +162,13 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
   Rule: 後置（狀態）- 網站清單的範圍即為計費集合，不做二次過濾
     # 已確認：帶經銷商 API key 呼叫 /websites 只回該 key 所屬帳號自己的站，
-    # 因此回應全量即為本經銷商的計費集合，不需再用 cloud_user_id 過濾
+    # 因此回應全量即為本經銷商的計費集合，不需再用 dealer_id 過濾
 
-    Example: 不以 cloud_user_id 對清單做過濾
+    Example: 不以 dealer_id 對清單做過濾
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | running | 20.00     | cu-1111-aaaa |
+        | domain       | status  | dailyCost | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | running | 20.00     | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 推送的網站清單共 2 筆
 
@@ -177,8 +177,8 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Scenario Outline: 網站狀態與是否列入推送清單
       Given PowerCloud 回應以下網站：
-        | domain       | status   | dailyCost | userId       |
-        | a.wpsite.pro | <status> | 10.50     | cu-1111-aaaa |
+        | domain       | status   | dailyCost | user.dealerId |
+        | a.wpsite.pro | <status> | 10.50     | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 推送清單中 status 為 running 的網站數為 <billable>
 
@@ -189,27 +189,50 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | stopped  | 0        | 不計費 |
         | deleting | 0        | 不計費 |
 
-  Rule: 後置（狀態）- cloud_user_id 取自網站清單的 userId 欄位，且為推送的必要欄位
-    # 接收端以 cloud_user_id 做 TOFU 身分綁定（首次收到即綁定，後續比對，不符則拒絕扣點），
+  Rule: 後置（狀態）- dealer_id 取自網站清單的 user.dealerId 欄位，且為推送的必要欄位
+    # 接收端以 dealer_id 做 TOFU 身分綁定（首次收到即綁定，後續比對，不符則拒絕扣點），
     # 因此它不是稽核用的選填欄位 —— 取不到就不能推送，否則接收端必定拒絕。
+    #
+    # ## 為什麼是 user.dealerId，不是 userId 或 user.id（重要，勿改回去）
+    # PowerCloud 的帳號是三層階層：
+    #
+    #   經銷商（dealer）  dealerId: 181f2bbe-1292-459a-a814-0baa72423636  ← 計費／綁定對象
+    #     └─ 開站用戶      user.id:  e77dcfa2-0687-49a5-a54a-50f721fef8bd  ← 只是操作者
+    #          └─ 網站      vibrant-panda-34812
+    #
+    # 真實 GET /websites 的單筆長這樣（站長 2026-08-20 提供，total: 358）：
+    #   {
+    #     "id": "58c46391-…", "primaryDomain": "vibrant-panda-34812.wpsite.pro",
+    #     "status": "running", "dailyCost": "7.67", "dailyCostDate": "2026-08-20",
+    #     "userId": "e77dcfa2-…",
+    #     "user": { "id": "e77dcfa2-…", "role": "dealer", "dealerId": "181f2bbe-…", "email": "…" }
+    #   }
+    #
+    # 一個經銷商底下可以有多個開站用戶，因此 userId / user.id 在同一批回應中本來就會出現
+    # 多個相異值。取那兩個欄位當識別，會讓下面「多個相異 dealerId 視為異常」的守衛每天
+    # 誤觸發、整天一行都推不出去，同時 TOFU 綁定也會綁到錯的 id。
+    #
+    # user 的型別是 { … } | null，取值時不得假設它是物件。刻意不做 fallback ——
+    # 解析不出經銷商 id 時寧可中止並通知，也不要猜一個 id 去扣別人的點。
 
-    Example: 從網站清單取得 cloud_user_id
+    Example: 從網站清單取得 dealer_id
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | stopped | 99.00     | cu-1111-aaaa |
+        | domain       | status  | dailyCost | user.id     | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | e77dcfa2-… | 181f2bbe-…   |
+        | b.wpsite.pro | stopped | 99.00     | e77dcfa2-… | 181f2bbe-…   |
       When 排程觸發計費推送
-      Then 推送的 cloud_user_id 為 "cu-1111-aaaa"
+      Then 推送的 dealer_id 為 "181f2bbe-1292-459a-a814-0baa72423636"
+      And 推送的 dealer_id 不是 "e77dcfa2-0687-49a5-a54a-50f721fef8bd"
 
-  Rule: 後置（狀態）- 首次推送成功後把 cloud_user_id 存為本地綁定值
+  Rule: 後置（狀態）- 首次推送成功後把 dealer_id 存為本地綁定值
     # 接收端的 TOFU 綁定只存在對端；本地留一份對照，讓「PowerCloud 帳號被換掉」或
     # 「本地狀態異常」在送出前就被擋下，而不是送出後才被對端以 403 拒絕
 
     Example: 首推成功後記錄綁定值
-      Given option "power_partner_billing_cloud_user_id" 不存在
-      And PowerCloud 回應的網站 userId 皆為 "cu-1111-aaaa"
+      Given option "power_partner_billing_dealer_id" 不存在
+      And PowerCloud 回應的網站 user.dealerId 皆為 "181f2bbe-1292-459a-a814-0baa72423636"
       When 排程觸發計費推送並成功
-      Then option "power_partner_billing_cloud_user_id" 為 "cu-1111-aaaa"
+      Then option "power_partner_billing_dealer_id" 為 "181f2bbe-1292-459a-a814-0baa72423636"
 
   Rule: 後置（狀態）- payload 帶 billing_date，取自最近一次排程 slot（21:00 UTC）對應的 UTC+8 日期
     # 業務日在發送端一次決定，重試時沿用同一個 billing_date 不重新計算，
@@ -277,26 +300,32 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Example: 推送成功寫 info log
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | running | 20.00     | cu-1111-aaaa |
-        | c.wpsite.pro | running | 0.25      | cu-1111-aaaa |
-        | d.wpsite.pro | stopped | 99.00     | cu-1111-aaaa |
+        | domain       | status  | dailyCost | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | running | 20.00     | 181f2bbe-…   |
+        | c.wpsite.pro | running | 0.25      | 181f2bbe-…   |
+        | d.wpsite.pro | stopped | 99.00     | 181f2bbe-…   |
       And CloudServer 回應 HTTP 200
       When 排程觸發計費推送
       Then 記錄 info log，計費站數為 3，總金額為 30.75
 
   # ========== 錯誤處理 ==========
 
-  Rule: 錯誤處理 - 無法取得 cloud_user_id 時中止推送並寫 error log
-    # 例如清單中所有站台皆無 userId 欄位。不得以空字串送出 ——
-    # 接收端以 cloud_user_id 做 TOFU 綁定比對，空值必定被拒絕扣點。
+  Rule: 錯誤處理 - 無法取得 dealer_id 時中止推送並寫 error log
+    # 例如清單中所有站台的 user 皆為 null，或有 user 但缺 dealerId 欄位。
+    # 不得以空字串送出 —— 接收端以 dealer_id 做 TOFU 綁定比對，空值必定被拒絕扣點。
+    # 頂層 userId 存不存在不影響判定：它不是識別值。
 
-    Example: 所有站台皆無 userId 時不推送
-      Given PowerCloud 回應的網站皆無 userId 欄位
+    Scenario Outline: 解析不出 dealerId 時不推送
+      Given PowerCloud 回應的網站皆為 "<user 形狀>"（頂層 userId 仍存在）
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
+
+      Examples: 兩種取不到 dealerId 的形狀（API 型別為 user: { … } | null）
+        | user 形狀        | 說明                    |
+        | user 為 null     | 回應沒有帶 user 物件      |
+        | user 缺 dealerId | 有 user 但少了 dealerId  |
 
   Rule: 錯誤處理 - 設定類的中止路徑一律寄信通知站台管理員
     # 這四條路徑不會自行復原、也不進重試流程，只寫 log 等於沒人知道；
@@ -312,37 +341,68 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       And 信件內容含 "<關鍵字>"
 
       Examples: 四條設定類中止路徑
-        | reason                  | 關鍵字     | 說明                                     |
-        | no_partner_id           | partner_id | 請重新連結 cloud.luke.cafe                |
-        | no_api_key              | 新架構權限   | 請到「新架構權限」tab 重新認證以寫入全域 key      |
-        | no_cloud_user_id        | cloud_user_id | 疑似 /websites 回應欄位改版              |
-        | multiple_cloud_user_ids | 權限       | API key 權限範圍異常，權限模型可能已變更        |
+        | reason              | 關鍵字     | 說明                                       |
+        | no_partner_id       | partner_id | 請重新連結 cloud.luke.cafe                  |
+        | no_api_key          | 新架構權限   | 請到「新架構權限」tab 重新認證以寫入全域 key       |
+        | no_dealer_id        | dealer_id  | 疑似 /websites 回應欄位改版                  |
+        | multiple_dealer_ids | 權限        | API key 權限範圍異常，權限模型可能已變更          |
 
-  Rule: 錯誤處理 - cloud_user_id 與本地綁定值不符時中止推送並通知管理員
+  Rule: 錯誤處理 - dealer_id 與本地綁定值不符時中止推送並通知管理員
     # 代表 PowerCloud 帳號被換，或本地狀態異常。接收端同樣不會自動換綁，
     # 硬推只會被拒絕，因此直接中止；也不得以新值覆寫本地綁定
 
     Example: 綁定值不符時中止
-      Given option "power_partner_billing_cloud_user_id" 為 "cu-0000-old"
-      And PowerCloud 回應的網站 userId 皆為 "cu-1111-aaaa"
+      Given option "power_partner_billing_dealer_id" 為 "00000000-old0-old0-old0-000000000000"
+      And PowerCloud 回應的網站 user.dealerId 皆為 "181f2bbe-1292-459a-a814-0baa72423636"
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
       And 寄出通知信給站台 admin_email
       And 系統沒有排程下次重試
-      And option "power_partner_billing_cloud_user_id" 仍為 "cu-0000-old"
+      And option "power_partner_billing_dealer_id" 仍為 "00000000-old0-old0-old0-000000000000"
 
-  Rule: 錯誤處理 - 接收端回報身分綁定不符時立即通知管理員，不進入一般重試
-    # 接收端只在 TOFU 比對失敗時回 403。重試三次也不會成功，
-    # 而且這可能代表有人以偽造的 partner_id 搶先完成綁定 —— 需要立刻人工介入，
-    # 不能等到重試三次（90 分鐘）之後才寄信
+  Rule: 錯誤處理 - 永久性錯誤一律立即通知管理員，不進入一般重試
+    # 判定依據是接收端回應 body 的 data.error_code，**不是 message 文案**。
+    #
+    # ## 為什麼不比對文案（重要，勿改回去）
+    # 原本的實作比對 message 是否含「cloud_user_id」。接收端隨 dealer_id 改名把文案換成
+    # 「dealer_id 與已綁定值不符」之後，這條判斷就整個失效了 —— 文案不是契約的一部分，
+    # 改一次字就靜默壞掉，而壞掉的後果是永久性錯誤被當成暫時性失敗白重試 90 分鐘才通知人。
+    #
+    # 身分綁定不符（identity_mismatch）額外要求 **HTTP 403 與 error_code 兩者皆成立**；
+    # 其餘代碼只認 error_code。
+    #
+    # 取不到 error_code 時**維持既有行為**（一般 push_failed → 進重試流程）：
+    # 中介 WAF／反向代理擋下的 403 不會帶這個 JSON 結構，不得被誤判成永久性錯誤而完全不重試。
+    # 反過來，不在清單內的代碼（例如限流 rate_limited）也一律走重試，不得因為「有代碼」就不重試。
 
-    Example: 接收端回 403 綁定不符
-      Given CloudServer 回應 HTTP 403 且訊息為 "cloud_user_id 與已綁定值不符"
+    Scenario Outline: 永久性錯誤代碼的處置
+      Given CloudServer 回應 HTTP <status> 且 data.error_code 為 "<error_code>"
       When 排程觸發計費推送
       Then 寄出通知信給站台 admin_email
+      And 通知信內容含錯誤代碼 "<error_code>"
       And 記錄 error log
       And 系統沒有排程下次重試
+
+      Examples: 接收端定義的永久性錯誤
+        | error_code           | status | 說明                              |
+        | identity_mismatch    | 403    | TOFU 綁定不符，可能有人搶先綁定       |
+        | partner_not_found    | 404    | partner_id 設錯或帳號已刪除          |
+        | not_a_dealer         | 500    | 該帳號不是經銷商，無法扣點            |
+        | invalid_billing_date | 400    | 排程嚴重落後或主機時間不正確          |
+        | missing_field        | 400    | 兩端契約版本不一致                   |
+
+    Scenario Outline: 取不到／不認得 error_code 時維持既有重試行為
+      Given CloudServer 回應 "<回應>"
+      When 排程觸發計費推送
+      And 結果原因為 "push_failed"
+      Then 系統排程 30 分鐘後重試
+
+      Examples: 三種不得判為永久性錯誤的回應
+        | 回應                                      | 說明                              |
+        | HTTP 403，文案含「dealer_id」但無 error_code | 文案不是契約，不得據以判定           |
+        | HTTP 403，body 為 HTML（非 JSON）           | 中介 WAF／反向代理擋下，屬暫時性      |
+        | HTTP 429，error_code 為 rate_limited       | 不在永久性清單內，屬暫時性           |
 
   Rule: 錯誤處理 - 取得網站清單失敗時進入重試流程，不送出不完整的 payload
     # 送出殘缺清單會導致接收端少扣點，且因冪等鍵已寫入而無法當日補扣
@@ -387,9 +447,9 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Scenario Outline: dailyCost 異常值處理
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost   | userId       |
-        | a.wpsite.pro | running | 10.50       | cu-1111-aaaa |
-        | b.wpsite.pro | running | <dailyCost> | cu-1111-aaaa |
+        | domain       | status  | dailyCost   | user.dealerId |
+        | a.wpsite.pro | running | 10.50       | 181f2bbe-…   |
+        | b.wpsite.pro | running | <dailyCost> | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 推送 b.wpsite.pro 的 dailyCost 為 0.00
       And 推送清單的總金額為 10.50
@@ -450,74 +510,104 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Example: 清單為空時推送空 sites
       Given PowerCloud 的 /websites 回應 total 為 0
-      And option "power_partner_billing_cloud_user_id" 為 "cu-1111-aaaa"
+      And option "power_partner_billing_dealer_id" 為 "181f2bbe-1292-459a-a814-0baa72423636"
       When 排程觸發計費推送
       Then 系統推送至 CloudServer
       And 推送的 sites 為空陣列
-      And 推送的 cloud_user_id 為 "cu-1111-aaaa"
+      And 推送的 dealer_id 為 "181f2bbe-1292-459a-a814-0baa72423636"
 
     Example: 清單為空且從未成功推送過時跳過
       Given PowerCloud 的 /websites 回應 total 為 0
-      And option "power_partner_billing_cloud_user_id" 不存在
+      And option "power_partner_billing_dealer_id" 不存在
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 info log
-      # 沒有本地綁定值就湊不出 cloud_user_id（接收端要求非空字串），
+      # 沒有本地綁定值就湊不出 dealer_id（接收端要求非空字串），
       # 而且從未推送成功代表接收端也還沒有任何合計 meta 需要更新為 0
 
-  Rule: 邊界條件 - 網站清單出現多個相異 userId 時視為異常，中止推送並寫告警 log
-    # 正常情況下同一把 API key 底下所有站應屬同一個 userId。
-    # 若出現多個，代表該 key 的權限範圍超出預期（例如管理員層級 key），
-    # 此時推送會把不屬於本經銷商的站算到他頭上，必須中止而非靜默取第一筆
+  Rule: 邊界條件 - 同一經銷商底下有多個開站用戶時照常推送
+    # production 的實際樣貌：一個經銷商 358 個站分屬多個開站用戶（user.id 相異、
+    # user.dealerId 相同）。識別值取 user.dealerId 才會得到單一值；若誤取 userId／user.id，
+    # 下一條守衛會每天誤判為「權限範圍異常」而中止，一行都推不出去。
+    # 這條與下一條互為對照，缺一不可 —— 少了這條，取值改回 userId 也不會有測試變紅。
 
-    Example: 出現兩個相異 userId 時中止推送
+    Example: 三個開站用戶共用一個 dealerId 時正常推送
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | running | 20.00     | cu-9999-zzzz |
+        | domain       | status  | dailyCost | user.id     | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | e77dcfa2-… | 181f2bbe-…   |
+        | b.wpsite.pro | running | 20.00     | a1b2c3d4-… | 181f2bbe-…   |
+        | c.wpsite.pro | running | 0.25      | f9e8d7c6-… | 181f2bbe-…   |
+      When 排程觸發計費推送
+      Then 系統推送至 CloudServer
+      And 推送的網站清單共 3 筆
+      And 推送清單的總金額為 30.75
+      And 推送的 dealer_id 為 "181f2bbe-1292-459a-a814-0baa72423636"
+
+  Rule: 邊界條件 - 網站清單出現多個相異 dealerId 時視為異常，中止推送並寫告警 log
+    # 正常情況下同一把 API key 底下所有站應屬同一個經銷商（user.dealerId 相同）。
+    # 若出現多個，代表該 key 的權限範圍超出預期（例如管理員層級 key），
+    # 此時推送會把不屬於本經銷商的站算到他頭上，必須中止而非靜默取第一筆。
+    # 注意判定的是「經銷商」不是「開站用戶」—— 見上一條 Rule。
+
+    Example: 出現兩個相異 dealerId 時中止推送
+      Given PowerCloud 回應以下網站：
+        | domain       | status  | dailyCost | user.id     | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | e77dcfa2-… | 181f2bbe-…   |
+        | b.wpsite.pro | running | 20.00     | a1b2c3d4-… | 99999999-…   |
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄告警 log
 
-  Rule: 邊界條件 - 可計費網站解析不出擁有者時視為異常，中止推送並通知管理員
-    # 這是上一條多租戶守衛的旁路：相異 userId 集合刻意略過解析不出 id 的站，
-    # 而計費清單完全不看 userId。因此當 API key 權限範圍意外放大（正是守衛要防的事）、
-    # 且多出來的站 userId 與 user 皆為 null 時，相異 id 集合仍只有一個 → 守衛不觸發 →
+  Rule: 邊界條件 - 可計費網站解析不出擁有者（經銷商 id）時視為異常，中止推送並通知管理員
+    # 這是上一條多租戶守衛的旁路：相異 dealerId 集合刻意略過解析不出 id 的站，
+    # 而計費清單完全不看 dealerId。因此當 API key 權限範圍意外放大（正是守衛要防的事）、
+    # 且多出來的站 user 為 null（或缺 dealerId）時，相異 id 集合仍只有一個 → 守衛不觸發 →
     # 不屬於本經銷商的站被算進 payload 並以本經銷商身分推送，
-    # 接收端只驗 TOFU 綁定的 cloud_user_id（相符），照扣。
+    # 接收端只驗 TOFU 綁定的 dealer_id（相符），照扣。
     # 同一把 API key 底下出現「沒有 owner 的可計費網站」本身就是異常訊號。
     #
-    # 注意：本守衛只做「中止或放行」，不得改成用 cloud_user_id 過濾清單 ——
+    # 注意：本守衛只做「中止或放行」，不得改成用 dealer_id 過濾清單 ——
     # 既有規格明確不做二次過濾（見「網站清單的範圍即為計費集合」Rule）。
 
-    Example: running 網站缺 owner 時中止推送
+    Scenario Outline: running 網站缺 owner 時中止推送
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | running | 20.00     | （userId 與 user 皆為 null） |
+        | domain       | status  | dailyCost | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | running | 20.00     | <缺 dealerId 的形狀> |
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
       And 寄出通知信給站台 admin_email
 
-    Example: 非 running 網站缺 owner 不影響推送
+      Examples: 兩種形狀（頂層 userId 仍存在，證明它不是識別值）
+        | 缺 dealerId 的形狀 |
+        | user 為 null      |
+        | user 缺 dealerId  |
+
+    Scenario Outline: 非 running 網站缺 owner 不影響推送
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | stopped | 20.00     | （無 userId）  |
+        | domain       | status  | dailyCost | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | stopped | 20.00     | <缺 dealerId 的形狀> |
       When 排程觸發計費推送
       Then 系統推送至 CloudServer
       And 推送清單中 status 為 running 的網站數為 1
+      And 推送的 dealer_id 為 "181f2bbe-1292-459a-a814-0baa72423636"
+
+      Examples: 兩種形狀
+        | 缺 dealerId 的形狀 |
+        | user 為 null      |
+        | user 缺 dealerId  |
 
   Rule: 邊界條件 - 全部網站都不是 running 時仍需推送，且金額為 0
     # 讓接收端寫下當日 log 與冪等鍵，維持每日對帳的連續性
 
     Example: 全部非 running 仍推送
       Given PowerCloud 回應以下網站：
-        | domain       | status   | dailyCost | userId       |
-        | a.wpsite.pro | creating | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | stopped  | 20.00     | cu-1111-aaaa |
-        | c.wpsite.pro | deleting | 0.25      | cu-1111-aaaa |
+        | domain       | status   | dailyCost | user.dealerId |
+        | a.wpsite.pro | creating | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | stopped  | 20.00     | 181f2bbe-…   |
+        | c.wpsite.pro | deleting | 0.25      | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 系統推送至 CloudServer
       And 推送清單的總金額為 0.00
@@ -537,9 +627,9 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Example: 全部狀態都不認得時提升為 error 並通知
       Given PowerCloud 回應以下網站：
-        | domain       | status     | dailyCost | userId       |
-        | a.wpsite.pro | Running    | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | restarting | 20.00     | cu-1111-aaaa |
+        | domain       | status     | dailyCost | user.dealerId |
+        | a.wpsite.pro | Running    | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | restarting | 20.00     | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 系統推送至 CloudServer
       And 推送清單的總金額為 0.00
@@ -548,8 +638,8 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
 
     Example: 至少有一個可計費網站時不得誤報
       Given PowerCloud 回應以下網站：
-        | domain       | status  | dailyCost | userId       |
-        | a.wpsite.pro | running | 10.50     | cu-1111-aaaa |
-        | b.wpsite.pro | stopped | 20.00     | cu-1111-aaaa |
+        | domain       | status  | dailyCost | user.dealerId |
+        | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
+        | b.wpsite.pro | stopped | 20.00     | 181f2bbe-…   |
       When 排程觸發計費推送
       Then 系統沒有寄出通知信
