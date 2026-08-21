@@ -1,0 +1,50 @@
+[ACTIVITY] 新架構每日計費推送流程
+[ACTOR] ActionScheduler -> {specs/actors/ActionScheduler.md}
+[ACTOR] PowerCloud -> {specs/actors/PowerCloud.md}
+[ACTOR] CloudServer -> {specs/actors/CloudServer.md}
+
+[STEP:0] @ActionScheduler 外掛啟用或版本升級後立刻排一次首推（壓縮接收端 TOFU 身分綁定的搶綁窗口） {features/billing/推送新架構網站計費資料.feature}
+
+[STEP:1] @ActionScheduler 每日 UTC+8 05:00（wall-clock cron 排程）觸發計費推送，billing_date 取自最近一次排程 slot {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:1a] 推送前置條件檢查
+  [BRANCH:1a:PowerCloud API Key 不存在] @ActionScheduler 中止推送、寫 error log 並寄信通知站台管理員 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:1a:partner_id 未設定] @ActionScheduler 中止推送、寫 error log 並寄信通知站台管理員 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:1a:前置條件皆滿足] @ActionScheduler 繼續取得網站清單 {features/billing/推送新架構網站計費資料.feature}
+[MERGE:1a]
+
+[STEP:2] @ActionScheduler 呼叫 PowerCloud 取得經銷商帳號下的網站全量清單（total 只認第 1 頁、逐筆以 id 去重、回應原文不落地 log） {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:2a] 網站清單取得結果
+  [BRANCH:2a:API 呼叫失敗] @ActionScheduler 進入重試流程 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:第 1 頁缺 total／分頁停滯／未取滿即無後續分頁] @ActionScheduler 視為取得失敗，進入重試流程（不可送出殘缺或重複的清單） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單為空且本地已有綁定值] @ActionScheduler 以本地綁定值推送空 sites，讓接收端把合計歸零 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單為空且本地尚無綁定值] @ActionScheduler 跳過本日推送並寫 info log {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單取不到 dealer_id] @ActionScheduler 中止推送、寫 error log 並寄信通知站台管理員 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單含多個相異 dealerId] @ActionScheduler 視為 API key 權限範圍異常，中止推送、寫告警 log 並寄信通知站台管理員 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:可計費網站解析不出 owner] @ActionScheduler 視為 API key 權限範圍放大，中止推送、寫 error log 並寄信通知站台管理員 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2a:清單正常] @ActionScheduler 過濾出 status 為 running 的網站 {features/billing/推送新架構網站計費資料.feature}
+[MERGE:2a]
+
+[DECISION:2b] dealer_id 與本地綁定值比對
+  [BRANCH:2b:本地尚無綁定值] @ActionScheduler 繼續組裝 payload（首推成功後才寫入綁定值） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2b:與本地綁定值不符] @ActionScheduler 中止推送、寫 error log 並寄信通知站台管理員（不重試、不覆寫綁定值） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2b:與本地綁定值相符] @ActionScheduler 繼續組裝 payload {features/billing/推送新架構網站計費資料.feature}
+[MERGE:2b]
+
+[DECISION:2c] 可計費網站數量檢查（僅在清單非空時判斷；清單為空是正常路徑，不告警）
+  [BRANCH:2c:清單非空卻無任何可計費網站] @ActionScheduler 寫 error log（含本次出現過的相異 status）並寄信通知站台管理員，仍照常推送 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:2c:有可計費網站] @ActionScheduler 繼續組裝 payload {features/billing/推送新架構網站計費資料.feature}
+[MERGE:2c]
+
+[STEP:3] @ActionScheduler 組裝 payload（partner_id / dealer_id / billing_date / sites） {features/billing/推送新架構網站計費資料.feature}
+
+[STEP:4] @ActionScheduler 以 Basic Auth 推送 payload 給 CloudServer {features/billing/推送新架構網站計費資料.feature}
+
+[DECISION:4a] 推送結果
+  [BRANCH:4a:HTTP 2xx] @ActionScheduler 寫入成功 log，並於首推成功時記錄本地 dealer_id 綁定值 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:HTTP 403 身分綁定不符] @ActionScheduler 立即寄信通知站台管理員並寫 error log（不重試，需人工介入） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:HTTP 非 2xx 且 data.error_code 為永久性代碼] @ActionScheduler 立即寄信通知站台管理員並寫 error log（不重試，重送必然以同樣方式失敗） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:失敗且重試次數未達上限] @ActionScheduler 排程 30 分鐘後重試 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:失敗且重試次數已達上限] @ActionScheduler 寄信通知站台管理員並寫 error log {features/billing/推送新架構網站計費資料.feature}
+[MERGE:4a]

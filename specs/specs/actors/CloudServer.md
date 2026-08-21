@@ -7,5 +7,6 @@ cloud.luke.cafe (WPCD 舊架構) 外部系統。提供 WordPress 網站的建立
 - API Base URL: https://cloud.luke.cafe
 - 認證方式: Basic Auth (username:password base64 encoded)
 - 提供 REST API endpoints: site-sync, disable-site, enable-site, template-sites
+- 提供 v2/powercloud-daily-billing endpoint：接收新架構（PowerCloud）網站每日計費資料並對經銷商扣點
 - 授權碼 API 由 Powerhouse 外掛的 CloudApi 代理呼叫
 - WPCD 開站完成後會回調 Power Partner 的 customer-notification 和 link-site API

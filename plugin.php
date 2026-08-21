@@ -102,6 +102,10 @@ final class Plugin
 	 */
 	public function activate(): void
 	{
+		// 啟用後立刻排一次新架構計費推送：接收端首次收到推送才建立身分綁定，
+		// 等到隔日 05:00 會留下最長 24 小時的搶綁窗口
+		Domains\Billing\Core\DailyBillingCron::instance()->maybe_schedule_bootstrap_push();
+
 		\add_option(
 			'power_partner_settings',
 			[
