@@ -1,6 +1,10 @@
 import { Button, Form, Input, notification, Alert } from 'antd'
 import { cloudAxios, axios } from '@/api'
-import { identityAtom, globalLoadingAtom } from '@/pages/AdminApp/Atom/atom'
+import {
+	accountInfoAtom,
+	identityAtom,
+	globalLoadingAtom,
+} from '@/pages/AdminApp/Atom/atom'
 import { useSetAtom } from 'jotai'
 import { renderHTML, encrypt, LOCALSTORAGE_ACCOUNT_KEY } from '@/utils'
 import { TAccountInfo, TIdentity } from '@/pages/AdminApp/types'
@@ -10,6 +14,7 @@ const index = () => {
 	const [form] = Form.useForm()
 	const setIdentity = useSetAtom(identityAtom)
 	const setGlobalLoading = useSetAtom(globalLoadingAtom)
+	const setAccountInfo = useSetAtom(accountInfoAtom)
 	const { mutate: getIdentity, isPending } = useMutation({
 		mutationFn: (values: TAccountInfo) => cloudAxios.post('/identity', values),
 		onMutate: (values: TAccountInfo) => {
@@ -51,6 +56,9 @@ const index = () => {
 				if (theIdentity?.status === 200) {
 					const encrypted_account_info = encrypt(values)
 					localStorage.setItem(LOCALSTORAGE_ACCOUNT_KEY, encrypted_account_info)
+
+					// 同一份帳密留一份在記憶體，供需要帶帳密的功能重用（例如明細下載）
+					setAccountInfo(values)
 					if (theIdentity?.data?.user_id) {
 						// 存入 wp-options  SNAKE . '_partner_id'
 

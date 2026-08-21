@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react'
 import { cloudAxios, axios } from '@/api'
-import { identityAtom, globalLoadingAtom } from '@/pages/AdminApp/Atom/atom'
+import {
+  accountInfoAtom,
+  identityAtom,
+  globalLoadingAtom,
+} from '@/pages/AdminApp/Atom/atom'
 import { useSetAtom } from 'jotai'
 import { notification } from 'antd'
 import { renderHTML, LOCALSTORAGE_ACCOUNT_KEY, decrypt } from '@/utils'
@@ -29,6 +33,7 @@ type TGetAccountInfo = {
 export const useGetUserIdentity = () => {
   const setIdentity = useSetAtom(identityAtom)
   const setGlobalLoading = useSetAtom(globalLoadingAtom)
+  const setAccountInfo = useSetAtom(accountInfoAtom)
   const accountInLocalStorage = localStorage.getItem(LOCALSTORAGE_ACCOUNT_KEY)
 
   const { data, isPending } = useQuery<AxiosResponse<TGetAccountInfo>>({
@@ -84,6 +89,12 @@ export const useGetUserIdentity = () => {
   useEffect(() => {
     if (encryptedAccountInfo) {
       const theAccountInfo: TAccountInfo = decrypt(encryptedAccountInfo, true)
+
+      // 解出來的帳密留一份在記憶體，讓需要帶帳密的功能（例如明細下載）
+      // 不必再自己解一次密文（decrypt 失敗會清 localStorage 並重整整頁）
+      if (theAccountInfo?.email && theAccountInfo?.password) {
+        setAccountInfo(theAccountInfo)
+      }
       mutation.mutate(theAccountInfo)
     }
   }, [encryptedAccountInfo])

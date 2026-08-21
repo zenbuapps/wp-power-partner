@@ -1,0 +1,32 @@
+[ACTIVITY] 點數紀錄查閱流程
+[ACTOR] Admin -> {specs/actors/Admin.md}
+
+# 本流程的資料來源端點全部由 power-partner-server 提供，本外掛不新增自有端點。
+# 伺服端對應規格：
+#   features/query/查詢點數紀錄.feature
+#   features/query/查詢點數紀錄明細.feature
+#   features/points/升級點數紀錄結構.feature
+
+[STEP:1] @Admin 開啟點數 Log 分頁 {features/dashboard/查閱點數紀錄.feature}
+
+[DECISION:1a] 帳號連結狀態
+  [BRANCH:1a:未連結] @Admin 不發出查詢 {features/dashboard/查閱點數紀錄.feature}
+  [BRANCH:1a:已連結] @Admin 查詢點數紀錄列表 {features/dashboard/查閱點數紀錄.feature}
+[MERGE:1a]
+
+[STEP:2] @Admin 檢視摘要、分類、金額與餘額 {features/dashboard/查閱點數紀錄.feature}
+
+[DECISION:2a] 該筆紀錄是否具備明細
+  [BRANCH:2a:無明細] @Admin 不顯示下載入口 {features/dashboard/查閱點數紀錄.feature}
+  [BRANCH:2a:有明細] @Admin 顯示下載入口 {features/dashboard/查閱點數紀錄.feature}
+[MERGE:2a]
+
+[STEP:3] @Admin 點擊下載明細 CSV {features/dashboard/查閱點數紀錄.feature}
+
+[DECISION:3a] 下載結果
+  [BRANCH:3a:成功] @Admin 觸發瀏覽器儲存 CSV 檔 {features/dashboard/查閱點數紀錄.feature}
+  [BRANCH:3a:明細不完整] @Admin 儲存檔案並提示明細已截斷 {features/dashboard/查閱點數紀錄.feature}
+  [BRANCH:3a:失敗] @Admin 顯示錯誤訊息且不產生檔案 {features/dashboard/查閱點數紀錄.feature}
+[MERGE:3a]
+
+[END]
