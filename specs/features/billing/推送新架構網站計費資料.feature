@@ -328,7 +328,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | user 缺 dealerId | 有 user 但少了 dealerId  |
 
   Rule: 錯誤處理 - 設定類的中止路徑一律寄信通知站台管理員
-    # 這四條路徑不會自行復原、也不進重試流程，只寫 log 等於沒人知道；
+    # 這些路徑不會自行復原、也不進重試流程，只寫 log 等於沒人知道；
     # 漏推一天等於少收一天錢。
     # 其中 no_api_key 最嚴重：排程情境沒有登入者，只讀得到全域 key，
     # 因此「只存了舊版 per-user key」的站台從第一天起就永遠中止且無人知情。
@@ -340,12 +340,26 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       And 寄出通知信給站台 admin_email
       And 信件內容含 "<關鍵字>"
 
-      Examples: 四條設定類中止路徑
+      Examples: 須通知的設定類中止路徑
         | reason              | 關鍵字     | 說明                                       |
-        | no_partner_id       | partner_id | 請重新連結 cloud.luke.cafe                  |
         | no_api_key          | 新架構權限   | 請到「新架構權限」tab 重新認證以寫入全域 key       |
         | no_dealer_id        | dealer_id  | 疑似 /websites 回應欄位改版                  |
         | multiple_dealer_ids | 權限        | API key 權限範圍異常，權限模型可能已變更          |
+
+  Rule: 錯誤處理 - partner_id 未設定時只寫 log，不寄信
+    # 上一條 Rule 的唯一例外。
+    # 排程是「裝了外掛就無條件註冊」，不問有沒有連結過帳號；而 partner_id 只在
+    # 後台按下「連結帳號」時才寫入。若此路徑照寄，每一台「裝了外掛但從未連結」的站
+    # （含模板站與由它 clone 出來的站）都會每天收到一封，而這類站根本不是運作中的
+    # 經銷商站、沒有任何錢會漏 —— 噪音會把真正該被看見的告警一起淹掉。
+    # 真經銷商若尚未連結，人就在後台，介面上直接看得到連結表單，不需要靠信提醒。
+
+    Example: partner_id 未設定時不寄信
+      Given option "power_partner_partner_id" 未設定
+      When 排程觸發計費推送
+      Then 系統沒有推送至 CloudServer
+      And 記錄 error log
+      And 沒有寄出任何通知信
 
   Rule: 錯誤處理 - dealer_id 與本地綁定值不符時中止推送並通知管理員
     # 代表 PowerCloud 帳號被換，或本地狀態異常。接收端同樣不會自動換綁，

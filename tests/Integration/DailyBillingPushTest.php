@@ -1096,6 +1096,80 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
+	 * Rule: 異常通知信須讓收信人不必登入後台就知道是哪一台站、要拿什麼身分去對帳、漏了多少錢
+	 *
+	 * 收信人多半同時是好幾個站的 admin_email，而 blogname 預設值人人相同（「我的網站」），
+	 * 只印站名等於沒印。唯一識別得靠網域。
+	 *
+	 * @group smoke
+	 */
+	public function test_notify_mail_identifies_the_site(): void {
+		$this->mock_http( [ $this->make_website() ], [ 'cloud_status' => 500 ] );
+
+		DailyBillingCron::run(
+			[
+				'billing_date' => '2026-08-19',
+				'retried'      => 3,
+			]
+		);
+
+		$this->assertNotEmpty( $this->mails );
+		$subject = (string) ( $this->mails[0]['subject'] ?? '' );
+		$body    = (string) ( $this->mails[0]['message'] ?? '' );
+
+		$host = (string) \wp_parse_url( (string) \site_url(), PHP_URL_HOST );
+		$this->assertNotSame( '', $host, '測試環境應解析得出網域' );
+		$this->assertStringContainsString( $host, $subject, '主旨須含站台網域，收件匣才分得出是哪一台' );
+
+		$this->assertStringContainsString( (string) \site_url(), $body, '內文須含站台網址' );
+		$this->assertStringContainsString( (string) self::PARTNER_ID, $body, '內文須含 partner_id，那是與接收端對帳的號碼' );
+		$this->assertStringContainsString( '2026-08-19', $body, '內文須含業務日期' );
+		$this->assertStringContainsString( 'push_failed', $body, '內文須含原因代碼' );
+		$this->assertStringContainsString( '未送出金額', $body, '算得出金額時須顯示，漏推一天等於少收一天錢' );
+	}
+
+	/**
+	 * Rule: partner_id 未設定時只寫 log，不寄信
+	 *
+	 * 排程是裝了外掛就無條件註冊，不問有沒有連結過帳號；partner_id 只在後台按下
+	 * 「連結帳號」時才寫入。若此路徑照寄，每一台「裝了外掛但從未連結」的站
+	 * （含模板站與由它 clone 出來的站）都會每天收到一封，而這類站根本沒有錢會漏 ——
+	 * 噪音會把真正該被看見的告警一起淹掉。
+	 *
+	 * @group error
+	 */
+	public function test_missing_partner_id_does_not_mail(): void {
+		\delete_option( Connect::PARTNER_ID_OPTION_NAME );
+
+		$result = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertSame( 'no_partner_id', $result['reason'] );
+		$this->assertEmpty( $this->mails, 'partner_id 未設定不得寄信，只留 log' );
+		$this->assert_log( 'error' );
+	}
+
+	/**
+	 * Rule: 前置中止（尚未抓網站清單）的通知信不顯示金額列
+	 *
+	 * 那時金額根本算不出來，硬填 0 會讓收信人以為「今天本來就沒錢可收」而不急著處理。
+	 * 以 no_api_key 驗證 —— 它同為前置中止，但仍須寄信（見該路徑的說明）。
+	 *
+	 * @group error
+	 */
+	public function test_notify_mail_omits_amount_before_fetch(): void {
+		\delete_transient( Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertNotEmpty( $this->mails );
+		$body = (string) ( $this->mails[0]['message'] ?? '' );
+
+		$this->assertStringContainsString( 'no_api_key', $body, '內文須含原因代碼' );
+		$this->assertStringNotContainsString( '未送出金額', $body, '算不出金額時不得顯示金額列' );
+		$this->assertStringNotContainsString( '未送出站數', $body, '算不出站數時不得顯示站數列' );
+	}
+
+	/**
 	 * Rule: 網站的 dailyCost 缺值或非數值時，該站以 0 計並寫 warning log
 	 *
 	 * @dataProvider provide_invalid_daily_cost
@@ -1862,7 +1936,9 @@ class DailyBillingPushTest extends TestCase {
 	// ========================================================================
 
 	/**
-	 * Rule: 四條設定類中止路徑都必須通知管理員，不可只寫 log 靜默 return
+	 * Rule: 設定類中止路徑都必須通知管理員，不可只寫 log 靜默 return
+	 *
+	 * 唯一的例外是 no_partner_id —— 見 test_missing_partner_id_does_not_mail 的說明。
 	 *
 	 * @dataProvider provide_config_abort
 	 * @group error
@@ -1875,9 +1951,6 @@ class DailyBillingPushTest extends TestCase {
 		$websites = [ $this->make_website() ];
 
 		switch ( $scenario ) {
-			case 'no_partner_id':
-				\delete_option( Connect::PARTNER_ID_OPTION_NAME );
-				break;
 			case 'no_api_key':
 				\delete_transient( Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
 				break;
@@ -1919,13 +1992,12 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * 四條設定類中止路徑
+	 * 須通知管理員的設定類中止路徑（不含 no_partner_id，該路徑刻意只寫 log）
 	 *
 	 * @return array<string, array{0: string, 1: string, 2: string}>
 	 */
 	public function provide_config_abort(): array {
 		return [
-			'partner_id 未設定'   => [ 'no_partner_id', 'no_partner_id', 'partner_id' ],
 			'API Key 不存在'      => [ 'no_api_key', 'no_api_key', '新架構權限' ],
 			'取不到 dealer_id'    => [ 'no_dealer_id', 'no_dealer_id', 'dealer_id' ],
 			'多個相異 dealer_id'  => [ 'multiple_dealer_ids', 'multiple_dealer_ids', '權限' ],
