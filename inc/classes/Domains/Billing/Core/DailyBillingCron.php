@@ -216,12 +216,11 @@ final class DailyBillingCron {
 					'partner_id'   => is_scalar( $partner_id ) ? $partner_id : \wp_json_encode( $partner_id ),
 				]
 			);
-			// 刻意不寄信（與其餘設定類中止路徑不同）：本外掛裝了就無條件註冊排程，
+			// 連 log_alert() 都不呼叫（其餘中止路徑都會呼叫）：本外掛裝了就無條件註冊排程，
 			// 不問有沒有連結過帳號 —— 而 partner_id 只在後台按下「連結帳號」時才寫入。
 			// 於是每一台「裝了外掛但從未連結」的站（含模板站與由它 clone 出來的站）
-			// 都會每天寄一封，收信人卻沒有任何錢會漏：這類站根本不是運作中的經銷商站。
-			// 噪音把真正該被看見的告警一起淹掉，故此路徑只留 error log。
-			// 真經銷商若尚未連結，人就在後台，介面上直接看得到連結表單，不需要靠信提醒。
+			// 每天都會走到這裡，而這類站根本不是運作中的經銷商站、沒有任何錢會漏。
+			// 上面的 error log 已足夠，不需要再多一筆帶完整 context 的告警。
 			return self::result( false, 'no_partner_id', $billing_date );
 		}
 
@@ -233,10 +232,10 @@ final class DailyBillingCron {
 				'error',
 				[ 'billing_date' => $billing_date ]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'no_api_key',
-				'<p>找不到全域 PowerCloud API Key，本日新架構（PowerCloud）網站的計費資料未送出。</p><p>請到後台 Power Partner 設定頁的「新架構權限」tab 重新認證，以寫入全域 key。</p><p>排程情境沒有登入者，只讀得到全域 key；若貴站當初只存了舊版的 per-user key，每日計費會從第一天起就永遠中止。</p>'
+				'找不到全域 PowerCloud API Key，本日新架構（PowerCloud）網站的計費資料未送出。請到後台 Power Partner 設定頁的「新架構權限」tab 重新認證，以寫入全域 key。排程情境沒有登入者，只讀得到全域 key；若貴站當初只存了舊版的 per-user key，每日計費會從第一天起就永遠中止。'
 			);
 			return self::result( false, 'no_api_key', $billing_date );
 		}
@@ -300,10 +299,10 @@ final class DailyBillingCron {
 					'website_count' => count( $websites ),
 				]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'no_dealer_id',
-				'<p>PowerCloud 網站清單中所有網站都取不到經銷商 id（<code>user.dealerId</code>），本日計費資料未送出。</p><p>接收端以 dealer_id 做身分綁定比對，空值必定被拒絕扣點。這通常代表 PowerCloud 的 /websites 回應欄位已改版，請通知開發者確認。</p>'
+				'PowerCloud 網站清單中所有網站都取不到經銷商 id（user.dealerId），本日計費資料未送出。接收端以 dealer_id 做身分綁定比對，空值必定被拒絕扣點。這通常代表 PowerCloud 的 /websites 回應欄位已改版，請通知開發者確認。'
 			);
 			return self::result( false, 'no_dealer_id', $billing_date );
 		}
@@ -321,12 +320,12 @@ final class DailyBillingCron {
 					'dealer_ids'   => $dealer_ids,
 				]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'multiple_dealer_ids',
 				sprintf(
-					'<p>PowerCloud 網站清單出現多個相異經銷商 id（<code>user.dealerId</code>：%1$s），本日計費資料未送出。</p><p>正常情況下同一把 API key 底下所有站都屬同一個經銷商，出現多個代表這把 key 的<strong>權限範圍</strong>已超出預期（例如被換成管理員層級的 key），權限模型可能已變更。若照推會把不屬於貴站的網站算到貴站頭上，因此直接中止。請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
-					\esc_html( implode( ', ', $dealer_ids ) )
+					'PowerCloud 網站清單出現多個相異經銷商 id（user.dealerId：%1$s），本日計費資料未送出。正常情況下同一把 API key 底下所有站都屬同一個經銷商，出現多個代表這把 key 的權限範圍已超出預期（例如被換成管理員層級的 key），權限模型可能已變更。若照推會把不屬於貴站的網站算到貴站頭上，因此直接中止。請確認後台「新架構權限」tab 綁定的 API key 是否正確。',
+					implode( ', ', $dealer_ids )
 				)
 			);
 			return self::result( false, 'multiple_dealer_ids', $billing_date );
@@ -350,11 +349,11 @@ final class DailyBillingCron {
 					'website_count' => count( $websites ),
 				]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'billable_site_without_owner',
 				sprintf(
-					'<p>PowerCloud 網站清單中有 %1$d 個 status 為 <code>%2$s</code> 的網站，其經銷商 id（<code>user.dealerId</code>）為空，無法確認擁有者，本日計費資料未送出。</p><p>同一把 API key 底下的站都應該有 owner。出現沒有 owner 的站，代表這把 key 的<strong>權限範圍</strong>可能已放大到其他帳號 —— 這類站若照推，會被以貴站的身分算進計費（接收端只比對 dealer_id，比對得過就照扣）。</p><p>請確認後台「新架構權限」tab 綁定的 API key 是否正確。</p>',
+					'PowerCloud 網站清單中有 %1$d 個 status 為 %2$s 的網站，其經銷商 id（user.dealerId）為空，無法確認擁有者，本日計費資料未送出。同一把 API key 底下的站都應該有 owner。出現沒有 owner 的站，代表這把 key 的權限範圍可能已放大到其他帳號 —— 這類站若照推，會被以貴站的身分算進計費（接收端只比對 dealer_id，比對得過就照扣）。請確認後台「新架構權限」tab 綁定的 API key 是否正確。',
 					$orphan_count,
 					self::BILLABLE_STATUS
 				)
@@ -374,13 +373,13 @@ final class DailyBillingCron {
 					'dealer_id'    => $dealer_id,
 				]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'dealer_id_changed',
 				sprintf(
-					'<p>本次從 PowerCloud 網站清單解析出的經銷商 id（dealerId：%1$s）與本地記錄的綁定值（%2$s）不符，本日計費資料未送出。</p><p>這代表 PowerCloud 帳號可能已更換，或本地狀態異常。接收端的身分綁定同樣不會自動換綁，硬推只會被拒絕，因此直接中止。</p><p>若確認是正常換綁，請聯絡 cloud.luke.cafe 管理員清除綁定，並刪除本站的 <code>%3$s</code> option 後重推。</p>',
-					\esc_html( $dealer_id ),
-					\esc_html( $bound ),
+					'本次從 PowerCloud 網站清單解析出的經銷商 id（dealerId：%1$s）與本地記錄的綁定值（%2$s）不符，本日計費資料未送出。這代表 PowerCloud 帳號可能已更換，或本地狀態異常。接收端的身分綁定同樣不會自動換綁，硬推只會被拒絕，因此直接中止。若確認是正常換綁，請聯絡 cloud.luke.cafe 管理員清除綁定，並刪除本站的 %3$s option 後重推。',
+					$dealer_id,
+					$bound,
 					self::BOUND_DEALER_ID_OPTION
 				)
 			);
@@ -405,14 +404,14 @@ final class DailyBillingCron {
 					'actual_statuses' => $statuses,
 				]
 			);
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				'no_billable_site',
 				sprintf(
-					'<p>PowerCloud 回報 %1$d 個網站，但沒有任何一個的 status 是 <code>%2$s</code>，本日計費金額為 0。</p><p>本次清單出現過的狀態值：<code>%3$s</code>。</p><p>若上述狀態值看起來只是大小寫或用字不同（例如 <code>Running</code>），代表 PowerCloud 的狀態字典已改版，計費過濾條件需要同步更新；請盡快通知開發者，否則每天都會以 0 點寫掉冪等鍵。</p>',
+					'PowerCloud 回報 %1$d 個網站，但沒有任何一個的 status 是 %2$s，本日計費金額為 0。本次清單出現過的狀態值：%3$s。若上述狀態值看起來只是大小寫或用字不同（例如 Running），代表 PowerCloud 的狀態字典已改版，計費過濾條件需要同步更新；請盡快通知開發者，否則每天都會以 0 點寫掉冪等鍵。',
 					count( $websites ),
 					self::BILLABLE_STATUS,
-					\esc_html( implode( ', ', $statuses ) )
+					implode( ', ', $statuses )
 				),
 				0.0,
 				0
@@ -442,12 +441,12 @@ final class DailyBillingCron {
 						'response_code' => $push['response_code'],
 					]
 				);
-				self::notify_admin(
+				self::log_alert(
 					$billing_date,
 					'identity_mismatch',
 					sprintf(
-						'<p>cloud.luke.cafe 以 HTTP 403 拒絕本次推送，原因是經銷商 id（dealer_id）與該經銷商<strong>已綁定</strong>的值不符。本次推送的 dealer_id 為 %1$s。</p><p>接收端的綁定採 Trust On First Use（首次收到即綁定），不會自動換綁。重試三次也不會成功，因此不進入重試流程。</p><p>可能原因：(1) 貴站的 PowerCloud 帳號已更換；(2) 有人以貴站的 partner_id 搶先完成綁定。請立刻聯絡 cloud.luke.cafe 管理員核對綁定值。</p>',
-						\esc_html( $dealer_id )
+						'cloud.luke.cafe 以 HTTP 403 拒絕本次推送，原因是經銷商 id（dealer_id）與該經銷商已綁定的值不符。本次推送的 dealer_id 為 %1$s。接收端的綁定採 Trust On First Use（首次收到即綁定），不會自動換綁。重試三次也不會成功，因此不進入重試流程。可能原因：(1) 貴站的 PowerCloud 帳號已更換；(2) 有人以貴站的 partner_id 搶先完成綁定。請立刻聯絡 cloud.luke.cafe 管理員核對綁定值。',
+						$dealer_id
 					),
 					$total_amount,
 					count( $sites )
@@ -467,7 +466,7 @@ final class DailyBillingCron {
 						'response_code' => $push['response_code'],
 					]
 				);
-				self::notify_admin(
+				self::log_alert(
 					$billing_date,
 					$push['error_code'],
 					self::permanent_error_detail( $push['error_code'], $push['response_code'], $push['message'] ),
@@ -629,7 +628,7 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 排程 30 分鐘後重試；已達上限則寄信通知站台管理員並寫 error log
+	 * 排程 30 分鐘後重試；已達上限則寫 error log（不寄信，見 log_alert()）
 	 *
 	 * 3 次 × 30 分鐘最晚於 UTC+8 06:30 完成，仍在同一業務日內，不會污染接收端的冪等鍵。
 	 *
@@ -642,11 +641,11 @@ final class DailyBillingCron {
 	 */
 	private static function schedule_retry( string $billing_date, int $retried, string $reason, ?float $total_amount = null, ?int $site_count = null ): void {
 		if ( $retried >= self::MAX_RETRY ) {
-			self::notify_admin(
+			self::log_alert(
 				$billing_date,
 				$reason,
 				sprintf(
-					'<p>已重試 %1$d 次仍失敗，本日新架構（PowerCloud）網站的計費資料未送達 cloud.luke.cafe，請盡快檢查。</p>',
+					'已重試 %1$d 次仍失敗，本日新架構（PowerCloud）網站的計費資料未送達 cloud.luke.cafe，請盡快檢查。',
 					$retried
 				),
 				$total_amount,
@@ -691,13 +690,13 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 永久性錯誤（接收端的 data.error_code）對應的通知信內文
+	 * 永久性錯誤（接收端的 data.error_code）對應的 log 說明
 	 *
 	 * 代碼清單見 BillingPushClient::PERMANENT_ERROR_CODES。接收端未來新增代碼時，
-	 * 這裡沒對到就走 default 的通用文案，不會漏寄信。
+	 * 這裡沒對到就走 default 的通用文案，不會漏記。
 	 *
-	 * 一律附上接收端回的 message —— 光給管理員一個 `missing_field` 之類的代碼，
-	 * 他無從得知是哪一個參數出問題，等於查不下去。
+	 * 一律附上接收端回的 message —— 光給一個 `missing_field` 之類的代碼，
+	 * 讀 log 的人無從得知是哪一個參數出問題，等於查不下去。
 	 *
 	 * @param string $error_code    接收端回報的錯誤代碼
 	 * @param int    $response_code HTTP status code
@@ -706,32 +705,32 @@ final class DailyBillingCron {
 	 */
 	private static function permanent_error_detail( string $error_code, int $response_code, string $message = '' ): string {
 		$detail = match ( $error_code ) {
-			'partner_not_found'    => '<p>cloud.luke.cafe 找不到本站 <code>partner_id</code> 對應的經銷商帳號，本日計費資料未送出。</p><p>可能是 partner_id 設錯，或該帳號已被刪除。請至後台重新連結 cloud.luke.cafe 取得正確的 partner_id。</p>',
-			'not_a_dealer'         => '<p>cloud.luke.cafe 回報本站 <code>partner_id</code> 對應的帳號<strong>不是經銷商</strong>，無法扣點，本日計費資料未送出。</p><p>請聯絡 cloud.luke.cafe 管理員確認該帳號的角色設定。</p>',
-			'invalid_billing_date' => '<p>cloud.luke.cafe 認為本次推送的 <code>billing_date</code> 超出可接受範圍，本日計費資料未送出。</p><p>這通常代表排程嚴重落後，或本站的主機時間不正確。請檢查 ActionScheduler 佇列與主機時間，並通知開發者。</p>',
-			'missing_field'        => '<p>cloud.luke.cafe 回報推送內容<strong>缺少</strong>必填欄位，本日計費資料未送出。</p><p>欄位整個沒送出，通常代表兩端的契約版本不一致（例如一端已改欄位名、另一端尚未更新）。請通知開發者核對 Power Partner 與 cloud.luke.cafe 的版本。</p>',
-			'invalid_field'        => '<p>cloud.luke.cafe 回報推送內容有欄位<strong>型別或格式不符</strong>，本日計費資料未送出。</p><p>欄位有送出但值不合法，代表發送端組出的資料有誤。請檢查資料組裝邏輯與 PowerCloud 回應格式，並看下方 message 確認是哪一個參數。</p>',
-			default                => '<p>cloud.luke.cafe 以永久性錯誤拒絕本次推送，本日計費資料未送出。</p><p>這類錯誤重試不會成功，請通知開發者確認。</p>',
+			'partner_not_found'    => 'cloud.luke.cafe 找不到本站 partner_id 對應的經銷商帳號，本日計費資料未送出。可能是 partner_id 設錯，或該帳號已被刪除。請至後台重新連結 cloud.luke.cafe 取得正確的 partner_id。',
+			'not_a_dealer'         => 'cloud.luke.cafe 回報本站 partner_id 對應的帳號不是經銷商，無法扣點，本日計費資料未送出。請聯絡 cloud.luke.cafe 管理員確認該帳號的角色設定。',
+			'invalid_billing_date' => 'cloud.luke.cafe 認為本次推送的 billing_date 超出可接受範圍，本日計費資料未送出。這通常代表排程嚴重落後，或本站的主機時間不正確。請檢查 ActionScheduler 佇列與主機時間，並通知開發者。',
+			'missing_field'        => 'cloud.luke.cafe 回報推送內容缺少必填欄位，本日計費資料未送出。欄位整個沒送出，通常代表兩端的契約版本不一致（例如一端已改欄位名、另一端尚未更新）。請通知開發者核對 Power Partner 與 cloud.luke.cafe 的版本。',
+			'invalid_field'        => 'cloud.luke.cafe 回報推送內容有欄位型別或格式不符，本日計費資料未送出。欄位有送出但值不合法，代表發送端組出的資料有誤。請檢查資料組裝邏輯與 PowerCloud 回應格式，並看後方 message 確認是哪一個參數。',
+			default                => 'cloud.luke.cafe 以永久性錯誤拒絕本次推送，本日計費資料未送出。這類錯誤重試不會成功，請通知開發者確認。',
 		};
 
 		$detail .= sprintf(
-			'<p>接收端回報：HTTP %1$d，錯誤代碼 <code>%2$s</code>。重試三次也不會成功，因此不進入重試流程。</p>',
+			' 接收端回報：HTTP %1$d，錯誤代碼 %2$s。重試三次也不會成功，因此不進入重試流程。',
 			$response_code,
-			\esc_html( $error_code )
+			$error_code
 		);
 
 		if ( '' !== $message ) {
-			$detail .= sprintf( '<p>接收端 message：<code>%1$s</code></p>', \esc_html( self::truncate( $message ) ) );
+			$detail .= sprintf( ' 接收端 message：%1$s', self::truncate( $message ) );
 		}
 
 		return $detail;
 	}
 
 	/**
-	 * 截斷過長的字串（供通知信顯示用）
+	 * 截斷過長的字串（供 log 顯示用）
 	 *
 	 * 接收端的 message 長度不受本站控制，中介設備也可能塞入大量內容，
-	 * 原樣貼進信件會產生無法閱讀的巨信。
+	 * 原樣寫進 log 會撐爆 log 表的欄位、也讓人讀不下去。
 	 *
 	 * @param string $text  原字串
 	 * @param int    $limit 上限字元數
@@ -746,125 +745,66 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 推送中止／失敗：寄信通知站台管理員 + error log
+	 * 推送中止／失敗：寫 error log（刻意不寄信）
 	 *
-	 * 漏推一天等於少收一天錢，必須有人看得見 —— 設定類的中止路徑（缺 partner_id、缺 API Key、
-	 * 缺 dealer_id、多個 dealer_id）不會自行復原，只寫 log 等於沒人知道。
+	 * 漏推一天等於少收一天錢，必須留得下痕跡 —— 設定類的中止路徑（缺 API Key、缺 dealer_id、
+	 * 多個 dealer_id）不會自行復原。
+	 *
+	 * 一律只寫 log、不寄信：收信人（站台 admin_email）是經銷商，而這裡每一種原因的處置
+	 * 都要進後台改設定或找開發者／接收端管理員，不是收一封信就能解決的事；本外掛又是
+	 * 「裝了就無條件註冊排程」，模板站與由它 clone 出來的終端客戶站全都會照跑照寄，
+	 * 噪音會把真正該被看見的告警一起淹掉。異常改由 log 與接收端的 stale 資料發現。
 	 *
 	 * @param string     $billing_date 業務日期
-	 * @param string     $reason       原因
-	 * @param string     $detail       信件內文（HTML，呼叫端自行組好並轉義）
+	 * @param string     $reason       原因代碼
+	 * @param string     $detail       說明（純文字，呼叫端自行組好）
 	 * @param float|null $total_amount 本次未送出的計費金額（算得出來時才傳）
 	 * @param int|null   $site_count   本次未送出的可計費站數（算得出來時才傳）
 	 * @return void
 	 */
-	private static function notify_admin( string $billing_date, string $reason, string $detail, ?float $total_amount = null, ?int $site_count = null ): void {
-		$admin_email = (string) \get_option( 'admin_email' );
-
-		// 主旨帶站台網域：收信人多半同時是好幾個站的 admin_email，主旨全都一樣時
-		// 收件匣裡分不出是哪一台出事，也搜尋不到。站名（blogname）不能用 ——
-		// 沒改過站名的站全叫「我的網站」，唯一識別得靠網域
-		$subject = sprintf(
-			'【Power Partner】%1$s 新架構網站計費資料推送異常（%2$s）',
-			self::site_host(),
-			$billing_date
-		);
-
-		$message = self::site_identity_html( $billing_date, $reason, $total_amount, $site_count ) . $detail;
-
-		\wp_mail( $admin_email, $subject, $message, [ 'Content-Type: text/html; charset=UTF-8' ] );
-
+	private static function log_alert( string $billing_date, string $reason, string $detail, ?float $total_amount = null, ?int $site_count = null ): void {
 		Plugin::logger(
-			sprintf( '新架構每日計費推送異常（%1$s），已寄信通知 %2$s', $reason, $admin_email ),
+			sprintf( '新架構每日計費推送異常（%1$s）：%2$s', $reason, $detail ),
 			'error',
-			[
-				'billing_date' => $billing_date,
-				'reason'       => $reason,
-			]
+			self::alert_context( $billing_date, $reason, $total_amount, $site_count )
 		);
 	}
 
 	/**
-	 * 本站的網域（主旨與識別區塊用）
+	 * 異常 log 的結構化 context
 	 *
-	 * @return string 解析不出時退回站名，再不然退回 '(未知站台)'
-	 */
-	private static function site_host(): string {
-		$host = \wp_parse_url( (string) \site_url(), PHP_URL_HOST );
-		if ( is_string( $host ) && '' !== $host ) {
-			return $host;
-		}
-
-		$name = (string) \get_bloginfo( 'name' );
-
-		return '' !== $name ? $name : '(未知站台)';
-	}
-
-	/**
-	 * 信件開頭的站台識別區塊
-	 *
-	 * 原本只印 blogname 與原因代碼。blogname 預設值人人相同（「我的網站」），
-	 * 收信人因此看不出是哪一台出事、要拿什麼身分去比對、也不知道漏了多少錢 ——
-	 * 而這封信要求的動作（重新連結、換 API key、聯絡接收端核對綁定）每一項都要先知道這些。
-	 * 唯一識別得靠網域；partner_id 與 dealer_id 是與接收端對帳時要報的兩個號碼。
+	 * 讀 log 的人要能直接看出是哪一台站、拿什麼身分去對帳：partner_id 與 dealer_id
+	 * 是與接收端對帳時要報的兩個號碼，缺了就得再回站上查一次；site_url 讓 log 被
+	 * 集中收集時仍分得出是哪一台（blogname 不能用 —— 沒改過站名的站全叫「我的網站」）。
 	 *
 	 * @param string     $billing_date 業務日期
 	 * @param string     $reason       原因代碼
 	 * @param float|null $total_amount 未送出的計費金額
 	 * @param int|null   $site_count   未送出的可計費站數
-	 * @return string
+	 * @return array<string, mixed>
 	 */
-	private static function site_identity_html( string $billing_date, string $reason, ?float $total_amount, ?int $site_count ): string {
+	private static function alert_context( string $billing_date, string $reason, ?float $total_amount, ?int $site_count ): array {
 		$partner_id = \get_option( Connect::PARTNER_ID_OPTION_NAME );
 		$bound      = (string) \get_option( self::BOUND_DEALER_ID_OPTION, '' );
 
-		$rows = [
-			'站台'       => sprintf(
-				'<strong>%1$s</strong><br /><a href="%2$s" target="_blank">%2$s</a>',
-				\esc_html( (string) \get_bloginfo( 'name' ) ),
-				\esc_url( (string) \site_url() )
-			),
-			'後台'       => sprintf( '<a href="%1$s" target="_blank">開啟本站後台</a>', \esc_url( (string) \admin_url() ) ),
-			'經銷商編號' => ( is_scalar( $partner_id ) && '' !== (string) $partner_id )
-				? \esc_html( '#' . (string) $partner_id )
-				: '<span style="color:#b00;">未設定</span>',
-			'經銷商 id'  => '' !== $bound
-				? sprintf( '<code>%s</code>', \esc_html( $bound ) )
-				: '<span style="color:#666;">尚未綁定（從未成功推送過）</span>',
-			'業務日期'   => \esc_html( $billing_date ),
-			'原因代碼'   => sprintf( '<code>%s</code>', \esc_html( $reason ) ),
+		$context = [
+			'billing_date'    => $billing_date,
+			'reason'          => $reason,
+			'site_url'        => (string) \site_url(),
+			'partner_id'      => is_scalar( $partner_id ) ? (string) $partner_id : '',
+			'bound_dealer_id' => $bound,
 		];
 
 		// 前置中止（缺 partner_id / 缺 API key）發生在抓網站清單之前，算不出金額。
-		// 那時硬填 0 會讓收信人以為「今天本來就沒錢可收」而不急著處理，故整列不顯示
+		// 那時硬填 0 會讓讀 log 的人以為「今天本來就沒錢可收」，故整個 key 不放
 		if ( null !== $site_count ) {
-			$rows['未送出站數'] = \esc_html( (string) $site_count );
+			$context['site_count'] = $site_count;
 		}
 		if ( null !== $total_amount ) {
-			$rows['未送出金額'] = sprintf(
-				'<strong style="color:#b00;">%s 點</strong>（漏推一天等於少收一天錢）',
-				\esc_html( number_format( $total_amount, 2 ) )
-			);
+			$context['total_amount'] = $total_amount;
 		}
 
-		$th_style = 'border:1px solid #ddd;padding:6px;text-align:left;background:#fafafa;white-space:nowrap;';
-		$td_style = 'border:1px solid #ddd;padding:6px;';
-
-		$html = '';
-		foreach ( $rows as $label => $value ) {
-			$html .= sprintf(
-				'<tr><th style="%1$s">%2$s</th><td style="%3$s">%4$s</td></tr>',
-				$th_style,
-				\esc_html( $label ),
-				$td_style,
-				$value
-			);
-		}
-
-		return sprintf(
-			'<p style="margin:0 0 6px;"><strong>發生問題的站台</strong></p><table style="border-collapse:collapse;margin-bottom:16px;">%s</table>',
-			$html
-		);
+		return $context;
 	}
 
 	/**
