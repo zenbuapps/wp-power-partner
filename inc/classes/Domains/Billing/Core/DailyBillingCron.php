@@ -53,6 +53,19 @@ final class DailyBillingCron {
 	 */
 	const CRON_EXPRESSION = '0 21 * * *';
 
+	/**
+	 * 告警信的收件人
+	 *
+	 * 刻意**不用**站台 admin_email：那是經銷商，而這裡每一種原因的處置 ——
+	 * 改設定、查兩端契約、聯絡接收端管理員 —— 都是服務商這邊要做的事。
+	 * 寄給經銷商只會讓他收到看不懂也修不了的信；由服務商集中收，才有人真的會處理。
+	 *
+	 * 可用 filter `power_partner_billing_alert_mail_to` 覆寫（例如轉寄到工單系統）。
+	 *
+	 * @var string
+	 */
+	const ALERT_MAIL_TO = 'info@morepower.club';
+
 	/** @var string 排程型態版本（'2' = wall-clock cron 排程），用於一次性遷移舊的 interval 排程 */
 	const SCHEDULE_VERSION = '2';
 
@@ -216,11 +229,12 @@ final class DailyBillingCron {
 					'partner_id'   => is_scalar( $partner_id ) ? $partner_id : \wp_json_encode( $partner_id ),
 				]
 			);
-			// 連 log_alert() 都不呼叫（其餘中止路徑都會呼叫）：本外掛裝了就無條件註冊排程，
+			// 連 raise_alert() 都不呼叫（其餘中止路徑都會呼叫）：本外掛裝了就無條件註冊排程，
 			// 不問有沒有連結過帳號 —— 而 partner_id 只在後台按下「連結帳號」時才寫入。
-			// 於是每一台「裝了外掛但從未連結」的站（含模板站與由它 clone 出來的站）
-			// 每天都會走到這裡，而這類站根本不是運作中的經銷商站、沒有任何錢會漏。
-			// 上面的 error log 已足夠，不需要再多一筆帶完整 context 的告警。
+			// 於是每一台「裝了外掛但從未連結」的站（含模板站與由它 clone 出來的終端客戶站）
+			// 每天都會走到這裡。告警信全部集中寄到同一個信箱，這條路徑照寄的話量最大、
+			// 而這類站根本不是運作中的經銷商站、沒有任何錢會漏 —— 收件匣會被它淹掉。
+			// 上面的 error log 已足夠。
 			return self::result( false, 'no_partner_id', $billing_date );
 		}
 
@@ -232,7 +246,7 @@ final class DailyBillingCron {
 				'error',
 				[ 'billing_date' => $billing_date ]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'no_api_key',
 				'找不到全域 PowerCloud API Key，本日新架構（PowerCloud）網站的計費資料未送出。請到後台 Power Partner 設定頁的「新架構權限」tab 重新認證，以寫入全域 key。排程情境沒有登入者，只讀得到全域 key；若貴站當初只存了舊版的 per-user key，每日計費會從第一天起就永遠中止。'
@@ -299,7 +313,7 @@ final class DailyBillingCron {
 					'website_count' => count( $websites ),
 				]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'no_dealer_id',
 				'PowerCloud 網站清單中所有網站都取不到經銷商 id（user.dealerId），本日計費資料未送出。接收端以 dealer_id 做身分綁定比對，空值必定被拒絕扣點。這通常代表 PowerCloud 的 /websites 回應欄位已改版，請通知開發者確認。'
@@ -320,7 +334,7 @@ final class DailyBillingCron {
 					'dealer_ids'   => $dealer_ids,
 				]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'multiple_dealer_ids',
 				sprintf(
@@ -349,7 +363,7 @@ final class DailyBillingCron {
 					'website_count' => count( $websites ),
 				]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'billable_site_without_owner',
 				sprintf(
@@ -373,7 +387,7 @@ final class DailyBillingCron {
 					'dealer_id'    => $dealer_id,
 				]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'dealer_id_changed',
 				sprintf(
@@ -404,7 +418,7 @@ final class DailyBillingCron {
 					'actual_statuses' => $statuses,
 				]
 			);
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				'no_billable_site',
 				sprintf(
@@ -441,7 +455,7 @@ final class DailyBillingCron {
 						'response_code' => $push['response_code'],
 					]
 				);
-				self::log_alert(
+				self::raise_alert(
 					$billing_date,
 					'identity_mismatch',
 					sprintf(
@@ -466,7 +480,7 @@ final class DailyBillingCron {
 						'response_code' => $push['response_code'],
 					]
 				);
-				self::log_alert(
+				self::raise_alert(
 					$billing_date,
 					$push['error_code'],
 					self::permanent_error_detail( $push['error_code'], $push['response_code'], $push['message'] ),
@@ -641,7 +655,7 @@ final class DailyBillingCron {
 	 */
 	private static function schedule_retry( string $billing_date, int $retried, string $reason, ?float $total_amount = null, ?int $site_count = null ): void {
 		if ( $retried >= self::MAX_RETRY ) {
-			self::log_alert(
+			self::raise_alert(
 				$billing_date,
 				$reason,
 				sprintf(
@@ -745,28 +759,194 @@ final class DailyBillingCron {
 	}
 
 	/**
-	 * 推送中止／失敗：寫 error log（刻意不寄信）
+	 * 推送中止／失敗：寫 error log + 寄告警信給服務商
 	 *
-	 * 漏推一天等於少收一天錢，必須留得下痕跡 —— 設定類的中止路徑（缺 API Key、缺 dealer_id、
-	 * 多個 dealer_id）不會自行復原。
+	 * 漏推一天等於少收一天錢，必須有人看得見 —— 設定類的中止路徑（缺 API Key、缺 dealer_id、
+	 * 多個 dealer_id）不會自行復原，只寫 log 沒人會主動去翻。
 	 *
-	 * 一律只寫 log、不寄信：收信人（站台 admin_email）是經銷商，而這裡每一種原因的處置
-	 * 都要進後台改設定或找開發者／接收端管理員，不是收一封信就能解決的事；本外掛又是
-	 * 「裝了就無條件註冊排程」，模板站與由它 clone 出來的終端客戶站全都會照跑照寄，
-	 * 噪音會把真正該被看見的告警一起淹掉。異常改由 log 與接收端的 stale 資料發現。
+	 * 收件人是 ALERT_MAIL_TO（服務商），不是站台 admin_email（經銷商）—— 理由見該常數。
+	 * 一封信要同時回答兩個問題：**是哪一台站**（網域／站名／管理員／partner_id／dealer_id）、
+	 * **出了什麼事**（原因代碼、處置說明、漏掉多少錢），否則收信人得先回站上查一輪才動得了。
 	 *
 	 * @param string     $billing_date 業務日期
 	 * @param string     $reason       原因代碼
-	 * @param string     $detail       說明（純文字，呼叫端自行組好）
+	 * @param string     $detail       說明（純文字，呼叫端自行組好；信件會自行轉義）
 	 * @param float|null $total_amount 本次未送出的計費金額（算得出來時才傳）
 	 * @param int|null   $site_count   本次未送出的可計費站數（算得出來時才傳）
 	 * @return void
 	 */
-	private static function log_alert( string $billing_date, string $reason, string $detail, ?float $total_amount = null, ?int $site_count = null ): void {
+	private static function raise_alert( string $billing_date, string $reason, string $detail, ?float $total_amount = null, ?int $site_count = null ): void {
 		Plugin::logger(
 			sprintf( '新架構每日計費推送異常（%1$s）：%2$s', $reason, $detail ),
 			'error',
 			self::alert_context( $billing_date, $reason, $total_amount, $site_count )
+		);
+
+		self::send_alert_mail( $billing_date, $reason, $detail, $total_amount, $site_count );
+	}
+
+	/**
+	 * 寄出告警信
+	 *
+	 * 主旨帶網域：收件匣同時收得到所有經銷商站的告警，主旨全都一樣時分不出是哪一台、
+	 * 也搜尋不到。站名（blogname）不能當識別 —— 沒改過站名的站全叫「我的網站」。
+	 *
+	 * @param string     $billing_date 業務日期
+	 * @param string     $reason       原因代碼
+	 * @param string     $detail       說明（純文字）
+	 * @param float|null $total_amount 未送出的計費金額
+	 * @param int|null   $site_count   未送出的可計費站數
+	 * @return void
+	 */
+	private static function send_alert_mail( string $billing_date, string $reason, string $detail, ?float $total_amount, ?int $site_count ): void {
+		/**
+		 * 告警信收件人
+		 *
+		 * @param string $mail_to 收件人
+		 */
+		$mail_to = (string) \apply_filters( 'power_partner_billing_alert_mail_to', self::ALERT_MAIL_TO );
+		if ( '' === $mail_to ) {
+			return;
+		}
+
+		$subject = sprintf(
+			'【Power Partner 計費異常】%1$s / %2$s（%3$s）',
+			self::site_host(),
+			$reason,
+			$billing_date
+		);
+
+		$message = self::alert_mail_html( $billing_date, $reason, $detail, $total_amount, $site_count );
+
+		\wp_mail( $mail_to, $subject, $message, [ 'Content-Type: text/html; charset=UTF-8' ] );
+	}
+
+	/**
+	 * 本站的網域（主旨與識別區塊用）
+	 *
+	 * @return string 解析不出時退回站名，再不然退回 '(未知站台)'
+	 */
+	private static function site_host(): string {
+		$host = \wp_parse_url( (string) \site_url(), PHP_URL_HOST );
+		if ( is_string( $host ) && '' !== $host ) {
+			return $host;
+		}
+
+		$name = (string) \get_bloginfo( 'name' );
+
+		return '' !== $name ? $name : '(未知站台)';
+	}
+
+	/**
+	 * 告警信內文（誰 + 什麼問題 + 漏了多少錢）
+	 *
+	 * 分成三段刻意不合併：「哪一台站」用來認人並決定要聯絡誰，「發生什麼事」用來決定怎麼修，
+	 * 「未送出的計費」用來決定急不急。混在一段散文裡，收信人得自己讀完才分得出來。
+	 *
+	 * @param string     $billing_date 業務日期
+	 * @param string     $reason       原因代碼
+	 * @param string     $detail       說明（純文字）
+	 * @param float|null $total_amount 未送出的計費金額
+	 * @param int|null   $site_count   未送出的可計費站數
+	 * @return string
+	 */
+	private static function alert_mail_html( string $billing_date, string $reason, string $detail, ?float $total_amount, ?int $site_count ): string {
+		$partner_id = \get_option( Connect::PARTNER_ID_OPTION_NAME );
+		$bound      = (string) \get_option( self::BOUND_DEALER_ID_OPTION, '' );
+
+		$site_rows = [
+			'網域'     => sprintf( '<strong>%s</strong>', \esc_html( self::site_host() ) ),
+			'站台名稱'   => \esc_html( (string) \get_bloginfo( 'name' ) ),
+			'前台'     => sprintf( '<a href="%1$s" target="_blank">%1$s</a>', \esc_url( (string) \site_url() ) ),
+			'後台'     => sprintf( '<a href="%1$s" target="_blank">%1$s</a>', \esc_url( (string) \admin_url() ) ),
+			'站台管理員'  => self::admin_identity_html(),
+			'經銷商編號'  => ( is_scalar( $partner_id ) && '' !== (string) $partner_id )
+				? \esc_html( '#' . (string) $partner_id )
+				: '<span style="color:#b00;">未設定</span>',
+			'經銷商 id' => '' !== $bound
+				? sprintf( '<code>%s</code>', \esc_html( $bound ) )
+				: '<span style="color:#666;">尚未綁定（從未成功推送過）</span>',
+		];
+
+		$issue_rows = [
+			'業務日期' => \esc_html( $billing_date ),
+			'原因代碼' => sprintf( '<code>%s</code>', \esc_html( $reason ) ),
+			'說明'   => \esc_html( $detail ),
+		];
+
+		// 前置中止（缺 API key）發生在抓網站清單之前，金額與站數根本算不出來。
+		// 那時硬填 0 會讓收信人以為「今天本來就沒錢可收」而不急著處理，故整段不顯示
+		$billing_rows = [];
+		if ( null !== $site_count ) {
+			$billing_rows['未送出站數'] = \esc_html( (string) $site_count );
+		}
+		if ( null !== $total_amount ) {
+			$billing_rows['未送出金額'] = sprintf(
+				'<strong style="color:#b00;">%s 點</strong>（漏推一天等於少收一天錢）',
+				\esc_html( number_format( $total_amount, 2 ) )
+			);
+		}
+
+		$html = self::alert_mail_section( '① 哪一台站', $site_rows )
+		. self::alert_mail_section( '② 發生什麼事', $issue_rows );
+
+		if ( $billing_rows ) {
+			$html .= self::alert_mail_section( '③ 未送出的計費', $billing_rows );
+		}
+
+		return sprintf(
+			'<div style="font-family:-apple-system,\'Segoe UI\',sans-serif;font-size:14px;line-height:1.6;color:#222;">%s</div>',
+			$html
+		);
+	}
+
+	/**
+	 * 站台管理員的可辨識資訊（顯示名稱 + email）
+	 *
+	 * 網域認得出「哪一台」，但認不出「找誰」。admin_email 是實際能聯絡到的人。
+	 *
+	 * @return string
+	 */
+	private static function admin_identity_html(): string {
+		$email = (string) \get_option( 'admin_email' );
+		$user  = '' !== $email ? \get_user_by( 'email', $email ) : false;
+		$name  = ( $user instanceof \WP_User ) ? $user->display_name : '';
+
+		if ( '' === $email ) {
+			return '<span style="color:#b00;">未設定</span>';
+		}
+
+		return '' !== $name
+		? sprintf( '%1$s &lt;<a href="mailto:%2$s">%2$s</a>&gt;', \esc_html( $name ), \esc_attr( $email ) )
+		: sprintf( '<a href="mailto:%1$s">%1$s</a>', \esc_attr( $email ) );
+	}
+
+	/**
+	 * 告警信的一個區塊（標題 + 表格）
+	 *
+	 * @param string                $title 區塊標題
+	 * @param array<string, string> $rows  欄位（值已由呼叫端轉義）
+	 * @return string
+	 */
+	private static function alert_mail_section( string $title, array $rows ): string {
+		$th = 'border:1px solid #e0e0e0;padding:8px 10px;text-align:left;background:#fafafa;white-space:nowrap;vertical-align:top;';
+		$td = 'border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;';
+
+		$body = '';
+		foreach ( $rows as $label => $value ) {
+			$body .= sprintf(
+				'<tr><th style="%1$s">%2$s</th><td style="%3$s">%4$s</td></tr>',
+				$th,
+				\esc_html( $label ),
+				$td,
+				$value
+			);
+		}
+
+		return sprintf(
+			'<p style="margin:20px 0 6px;font-weight:bold;">%1$s</p><table style="border-collapse:collapse;width:100%%;max-width:640px;">%2$s</table>',
+			\esc_html( $title ),
+			$body
 		);
 	}
 
