@@ -9,6 +9,7 @@ use J7\PowerPartner\Domains\Email\DTOs\Email;
 use J7\PowerPartner\Domains\Email\Models\SubscriptionEmail;
 use J7\PowerPartner\Domains\Subscription\Utils\Base as SubscriptionUtils;
 use J7\PowerPartner\Domains\Email\Services\SubscriptionEmailScheduler;
+use J7\PowerPartner\ShopSubscription;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Action;
 use J7\Powerhouse\Domains\Subscription\Utils\Base as PowerhouseSubscriptionUtils;
 use J7\PowerPartner\Utils\Token;
@@ -34,6 +35,26 @@ final class SubscriptionEmailHooks {
 	 * @var array<string>
 	 */
 	private const REQUIRED_SITE_TOKENS = [ 'FRONTURL', 'ADMINURL', 'SITEUSERNAME', 'SITEPASSWORD' ];
+
+	/**
+	 * 網站綁定完成後要補排的信件類型（issue #22）
+	 *
+	 * 值對應 Powerhouse Action enum 的 value。
+	 * ⚠️ 不可寫成 Action::NEXT_PAYMENT->value —— enum property fetch 在 class const 初始化式
+	 *    是 PHP 8.2 才支援，本外掛 Requires PHP 8.1，寫了會 Fatal。
+	 *
+	 * 只列「日期錨點類、且真的有綁 Powerhouse hook」的信：
+	 *   - end / watch_end 已改由狀態轉換觸發（見 constructor 的 $rebound_actions），補排等於空轉。
+	 *   - subscription_failed / success / customer_cancelled 是「事件當下才寄」的信，補排 = 憑空寄一封。
+	 *
+	 * ⛔ site_sync 絕對不可加入：本 hook 在 PowerCloud 路徑是在開站流程內
+	 *    （SiteSync::site_sync_powercloud() 寫入 pp_linked_site_ids 時）同步 fire 的，
+	 *    加進來會原地重現 issue #21——而且因為 fire 當下 meta 已寫入、守門已通過，
+	 *    連原本不受影響的 WPCD 也會一起開始重複寄壞信。
+	 *
+	 * @var array<string>
+	 */
+	private const BACKFILL_ACTIONS = [ 'next_payment', 'watch_next_payment', 'trial_end', 'watch_trial_end' ];
 
 	/** @var object{subject:string, body:string} $default Default email */
 	public object $default;
@@ -64,7 +85,7 @@ final class SubscriptionEmailHooks {
 		SubscriptionEmailScheduler::register();
 
 		/**
-		 * issue #21：這裡原本綁了 pp_site_sync_by_subscription → schedule_site_sync_email()，
+		 * Issue #21：這裡原本綁了 pp_site_sync_by_subscription → schedule_site_sync_email()，
 		 * 會在開站當下立刻排一封 site_sync 信。但那條路徑的 tokens 只有
 		 * Token::get_order_tokens() + Token::get_subscription_tokens()（後者只產 URL 一個 key），
 		 * 結構上拿不到 FRONTURL / ADMINURL / SITEUSERNAME / SITEPASSWORD / IPV4，
@@ -80,6 +101,23 @@ final class SubscriptionEmailHooks {
 		 *    PowerCloud 在開站當下同步寫入 pp_linked_site_ids（守門會過），WPCD 要等 REST 回調（守門擋住）。
 		 *    任何放寬該守門的修改，都必須先確認這裡沒有 site_sync 的排程綁定。
 		 */
+
+		/**
+		 * 網站綁定完成後補排訂閱里程碑信（issue #22）
+		 *
+		 * 這兩類信（next_payment / trial_end）唯一的排程入口是 powerhouse_subscription_at_watch_* hook，
+		 * 而該 hook 的唯一來源是 WCS 的 woocommerce_subscription_date_updated。
+		 * 新訂閱在 WCS 把狀態轉成 active 當下（WC_Subscription::status_transition() 的 active 分支
+		 * 會 update_dates(next_payment)）就 fire 過了，而開站發生在其後的
+		 * woocommerce_subscription_payment_complete——所以 fire 當下 pp_linked_site_ids 還是空的，
+		 * schedule_email() 的 is_site_sync() 守門直接 return，新訂閱的第一個週期永遠排不進去。
+		 * （下次續訂成功時 WCS 會再更新一次 next_payment 而自然補排，所以受害範圍是「第一個週期」，
+		 *   不是「永遠」——但那正是客戶第一次自動扣款、最容易產生爭議的那一次。）
+		 *
+		 * 補排掛在「pp_linked_site_ids 真的變更之後」，PowerCloud / WPCD 兩種架構都涵蓋。
+		 * 不可改掛 pp_site_sync_by_subscription——那個 hook 在 WPCD 路徑 fire 時 meta 還沒寫入。
+		 */
+		\add_action( ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, [ $this, 'backfill_subscription_emails' ], 10, 1 );
 
 		// 以下時間點，用監聽的 hook 來發信，且只發一次，如果有修改要取消排程，重新排程
 		$mapper = [
@@ -215,9 +253,10 @@ final class SubscriptionEmailHooks {
 	 * @param Email            $email 信件
 	 * @param \WC_Subscription $subscription 訂閱
 	 * @param int              $min_delay 最少延遲秒數，排程時間不會早於 time() + $min_delay
+	 * @param bool             $skip_if_past 計算出的寄送時間若已是過去就跳過不排（補排專用，見 issue #22）
 	 * @return void
 	 */
-	private function schedule_email( Email $email, \WC_Subscription $subscription, int $min_delay = 0 ): void {
+	private function schedule_email( Email $email, \WC_Subscription $subscription, int $min_delay = 0, bool $skip_if_past = false ): void {
 		if (!SubscriptionUtils::is_site_sync($subscription)) {
 			return;
 		}
@@ -227,11 +266,113 @@ final class SubscriptionEmailHooks {
 			return;
 		}
 
-		$subscription_email           = new SubscriptionEmail($email, $subscription);
+		$subscription_email = new SubscriptionEmail($email, $subscription);
+		$raw_timestamp      = $subscription_email->get_timestamp();
+
+		/**
+		 * 補排時「寄送時點已過」一律跳過，不可讓下面的 max() 夾成「現在」→ 立刻寄出（issue #22）
+		 *
+		 * 原因：get_timestamp() 對 next_payment / trial_end 這種日期錨點型的信回傳「錨點日期 ± N 天」：
+		 *   - 訂閱沒有下次扣款日時 get_time() 回 0 → 錨點 ± N 天成為很久以前
+		 *     → 被 max() 夾成現在 → 客戶立刻收到一封「N 天後將扣款」。
+		 *   - 錨點存在但提醒窗口已過（例如月繳訂閱卻設「扣款前 30 天」）也是同樣結果。
+		 *
+		 * days=0 的 next_payment 信（扣款當下寄）是合法設定，不會被這個條件誤殺——
+		 * 它的 timestamp 就等於 next_payment 本身，只要下次扣款日還在未來就 > time()。
+		 *
+		 * 刻意只在補排路徑生效（預設 false），不改動既有的排程行為。
+		 */
+		if ( $skip_if_past && $raw_timestamp <= time() ) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 補排 Email 跳過：寄送時點已過",
+				'info',
+				[
+					'email_key'   => $email->key,
+					'action_name' => $email->action_name,
+					'timestamp'   => $raw_timestamp,
+					'now'         => time(),
+				]
+			);
+			return;
+		}
+
 		$subscription_email_scheduler = new SubscriptionEmailScheduler($subscription_email);
-		$timestamp                    = max( $subscription_email->get_timestamp(), time() + $min_delay );
+		$timestamp                    = max( $raw_timestamp, time() + $min_delay );
 		$subscription_email_scheduler->maybe_unschedule($email->action_name, $email->unique);
 		$subscription_email_scheduler->schedule_single($timestamp, $email->action_name);
+	}
+
+	/**
+	 * 網站綁定（pp_linked_site_ids）變更後，補排訂閱里程碑信（issue #22）
+	 *
+	 * 綁定成立 → 補排；綁定被清空 → 清掉尚未寄出的里程碑信
+	 * （schedule_email() 的 is_site_sync() 守門是 return 在 maybe_unschedule() 之前，
+	 *   所以失去綁定的訂閱靠原有流程清不掉舊排程）。
+	 *
+	 * ⚠️ 必須自行吞掉所有例外：PowerCloud 路徑是在 SiteSync::site_sync_by_subscription() 的
+	 *    try/catch(\Throwable) 內同步呼叫，而且在 email_payloads_tmp 寫入與 240 秒延遲排程「之前」。
+	 *    往上拋的例外會被誤記成「網站建立失敗」訂單備註，並連帶殺掉正確的那封開站通知信。
+	 *
+	 * @param mixed $subscription 訂閱
+	 * @return void
+	 */
+	public function backfill_subscription_emails( $subscription ): void {
+		try {
+			if ( ! ( $subscription instanceof \WC_Subscription ) ) {
+				return;
+			}
+
+			// 綁定被清空（管理員後台移除，或 change_linked_site_ids() 把站台移轉到別筆訂閱）
+			if ( ! SubscriptionUtils::is_site_sync( $subscription ) ) {
+				$this->unschedule_emails_by_actions( $subscription, self::BACKFILL_ACTIONS );
+				return;
+			}
+
+			/**
+			 * 不會再有下次扣款 / 已結束的訂閱不補排。
+			 * on_status_updated() 進入 pending-cancel/cancelled/expired 時會主動清除 next_payment 排程，
+			 * SubscriptionEmailScheduler::action_callback() 寄送當下也會複查後跳過——
+			 * 排了必定不寄，只會留下永遠用不到的 ActionScheduler row。
+			 */
+			if ( ! in_array( $subscription->get_status(), [ 'active', 'on-hold', 'pending' ], true ) ) {
+				return;
+			}
+
+			foreach ( self::BACKFILL_ACTIONS as $action_name ) {
+				foreach ( $this->get_emails( $action_name ) as $email ) {
+					$this->schedule_email( $email, $subscription, 0, true );
+				}
+			}
+		} catch ( \Throwable $th ) {
+			// 走到這裡時 $subscription 必為 WC_Subscription——上面的 instanceof 守門若不成立會直接 return，
+			// 而 instanceof 本身不會拋例外，所以 catch 只可能發生在型別已確定之後。
+			Plugin::logger(
+				'補排訂閱 Email 失敗',
+				'error',
+				[
+					'subscription_id' => $subscription->get_id(),
+					'error'           => $th->getMessage(),
+				],
+				5
+			);
+		}
+	}
+
+	/**
+	 * 取消指定 action_name 尚未寄出的信
+	 *
+	 * @param \WC_Subscription $subscription 訂閱
+	 * @param array<string>    $action_names action 名稱
+	 * @return void
+	 */
+	private function unschedule_emails_by_actions( \WC_Subscription $subscription, array $action_names ): void {
+		foreach ( $action_names as $action_name ) {
+			foreach ( $this->get_emails( $action_name ) as $email ) {
+				$subscription_email           = new SubscriptionEmail( $email, $subscription );
+				$subscription_email_scheduler = new SubscriptionEmailScheduler( $subscription_email );
+				$subscription_email_scheduler->unschedule( $email->action_name );
+			}
+		}
 	}
 
 	/**

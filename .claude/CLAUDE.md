@@ -163,6 +163,7 @@ PowerCloud API key 儲存方式:
 | `pp_site_sync_by_subscription` | `$subscription` | 開站成功後（所有後端）。**純公開擴充點，PP 內部已無監聽者**——issue #21 移除了原本掛在此的 `site_sync` 信排程 |
 | `pp_after_site_sync` | `$response_obj` | WPCD API 回應後 |
 | `pp_after_site_sync_powercloud` | `$response_obj, $props` | PowerCloud API 回應後 |
+| `pp_linked_site_ids_updated` | `$subscription, $new_ids, $old_ids` | `pp_linked_site_ids` **真的變更**後（四個寫入點共同收斂：PowerCloud 開站 201 / WPCD `/customer-notification` / WPCD `/link-site` / 後台手動編輯）。無變更時不 fire。**監聽者必須自吞例外**——PowerCloud 路徑是在 `site_sync_by_subscription()` 的 try/catch 內、且在 `email_payloads_tmp` 寫入之前同步呼叫，往上拋會被誤記成「網站建立失敗」並殺掉開站通知信 |
 
 ---
 
@@ -184,6 +185,8 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 | `end` | 訂閱進入 cancelled/expired（已取消/已過期），寄送當下仍須為 cancelled/expired |
 | `trial_end` / `next_payment` | 訂閱里程碑時。`next_payment`（即將扣款）在訂閱進入 pending-cancel/cancelled/expired 時取消排程，且寄送當下複查狀態：pending-cancel/cancelled/expired 不寄（期末不再扣款，修復見 commit 4d3763c；註：該 commit 訊息誤引 "issue #20"，實際無對應 issue——#20 是 customer_cancelled feature） |
 | `watch_trial_end` / `watch_next_payment` | 前/後 N 天（unique，設定變更時重排）。`watch_next_payment` 同 `next_payment` 的取消排程與寄送狀態複查（commit 4d3763c） |
+
+**issue #22 補排**：`next_payment` / `watch_next_payment` / `trial_end` / `watch_trial_end` 四種信的唯一排程入口是 `woocommerce_subscription_date_updated`，而新訂閱 fire 該事件時 `pp_linked_site_ids` 尚未寫入 → `schedule_email()` 的 `is_site_sync()` 守門直接 return → **新訂閱的第一個週期排不進去**（下次續訂成功時 WCS 會重算 `next_payment` 而自然補排，所以不是「永遠」）。修法是監聽 `pp_linked_site_ids_updated` 補排一次（`SubscriptionEmailHooks::backfill_subscription_emails()`，白名單 `BACKFILL_ACTIONS`）。⛔ **白名單絕不可加入 `site_sync`**——該 hook 在 PowerCloud 路徑是開站流程內同步 fire，加了會原地重現 issue #21 並擴散到 WPCD。補排時若「寄送時點已過」一律跳過（`schedule_email()` 的 `$skip_if_past`），避免被 `max()` 夾成「現在」而立刻寄出「N 天後將扣款」。
 | `watch_end` | **已停用**（v3.3.7 起 `end` 改由狀態轉換觸發，UI 從未提供此選項） |
 | `customer_cancelled` | 終端客戶於「我的帳號」**自行**取消訂閱時觸發（issue #20）。收件人是**經銷商**（站台 `admin_email`，不 Bcc），非終端客戶；立即寄出（UI 鎖 days=0/after）、不 unique（每次取消都寄）、寄送當下不複查狀態（取消是歷史事實）。管理員後台取消與金流扣款失敗**不**觸發。觸發 hook 是 WCS `woocommerce_customer_changed_subscription_to_cancelled`——hook 名取自「客戶請求的狀態」（取消一律請求 cancelled），非落地狀態；落地 pending-cancel 或 cancelled 皆 fire 同一 hook，`_to_pending-cancel` 永不觸發（不綁）。客戶照舊另收 `end` 信（若有啟用），互不影響 |
 

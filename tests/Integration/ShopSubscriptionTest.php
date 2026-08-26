@@ -265,4 +265,105 @@ class ShopSubscriptionTest extends TestCase {
 		$values = get_post_meta( $post_id, 'pp_linked_site_ids' );
 		$this->assertContains( $unicode_id, $values );
 	}
+
+	// ========== issue #22：pp_linked_site_ids_updated hook ==========
+
+	/**
+	 * 建立真實 WC_Subscription（hook 測試需要，裸 post 過不了 wcs_get_subscription()）
+	 *
+	 * @return \WC_Subscription
+	 */
+	private function create_real_subscription(): \WC_Subscription {
+		// wcs_create_subscription() 沒有 customer_id 會回 WP_Error
+		$customer_id = $this->factory()->user->create( [ 'role' => 'customer' ] );
+
+		$order = wc_create_order(
+			[
+				'customer_id' => $customer_id,
+				'status'      => 'processing',
+			]
+		);
+		$this->assertInstanceOf( \WC_Order::class, $order );
+
+		$subscription = wcs_create_subscription(
+			[
+				'order_id'         => $order->get_id(),
+				'status'           => 'active',
+				'billing_period'   => 'month',
+				'billing_interval' => 1,
+				'customer_id'      => $customer_id,
+			]
+		);
+		$this->assertInstanceOf( \WC_Subscription::class, $subscription );
+
+		return $subscription;
+	}
+
+	/**
+	 * 綁定真的變更時應觸發 pp_linked_site_ids_updated，且 callback 收到的訂閱 meta 已寫入
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_update_linked_site_ids_有變更時應觸發pp_linked_site_ids_updated(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		$received = null;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function ( $sub ) use ( &$received ) {
+				$received = $sub;
+			},
+			10,
+			1
+		);
+
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ '777' ] );
+
+		$this->assertTrue( $result, 'update_linked_site_ids 應回傳 true' );
+		$this->assertInstanceOf( \WC_Subscription::class, $received, 'hook 應被觸發並帶入 WC_Subscription' );
+		$this->assertSame(
+			$sub_id,
+			$received->get_id(),
+			'callback 收到的應是同一筆訂閱'
+		);
+		$this->assertNotEmpty(
+			$received->get_meta( SiteSync::LINKED_SITE_IDS_META_KEY, true ),
+			'fire 時 meta 應已寫入並持久化，否則監聽者的 is_site_sync() 會是 false'
+		);
+	}
+
+	/**
+	 * 綁定沒有變更時不應觸發 hook（避免管理員按了儲存但沒改東西也重排程）
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_update_linked_site_ids_無變更時不應觸發pp_linked_site_ids_updated(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ '888' ] );
+
+		$fired = 0;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		// 綁同一組 id，is_same_site_ids() 會提前 return false
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ '888' ] );
+
+		$this->assertFalse( $result, '內容未變更時 update_linked_site_ids 應回傳 false' );
+		$this->assertSame( 0, $fired, '內容未變更時不應 fire hook' );
+	}
 }
