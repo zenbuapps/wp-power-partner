@@ -240,18 +240,48 @@ final class Main
 				}
 			}
 
+			/**
+			 * 這些欄位原本是直接 $body_params['X'] 取值，沒有任何預設（issue #21）。
+			 * CloudServer 少送任一欄就是 PHP 8 undefined array key warning + null，
+			 * 而 SubscriptionEmailHooks::send_mail() 的關鍵變數防呆會因此中止寄送——
+			 * 客戶會從「收到一封有佔位符的信」變成「一封都收不到」。
+			 * 補 ?? '' 讓型別穩定，並在下方對缺漏留 error log（問題在 CloudServer 端，不是外掛壞掉）。
+			 */
 			$tokens                                   = [];
 			$tokens['FIRST_NAME']                     = $customer->first_name;
 			$tokens['LAST_NAME']                      = $customer->last_name;
 			$tokens['NICE_NAME']                      = $customer->user_nicename;
 			$tokens['EMAIL']                          = $customer_email;
-			$tokens['WORDPRESSAPPWCSITESACCOUNTPAGE'] = $body_params['WORDPRESSAPPWCSITESACCOUNTPAGE'];
-			$tokens['IPV4']                           = $body_params['IPV4'];
-			$tokens['DOMAIN']                         = $body_params['DOMAIN'];
-			$tokens['FRONTURL']                       = $body_params['FRONTURL'];
-			$tokens['ADMINURL']                       = $body_params['ADMINURL'];
-			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'];
-			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'];
+			$tokens['WORDPRESSAPPWCSITESACCOUNTPAGE'] = $body_params['WORDPRESSAPPWCSITESACCOUNTPAGE'] ?? '';
+			$tokens['IPV4']                           = $body_params['IPV4'] ?? '';
+			$tokens['DOMAIN']                         = $body_params['DOMAIN'] ?? '';
+			$tokens['FRONTURL']                       = $body_params['FRONTURL'] ?? '';
+			$tokens['ADMINURL']                       = $body_params['ADMINURL'] ?? '';
+			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'] ?? '';
+			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'] ?? '';
+
+			// 回調 payload 不全時留痕：這是 CloudServer 端的問題，但後果會落在終端客戶身上（收不到開通信）
+			$missing_params = [];
+			foreach ( [ 'DOMAIN', 'FRONTURL', 'ADMINURL', 'SITEUSERNAME', 'SITEPASSWORD' ] as $required_param ) {
+				if ( '' === trim( (string) $tokens[ $required_param ] ) ) {
+					$missing_params[] = $required_param;
+				}
+			}
+			if ( $missing_params ) {
+				Plugin::logger(
+					'/customer-notification 回調 payload 缺少站台欄位：' . implode( ', ', $missing_params ),
+					'error',
+					[
+						'order_id'        => $order_id,
+						'customer_id'     => $customer_id,
+						// 不用區塊內的 $new_site_id——它只在 $order instanceof WC_Order 時才定義
+						'new_site_id'     => $body_params['NEW_SITE_ID'] ?? null,
+						'missing_params'  => $missing_params,
+						'received_params' => array_keys( $body_params ),
+					],
+					5
+				);
+			}
 
 			[$success_emails, $failed_emails] = EmailService::send_mail($customer_email, $tokens);
 

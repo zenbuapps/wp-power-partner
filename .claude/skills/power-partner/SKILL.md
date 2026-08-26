@@ -31,7 +31,7 @@ WooCommerce 訂閱首次付款 (INITIAL_PAYMENT_COMPLETE)
       └── POST cloud.luke.cafe/wp-json/power-partner-server/site-sync（Basic Auth）
   → 儲存回應到 order item meta + order meta
   → do_action('pp_site_sync_by_subscription')
-      └── SubscriptionEmailHooks::schedule_site_sync_email()
+      └── 公開擴充點，PP 內部已無監聽者（issue #21 移除了 site_sync 排程）
   → LC\LifeCycle::create_lcs()（同時觸發）
       └── CloudApi::remote_post('license-codes', ...)
       └── send_email_to_subscriber()

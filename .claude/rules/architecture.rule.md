@@ -46,7 +46,9 @@ Customer buys subscription
                                   │         └── [powercloud] FetchPowerCloud::site_sync()
                                   │         └── [wpcd]       Fetch::site_sync()
                                   │         └── do_action('pp_site_sync_by_subscription')
-                                  │                 └── SubscriptionEmailHooks::schedule_site_sync_email()
+                                  │                 └── (公開擴充點，PP 內部已無監聽者，見 issue #21)
+                                  │         └── [powercloud] email_payloads_tmp + as_schedule_single_action(+240s)
+                                  │                 └── SiteSync::send_email() → SubscriptionEmailHooks::send_mail()
                                   │
                                   └──── LC\LifeCycle::create_lcs()
                                              └── CloudApi::remote_post('license-codes', ...)
@@ -106,7 +108,7 @@ Customer buys subscription
 ### `Domains\Email`
 管理所有外發 Email 排程與發送。
 
-- **`Core\SubscriptionEmailHooks`** — Singleton。將每個 `Action` enum hook 連接到排程發信。從 `power_partner_settings['emails']` 讀取模板。另綁 WCS `woocommerce_customer_changed_subscription_to_cancelled` → `schedule_customer_cancelled_email()`（issue #20，客戶自行取消 → 通知經銷商）。
+- **`Core\SubscriptionEmailHooks`** — Singleton。將每個 `Action` enum hook 連接到排程發信。從 `power_partner_settings['emails']` 讀取模板。另綁 WCS `woocommerce_customer_changed_subscription_to_cancelled` → `schedule_customer_cancelled_email()`（issue #20，客戶自行取消 → 通知經銷商）。**不再綁 `pp_site_sync_by_subscription`**（issue #21：該路徑的 tokens 只有 order + subscription，結構上拿不到 FRONTURL / ADMINURL / SITEUSERNAME / SITEPASSWORD，會寄出滿是 `##XXX##` 的半成品且比正確的那封先到）。`send_mail()` 在替換 token 前會檢查 `REQUIRED_SITE_TOKENS`（FRONTURL / ADMINURL / SITEUSERNAME / SITEPASSWORD）——**模板有用到但值為空時中止寄送並記 error**，計入 `failed_emails`；模板沒用到則不受影響。
 - **`DTOs\Email`** — 繼承 `J7\WpUtils\Classes\DTO`。建構時驗證 `action_name`、`operator`、`days`（enum 外白名單：`site_sync`、`customer_cancelled`）。`unique` 自動為 true（trial_end/next_payment/end）。
 - **`Models\SubscriptionEmail`** — 結合 Email DTO + Subscription 計算最終發送 timestamp。使用 Powerhouse 的 `Times` DTO。
 - **`Services\SubscriptionEmailScheduler`** — 繼承 `Powerhouse\Domains\AsSchedulerHandler\Shared\Base`。hook: `power_partner/3.1.0/email/scheduler`。`register()` 必須在 Bootstrap 中呼叫。

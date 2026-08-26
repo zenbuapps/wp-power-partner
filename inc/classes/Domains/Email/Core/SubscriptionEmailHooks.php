@@ -21,6 +21,20 @@ use J7\PowerPartner\Utils\Token;
 final class SubscriptionEmailHooks {
 	use \J7\WpUtils\Traits\SingletonTrait;
 
+	/**
+	 * 站台通知信的關鍵 token（issue #21）
+	 *
+	 * 這些是「客戶拿不到就等於沒開站」的資訊（對照 Plugin::DEFAULT_EMAIL_BODY，其中就含這四個）。
+	 * 模板有用到、但 tokens 給不出值時寧可不寄，也不要寄一封滿是 ##XXX## 的半成品給終端客戶。
+	 *
+	 * DOMAIN / IPV4 刻意不列入——缺了信仍然可用。
+	 * FIRST_NAME / LAST_NAME 這類也不列入——訪客結帳本來就可能為空，列入會把整封信擋掉，
+	 * 變成「客戶完全收不到開通資訊」，比看到佔位符更糟。
+	 *
+	 * @var array<string>
+	 */
+	private const REQUIRED_SITE_TOKENS = [ 'FRONTURL', 'ADMINURL', 'SITEUSERNAME', 'SITEPASSWORD' ];
+
 	/** @var object{subject:string, body:string} $default Default email */
 	public object $default;
 
@@ -49,8 +63,23 @@ final class SubscriptionEmailHooks {
 
 		SubscriptionEmailScheduler::register();
 
-		// 網站訂閱創建後
-		\add_action('pp_site_sync_by_subscription', [ $this, 'schedule_site_sync_email' ], 10, 1);
+		/**
+		 * issue #21：這裡原本綁了 pp_site_sync_by_subscription → schedule_site_sync_email()，
+		 * 會在開站當下立刻排一封 site_sync 信。但那條路徑的 tokens 只有
+		 * Token::get_order_tokens() + Token::get_subscription_tokens()（後者只產 URL 一個 key），
+		 * 結構上拿不到 FRONTURL / ADMINURL / SITEUSERNAME / SITEPASSWORD / IPV4，
+		 * 而 Token::replace() 對空值是 continue，缺值會以字面 ##XXX## 直接寄給客戶；
+		 * 又因為 days 被 UI 鎖 0，這封「壞信」還比正確的那封（240 秒後）先到。
+		 *
+		 * 開站通知信一律改由帶完整站台 payload 的兩條路徑負責：
+		 *   - PowerCloud：Product\SiteSync::send_email()（讀 email_payloads_tmp，time()+240）
+		 *   - WPCD：Api\Main::post_customer_notification_callback()（CloudServer 回調 body params）
+		 *
+		 * ⚠️ Product\SiteSync 的 do_action('pp_site_sync_by_subscription') 保留（公開擴充點）。
+		 * ⚠️ 目前 WPCD 沒有重複寄信的唯一原因，就是 schedule_email() 的 is_site_sync() 守門——
+		 *    PowerCloud 在開站當下同步寫入 pp_linked_site_ids（守門會過），WPCD 要等 REST 回調（守門擋住）。
+		 *    任何放寬該守門的修改，都必須先確認這裡沒有 site_sync 的排程綁定。
+		 */
 
 		// 以下時間點，用監聽的 hook 來發信，且只發一次，如果有修改要取消排程，重新排程
 		$mapper = [
@@ -237,19 +266,6 @@ final class SubscriptionEmailHooks {
 	}
 
 	/**
-	 * 網站訂閱創建後發信
-	 *
-	 * @param \WC_Subscription $subscription 訂閱
-	 * @return void
-	 */
-	public function schedule_site_sync_email( $subscription ): void {
-		$emails = $this->get_emails('site_sync');
-		foreach ($emails as $email) {
-			$this->schedule_email($email, $subscription);
-		}
-	}
-
-	/**
 	 * 客戶自行取消訂閱後，排程通知信給經銷商
 	 *
 	 * 綁定於 WCS 的 woocommerce_customer_changed_subscription_to_cancelled hook（見 constructor），
@@ -387,6 +403,36 @@ final class SubscriptionEmailHooks {
 	}
 
 	/**
+	 * 找出「模板有用到、但 tokens 給不出值」的關鍵站台 token（issue #21）
+	 *
+	 * 三個條件同時成立才算缺少：
+	 *   1. token 在 REQUIRED_SITE_TOKENS 白名單內
+	 *   2. 模板（subject + body）真的有用到它——模板沒用到就不該因為 tokens 不全而擋信
+	 *   3. tokens 給不出非空值
+	 *
+	 * @param string               $content 替換前的 subject + body
+	 * @param array<string, mixed> $tokens  取代字串（key 比對不分大小寫，與 Token::replace() 的 strtoupper 行為一致）
+	 * @return array<string> 缺少的 token 名稱
+	 */
+	private static function get_missing_required_tokens( string $content, array $tokens ): array {
+		$upper_tokens = array_change_key_case( $tokens, CASE_UPPER );
+		$missing      = [];
+
+		foreach ( self::REQUIRED_SITE_TOKENS as $token_name ) {
+			if ( ! str_contains( $content, "##{$token_name}##" ) ) {
+				continue;
+			}
+
+			$value = $upper_tokens[ $token_name ] ?? '';
+			if ( is_array( $value ) || '' === trim( (string) $value ) ) {
+				$missing[] = $token_name;
+			}
+		}
+
+		return $missing;
+	}
+
+	/**
 	 * Send mail
 	 *
 	 * @param string               $to 收件者
@@ -408,6 +454,30 @@ final class SubscriptionEmailHooks {
 			// 取得 message
 			$body = $email->body;
 			$body = empty( $body ) ? $email_service->default->body : $body;
+
+			/**
+			 * 防呆：模板需要站台變數，但 tokens 給不出來時中止寄送（issue #21）
+			 *
+			 * 必須在 Token::replace() 之前檢查——replace() 對空值是 continue（保留字面佔位符），
+			 * 替換之後就分不出「本來就沒有這個 token」與「有但值是空的」。
+			 */
+			$missing_tokens = self::get_missing_required_tokens( $subject . ' ' . $body, $tokens );
+			if ( $missing_tokens ) {
+				Plugin::logger(
+					'開站通知信缺少關鍵站台變數，已中止寄送：' . implode( ', ', $missing_tokens ),
+					'error',
+					[
+						'to'                  => $to,
+						'email_key'           => $email->key,
+						'action_name'         => $email->action_name,
+						'missing_tokens'      => $missing_tokens,
+						'provided_token_keys' => array_keys( $tokens ),
+					],
+					5
+				);
+				$failed_emails[] = $email->action_name;
+				continue;
+			}
 
 			// Replace tokens in email..
 			$subject = Token::replace( $subject, $tokens );

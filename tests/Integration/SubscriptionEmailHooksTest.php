@@ -825,4 +825,221 @@ class SubscriptionEmailHooksTest extends TestCase {
 			"days=1 的成功信 timestamp {$ts} 應不早於 time()+600=" . ( $time_before + 600 )
 		);
 	}
+
+	// ========== issue #21：開站信重複寄送 + 變數未取代 ==========
+
+	/**
+	 * 用任意 email 設定重建 singleton
+	 *
+	 * setup_hooks_with_all_emails() 寫死 success/failed/end 三種信，
+	 * issue #21 的案例需要 site_sync 模板，故另開一個泛用版本。
+	 *
+	 * @param array<int, array<string, mixed>> $email_configs make_email_config() 的結果陣列
+	 * @return SubscriptionEmailHooks
+	 */
+	private function setup_hooks_with( array $email_configs ): SubscriptionEmailHooks {
+		$this->setup_settings_with_emails( $email_configs );
+
+		$reflection = new \ReflectionClass( SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+
+		return SubscriptionEmailHooks::instance();
+	}
+
+	/**
+	 * 開站當下不應再排程 site_sync 信（issue #21 路徑 A 已移除）
+	 *
+	 * 刻意使用 create_pp_subscription()——它會寫入 pp_linked_site_ids，
+	 * 也就是 schedule_email() 的 is_site_sync() 守門「會通過」的狀態。
+	 * 這樣才能證明「沒有排程」是因為 hook 綁定被移除，而不是被守門擋掉。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_觸發pp_site_sync_by_subscription_不應排程site_sync信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$email_key = 'test_site_sync_' . uniqid();
+		$hooks     = $this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => $email_key,
+						'action_name' => 'site_sync',
+						'days'        => '0',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$this->assertNotEmpty(
+			$hooks->get_emails( 'site_sync' ),
+			'前置條件失敗：settings 中找不到啟用的 site_sync 模板，測試將失去意義'
+		);
+
+		$subscription = $this->create_pp_subscription( 'active' );
+
+		// 守門確認：此訂閱確實已綁站，is_site_sync() 會通過
+		$this->assertNotEmpty(
+			$subscription->get_meta( SiteSync::LINKED_SITE_IDS_META_KEY, true ),
+			'前置條件失敗：訂閱應已綁定站台，否則無法證明是 hook 移除而非守門擋下'
+		);
+
+		do_action( 'pp_site_sync_by_subscription', $subscription );
+
+		$this->assert_no_pending_action(
+			$subscription->get_id(),
+			'site_sync',
+			'pp_site_sync_by_subscription 不應再排程 site_sync 信（issue #21：該路徑拿不到站台變數）'
+		);
+	}
+
+	/**
+	 * 站台變數齊全時應正常寄出，且信中不留下任何佔位符
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_send_mail_模板需要的站台變數齊全時應寄出且不留下佔位符(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##　後台：##ADMINURL##　帳號：##SITEUSERNAME##　密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$sent_body = null;
+		add_filter(
+			'pre_wp_mail',
+			function ( $return, $atts ) use ( &$sent_body ) {
+				$sent_body = $atts['message'];
+				return true;
+			},
+			10,
+			2
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[
+				'FRONTURL'     => 'https://abc.wpsite.pro',
+				'ADMINURL'     => 'https://abc.wpsite.pro/wp-admin',
+				'SITEUSERNAME' => 'customer@example.com',
+				'SITEPASSWORD' => 'p@ssw0rd',
+			]
+		);
+
+		$this->assertSame( [ 'site_sync' ], $success_emails, '站台變數齊全時應寄送成功' );
+		$this->assertSame( [], $failed_emails, '不應有失敗項目' );
+		$this->assertNotNull( $sent_body, 'wp_mail 應被呼叫' );
+		$this->assertStringNotContainsString( '##', (string) $sent_body, '寄出的信件中不應殘留任何 ## 佔位符' );
+		$this->assertStringContainsString( 'https://abc.wpsite.pro/wp-admin', (string) $sent_body );
+	}
+
+	/**
+	 * 缺少關鍵站台變數時應中止寄送並計入失敗（issue #21 防呆）
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_send_mail_缺少SITEPASSWORD時應中止寄送並計入失敗(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##　後台：##ADMINURL##　帳號：##SITEUSERNAME##　密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$mail_called = false;
+		add_filter(
+			'pre_wp_mail',
+			function ( $return ) use ( &$mail_called ) {
+				$mail_called = true;
+				return true;
+			},
+			10,
+			1
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[
+				'FRONTURL'     => 'https://abc.wpsite.pro',
+				'ADMINURL'     => 'https://abc.wpsite.pro/wp-admin',
+				'SITEUSERNAME' => 'customer@example.com',
+				// SITEPASSWORD 刻意缺席
+			]
+		);
+
+		$this->assertFalse( $mail_called, '缺少關鍵站台變數時不應呼叫 wp_mail（寧可不寄，也不寄半成品）' );
+		$this->assertSame( [], $success_emails, '不應有成功項目' );
+		$this->assertSame( [ 'site_sync' ], $failed_emails, '被防呆擋下的信應計入 failed_emails' );
+	}
+
+	/**
+	 * 模板沒用到站台變數時，tokens 不全也應照常寄出
+	 *
+	 * 這條守住防呆的「不誤殺」邊界：白名單只在模板真的用到該 token 時才生效。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_send_mail_模板未使用站台變數時_tokens不全也應照常寄出(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '感謝您的訂購',
+						'body'        => '<p>##FIRST_NAME## 您好，感謝訂購。</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$mail_called = false;
+		add_filter(
+			'pre_wp_mail',
+			function ( $return ) use ( &$mail_called ) {
+				$mail_called = true;
+				return true;
+			},
+			10,
+			1
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[ 'FIRST_NAME' => '小明' ]
+		);
+
+		$this->assertTrue( $mail_called, '模板未使用站台變數時，不該因 tokens 不全而擋信' );
+		$this->assertSame( [ 'site_sync' ], $success_emails );
+		$this->assertSame( [], $failed_emails );
+	}
 }

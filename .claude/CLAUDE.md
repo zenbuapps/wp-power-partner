@@ -160,7 +160,7 @@ PowerCloud API key 儲存方式:
 
 | Action | Args | 時機 |
 |---|---|---|
-| `pp_site_sync_by_subscription` | `$subscription` | 開站成功後（所有後端） |
+| `pp_site_sync_by_subscription` | `$subscription` | 開站成功後（所有後端）。**純公開擴充點，PP 內部已無監聽者**——issue #21 移除了原本掛在此的 `site_sync` 信排程 |
 | `pp_after_site_sync` | `$response_obj` | WPCD API 回應後 |
 | `pp_after_site_sync_powercloud` | `$response_obj, $props` | PowerCloud API 回應後 |
 
@@ -178,7 +178,7 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 | 值 | 發送時機 |
 |---|---|
-| `site_sync` | 開站完成後 |
+| `site_sync` | 開站完成後。**只由帶完整站台 payload 的兩條路徑寄出**：PowerCloud 走 `SiteSync::send_email()`（讀 `email_payloads_tmp`，延遲 240 秒）、WPCD 走 `/customer-notification` 回調。**不再由 `pp_site_sync_by_subscription` 排程**（issue #21：該路徑的 tokens 只有 order + subscription，拿不到站台變數，會寄出滿是 `##XXX##` 的半成品且比正確的那封先到） |
 | `subscription_failed` | 訂閱進入 on-hold（待處理/催繳階段），寄送當下仍須為 on-hold 才會真的寄出；回到 active 或進入 cancelled/expired 時取消排程 |
 | `subscription_success` | 訂閱從 on-hold（待處理）/ pending-cancel（待取消）/ cancelled / expired 恢復為 active 時觸發（**不含** pending → active 首次付款）；每次成功續訂寄一封；10 分鐘緩衝 + 寄送當下須仍為 active；離開 active 時自動取消未寄成功信（issue #16） |
 | `end` | 訂閱進入 cancelled/expired（已取消/已過期），寄送當下仍須為 cancelled/expired |

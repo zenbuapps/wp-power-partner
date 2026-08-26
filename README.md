@@ -152,9 +152,10 @@ SiteSync::site_sync_by_subscription()
         ↓
 [PowerCloud] FetchPowerCloud::site_sync()   OR   [WPCD] Fetch::site_sync()
         ↓
-Site provisioned → pp_site_sync_by_subscription fired
+Site provisioned → pp_site_sync_by_subscription fired (public extension point)
         ↓
-Email scheduled → sent 4 min later via ActionScheduler
+[PowerCloud] email_payloads_tmp stored → sent 4 min later via ActionScheduler
+[WPCD]       CloudServer calls back /customer-notification → sent immediately
 
 --- Later ---
 
