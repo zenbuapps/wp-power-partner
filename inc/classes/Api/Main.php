@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Api;
 
 use J7\PowerPartner\Plugin;
-use J7\PowerPartner\Utils\Token;
 use J7\PowerPartner\Api\Fetch;
 use J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks as EmailService;
 use J7\PowerPartner\Product\SiteSync;
@@ -241,7 +240,14 @@ final class Main
 					 *
 					 * 只在尚未寫入時寫，語義與 PowerCloud 分支一致（第一個站先寫、之後不覆蓋）。
 					 */
-					$callback_site_url = (string) ( $body_params['FRONTURL'] ?? $body_params['DOMAIN'] ?? '' );
+					// 用 SiteSync::extract_site_url() 正規化——回調可能只給裸網域（無 scheme），
+					// 直接存進去會讓 <a href="##URL##"> 渲染成相對連結
+					$callback_site_url = SiteSync::extract_site_url(
+						[
+							'url'    => (string) ( $body_params['FRONTURL'] ?? '' ),
+							'domain' => (string) ( $body_params['DOMAIN'] ?? '' ),
+						]
+					);
 					if ( $callback_site_url && '' === (string) $subscription->get_meta( SiteSync::SITE_URL_META_KEY, true ) ) {
 						$subscription->update_meta_data( SiteSync::SITE_URL_META_KEY, $callback_site_url );
 						$subscription->save();
@@ -695,6 +701,7 @@ final class Main
 			$tokens['SITEUSERNAME'] = $username;
 			$tokens['SITEPASSWORD'] = $password;
 			$tokens['IPV4']         = $ip;
+			$tokens['URL']          = $front_url; // issue #23：與前端 siteSyncTokens 的合約一致
 
 			// 取得 site_sync 的 email 模板
 			$email_service = EmailService::instance();
@@ -710,37 +717,14 @@ final class Main
 				);
 			}
 
-			$success_emails = [];
-			$failed_emails  = [];
-
-			foreach ($emails as $email) {
-				// 取得 subject
-				$subject = $email->subject;
-				$subject = empty($subject) ? $email_service->default->subject : $subject;
-
-				// 取得 message
-				$body = $email->body;
-				$body = empty($body) ? $email_service->default->body : $body;
-
-				// Replace tokens in email
-				$subject = Token::replace($subject, $tokens);
-				$body    = Token::replace($body, $tokens);
-
-				$email_headers = ['Content-Type: text/html; charset=UTF-8'];
-
-				$result = \wp_mail(
-					$admin_email,
-					$subject,
-					\wpautop($body),
-					$email_headers
-				);
-
-				if ($result) {
-					$success_emails[] = $email->action_name;
-				} else {
-					$failed_emails[] = $email->action_name;
-				}
-			}
+			/**
+			 * 一律走 EmailService::send_mail()，不要在這裡自己 replace + wp_mail。
+			 *
+			 * 原本這裡是 send_mail() 的複製品，導致兩個實際後果：
+			 *   1. 缺少 ##URL##（前端 siteSyncTokens 有列，此路徑卻不提供）
+			 *   2. 繞過 issue #21 的關鍵站台變數防呆，可能把 ##XXX## 寄給客戶
+			 */
+			[ $success_emails, $failed_emails ] = EmailService::send_mail($admin_email, $tokens);
 
 			return new \WP_REST_Response(
 				[

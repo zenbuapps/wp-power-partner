@@ -67,11 +67,17 @@ final class SiteSync {
 	 */
 	const SITE_SYNC_LOCK_TIMEOUT = 900;
 
+	/** 鎖競爭時延後重試開站的 ActionScheduler hook（issue #24） */
+	const RETRY_AFTER_LOCK_ACTION = 'pp_site_sync_retry_after_lock';
+
 	/** Constructor */
 	public function __construct() {
 		\add_action(Action::INITIAL_PAYMENT_COMPLETE->get_action_hook(), [ $this, 'site_sync_by_subscription' ], 1, 2);
 
 		\add_action('powerhouse_delay_send_email', [ $this, 'send_email' ], 10, 2);
+
+		// 鎖競爭時的延後重試（issue #24）
+		\add_action(self::RETRY_AFTER_LOCK_ACTION, [ $this, 'retry_site_sync_after_lock' ], 10, 1);
 	}
 
 
@@ -149,6 +155,27 @@ final class SiteSync {
 						'locked_at'       => $locked_at,
 					]
 				);
+
+				/**
+				 * 排一次延後重試，不能就這樣放棄。
+				 *
+				 * INITIAL_PAYMENT_COMPLETE 對同一張訂單只會來這幾次，錯過就不會再有。
+				 * 若前一個 request 是被 fatal / OOM 殺掉的，鎖會存活到 SITE_SYNC_LOCK_TIMEOUT，
+				 * 而金流的重送 webhook 往往在那之前就到——直接 return 等於「客戶付了錢、永遠沒有站」。
+				 *
+				 * 重試時間排在鎖必然失效之後（timeout + 60 秒緩衝）：
+				 *   - 前一個程序正常跑完 → 冪等旗標已落，重試被旗標擋下，只多一筆 order note
+				 *   - 前一個程序已死 → 殘鎖可被接管，重試真的把站開出來
+				 * $unique=true 讓多次重送只堆出一個重試。
+				 */
+				\as_schedule_single_action(
+					\time() + self::SITE_SYNC_LOCK_TIMEOUT + MINUTE_IN_SECONDS,
+					self::RETRY_AFTER_LOCK_ACTION,
+					[ 'subscription_id' => $subscription->get_id() ],
+					'',
+					true
+				);
+
 				return;
 			}
 
@@ -285,7 +312,8 @@ final class SiteSync {
 					(string) \wp_json_encode([ $response_entry ])
 				);
 
-				if ($status >= 200 && $status < 300) {
+				// 條件必須與 site_sync_powercloud() 內的成功判斷一致，見該處註解
+				if (self::is_successful_status($status)) {
 					$item->update_meta_data(self::SITE_SYNC_DONE_META_KEY, (string) \time());
 				}
 
@@ -328,7 +356,7 @@ final class SiteSync {
 				 * （/websites 端點就會帶 adminPassword），會被寫進經銷商可見、
 				 * 且出現在 WC 訂單備註 REST API 的欄位。
 				 */
-				if ($first_status >= 200 && $first_status < 300) {
+				if (self::is_successful_status($first_status)) {
 					$note = '';
 					foreach ($response['data'] as $key => $value) {
 						$note .= $key . ': ' . ( \is_scalar($value) ? (string) $value : (string) \wp_json_encode($value) ) . '<br />';
@@ -346,7 +374,19 @@ final class SiteSync {
 				}
 
 				$parent_order->add_order_note($note);
-				$parent_order->update_meta_data(self::CREATE_SITE_RESPONSES_META_KEY, (string) \wp_json_encode($responses));
+
+				/**
+				 * 與既有紀錄合併，不可直接覆寫。
+				 *
+				 * 部分重試（item 1 被冪等旗標略過、item 2 重新開站）時 $responses 只含 item 2，
+				 * 直接覆寫會讓 get_first_site_response_data()——訂單列表欄位、metabox、
+				 * 與 Token 的 ##URL## fallback 共用的那個 accessor——改為回報第二個站。
+				 */
+				$merged_responses = \array_merge(
+					self::get_create_site_responses($parent_order),
+					$responses
+				);
+				$parent_order->update_meta_data(self::CREATE_SITE_RESPONSES_META_KEY, (string) \wp_json_encode($merged_responses));
 			}
 
 			$parent_order->save();
@@ -385,10 +425,9 @@ final class SiteSync {
 	 *
 	 * @param string $lock_key 鎖的 option name
 	 * @param int    $timeout  殘鎖判定門檻（秒）
-	 * @param bool   $is_retry 是否為清除殘鎖後的重試（避免無限遞迴）
 	 * @return bool 是否取得鎖
 	 */
-	private static function acquire_lock( string $lock_key, int $timeout, bool $is_retry = false ): bool {
+	private static function acquire_lock( string $lock_key, int $timeout ): bool {
 		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
@@ -419,22 +458,46 @@ final class SiteSync {
 			return false;
 		}
 
-		// 逾時殘鎖（前一個 request 中途 fatal / 被 kill）→ 清掉重取，但只重試一次
-		if ($is_retry) {
+		/**
+		 * 逾時殘鎖（前一個 request 中途 fatal / OOM / 被 kill）→ 原子性接管。
+		 *
+		 * 不可用「delete 再 INSERT IGNORE」——那是 check-then-act：兩個 request 同時
+		 * 看到同一筆殘鎖，會雙雙 delete、雙雙 insert 成功（B 的 delete 可能刪掉 A 剛插入的那筆），
+		 * 兩邊都拿到鎖，正是這個鎖要防的重複開站。
+		 *
+		 * 改用條件式 UPDATE：WHERE option_value = 我讀到的那個舊值。
+		 * MySQL 保證只有一個 request 的 UPDATE 會 affect 到 1 row，另一個 affect 0 row。
+		 */
+		$now = (string) \time();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$taken = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE `{$wpdb->options}` SET `option_value` = %s WHERE `option_name` = %s AND `option_value` = %s /* PP SITE SYNC LOCK TAKEOVER */",
+				$now,
+				$lock_key,
+				(string) $existing
+			)
+		);
+
+		\wp_cache_delete($lock_key, 'options');
+		\wp_cache_delete('notoptions', 'options');
+
+		if (1 !== (int) $taken) {
+			// 另一個 request 搶先接管了這把殘鎖
 			return false;
 		}
 
 		Plugin::logger(
-			"開站鎖 {$lock_key} 已逾時，清除殘鎖後重取",
+			"開站鎖 {$lock_key} 已逾時，已原子性接管",
 			'error',
 			[
 				'lock_key'  => $lock_key,
 				'locked_at' => (int) $existing,
 			]
 		);
-		self::release_lock($lock_key);
 
-		return self::acquire_lock($lock_key, $timeout, true);
+		return true;
 	}
 
 	/**
@@ -445,6 +508,24 @@ final class SiteSync {
 	 */
 	private static function release_lock( string $lock_key ): void {
 		\delete_option($lock_key);
+	}
+
+	/**
+	 * 開站回應是否代表成功
+	 *
+	 * WPCD 成功回 200、PowerCloud 成功回 201，故以 2xx 區間判定
+	 * （與 FetchPowerCloud::disable_site() / enable_site() 的既有慣例一致，見 issue #13）。
+	 *
+	 * ⚠️ 這個判斷同時決定三件事，三者必須永遠一致，否則會產生無法自動恢復的死局：
+	 *   1. site_sync_powercloud() 是否綁定站台、寫 pp_site_url、排開站通知信
+	 *   2. 是否對該 order item 落下冪等旗標（落了就永久擋住重試）
+	 *   3. 訂單備註寫「開站成功」還是「開站失敗」
+	 *
+	 * @param int $status HTTP status code
+	 * @return bool
+	 */
+	private static function is_successful_status( int $status ): bool {
+		return $status >= 200 && $status < 300;
 	}
 
 	/**
@@ -517,8 +598,15 @@ final class SiteSync {
 		// 新架構：使用 FetchPowerCloud::site_sync
 		[$response_obj, $wordpress_obj] = FetchPowerCloud::site_sync($site_sync_params, $open_site_plan_id, $template_site_id);
 
-		// 發送 email 給用戶，告知網站已建立成功
-		if ($response_obj->status === 201) {
+		/**
+		 * 發送 email 給用戶，告知網站已建立成功。
+		 *
+		 * 判斷必須與呼叫端落冪等旗標的條件完全一致——否則會出現
+		 * 「旗標已落、但沒綁站也沒寄帳密」的死局：旗標一旦寫入，
+		 * 後續每次合法重試都會被擋，客戶永遠拿不到站台。
+		 * 用 2xx 而非 === 201 也與專案既有慣例一致（見 FetchPowerCloud::disable_site()）。
+		 */
+		if (self::is_successful_status( (int) $response_obj->status )) {
 			// Store websiteId in pp_linked_site_ids for subscription binding
 			$website_id = $response_obj->data['websiteId'] ?? '';
 			if (!empty($website_id)) {
@@ -698,6 +786,40 @@ final class SiteSync {
 	}
 
 	/**
+	 * 鎖競爭後的延後重試（issue #24）
+	 *
+	 * 只在 acquire_lock() 失敗時排程。此時鎖必然已失效（排程時間 = timeout + 60 秒），
+	 * 所以這次一定拿得到鎖；真正決定「要不要重開」的是 order item 上的冪等旗標：
+	 *   - 前一個程序成功跑完 → 旗標已落 → 逐項略過，只留一筆 order note
+	 *   - 前一個程序中途死掉 → 旗標沒落 → 正常把站開出來
+	 *
+	 * 注意 site_sync_by_subscription() 的三道前置守衛在此仍然生效——
+	 * 若這段期間內產生了續訂訂單，count($order_ids) !== 1 會擋下，這是正確行為。
+	 *
+	 * @param int|string $subscription_id 訂閱 ID
+	 * @return void
+	 */
+	public function retry_site_sync_after_lock( int|string $subscription_id ): void {
+		$subscription = \wcs_get_subscription($subscription_id);
+		if (! ( $subscription instanceof \WC_Subscription )) {
+			Plugin::logger(
+				"鎖競爭重試：找不到訂閱 #{$subscription_id}",
+				'error',
+				[ 'subscription_id' => $subscription_id ]
+			);
+			return;
+		}
+
+		Plugin::logger(
+			"鎖競爭重試：重新嘗試訂閱 #{$subscription->get_id()} 的開站",
+			'info',
+			[ 'subscription_id' => $subscription->get_id() ]
+		);
+
+		$this->site_sync_by_subscription($subscription, []);
+	}
+
+	/**
 	 * 延遲寄送 email
 	 *
 	 * @param string     $to 收件者
@@ -716,9 +838,34 @@ final class SiteSync {
 		}
 
 		/** @var array<string, string> $payload */
-		$payload = \array_shift($queue);
+		$payload = $queue[0];
 
-		EmailService::send_mail($to, $payload);
+		[ $success_emails, $failed_emails ] = EmailService::send_mail($to, $payload);
+
+		/**
+		 * 寄送失敗時「不」消費佇列（issue #21 與 #24 的交互作用）。
+		 *
+		 * 原因：send_mail() 除了 wp_mail 本身失敗，還會在關鍵站台變數缺失時「主動中止寄送」
+		 * （issue #21 的防呆）。而這份 payload 是 wp_admin_password 唯一的存放處——
+		 * 一旦 array_shift 後刪掉 meta，密碼就永久遺失，沒有任何補寄路徑。
+		 * 保留 payload，讓管理員修正模板或設定後還能重試。
+		 */
+		if ($failed_emails) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 開站通知信未成功寄出，保留 email_payloads_tmp 以便補寄",
+				'error',
+				[
+					'to'             => $to,
+					'failed_emails'  => $failed_emails,
+					'success_emails' => $success_emails,
+					'queue_size'     => count($queue),
+				],
+				5
+			);
+			return;
+		}
+
+		\array_shift($queue);
 
 		if ($queue) {
 			// 同一訂閱還有其他站的帳密沒寄，留給下一個排程

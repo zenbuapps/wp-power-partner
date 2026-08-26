@@ -593,4 +593,163 @@ class SiteSyncIdempotencyTest extends TestCase {
 			'舊格式寄出後應刪除 meta'
 		);
 	}
+
+	// ========== code review 修正後的行為 ==========
+
+	/**
+	 * 寄信被 issue #21 防呆擋下時，payload 必須保留（不可消費佇列）
+	 *
+	 * payload 是 wp_admin_password 唯一的存放處，消費掉就永久遺失、沒有補寄路徑。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_開站通知信被防呆擋下時應保留payload以便補寄(): void {
+		$this->skip_if_no_subscriptions();
+
+		// 模板需要 SITEPASSWORD，但 payload 給不出來 → send_mail() 會主動中止寄送
+		$this->setup_settings_with_emails(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://x.wpsite.pro',
+					'SITEPASSWORD' => '',
+				],
+			]
+		);
+		$subscription->save();
+
+		$this->mock_wp_mail();
+		( new SiteSync() )->send_email( 'site@example.com', $subscription_id );
+
+		$fresh = \wcs_get_subscription( $subscription_id );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh );
+		$this->assertNotEmpty(
+			$fresh->get_meta( 'email_payloads_tmp' ),
+			'寄送被防呆擋下時必須保留 payload——它是 wp_admin_password 唯一的存放處'
+		);
+		$this->assertEmpty( $this->sent_emails, '防呆應中止寄送' );
+
+		$property->setValue( null, null );
+	}
+
+	/**
+	 * 部分重試時不可用「只含新項目」的回應覆寫既有紀錄
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_部分重試時應合併而非覆寫pp_create_site_responses(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription( 2 );
+		$order_id     = $subscription->get_parent_id();
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-first' ] ) );
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$parent_order = \wc_get_order( $order_id );
+		$this->assertInstanceOf( \WC_Order::class, $parent_order );
+		$this->assertCount( 2, SiteSync::get_create_site_responses( $parent_order ) );
+
+		// 清掉第二個 item 的冪等旗標，模擬「item 1 已完成、item 2 需重試」
+		$items = array_values( $parent_order->get_items() );
+		$items[1]->delete_meta_data( SiteSync::SITE_SYNC_DONE_META_KEY );
+		$items[1]->save();
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-second' ] ) );
+		$this->replay_payment_complete( $subscription->get_id() );
+
+		$after = \wc_get_order( $order_id );
+		$this->assertInstanceOf( \WC_Order::class, $after );
+
+		$this->assertGreaterThanOrEqual(
+			2,
+			count( SiteSync::get_create_site_responses( $after ) ),
+			'部分重試不應把既有紀錄覆寫成只剩重試的那一筆'
+		);
+	}
+
+	/**
+	 * 鎖競爭時應排一次延後重試，不可就此放棄
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_鎖競爭時應排程延後重試(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+		$order_id     = $subscription->get_parent_id();
+
+		\add_option( SiteSync::SITE_SYNC_LOCK_PREFIX . $order_id, (string) time(), '', false );
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-lock' ] ) );
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$matched = 0;
+		foreach ( \as_get_scheduled_actions(
+			[
+				'hook'     => SiteSync::RETRY_AFTER_LOCK_ACTION,
+				'status'   => \ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 100,
+			]
+		) as $action ) {
+			$args = $action->get_args();
+			if ( (int) ( $args['subscription_id'] ?? 0 ) === $subscription->get_id() ) {
+				++$matched;
+			}
+		}
+
+		$this->assertSame(
+			1,
+			$matched,
+			'鎖競爭時應排一次延後重試——否則前一個程序若已 fatal，客戶付了錢永遠沒有站'
+		);
+	}
+
+	/**
+	 * 延後重試在前一次已成功時應被冪等旗標擋下
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_延後重試在前次已成功時應被冪等旗標擋下(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-retry' ] ) );
+
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+		$this->assertSame( 1, $this->request_count );
+
+		( new SiteSync() )->retry_site_sync_after_lock( $subscription->get_id() );
+
+		$this->assertSame(
+			1,
+			$this->request_count,
+			'前一次已成功時，延後重試應被冪等旗標擋下，不可再開一個站'
+		);
+	}
 }

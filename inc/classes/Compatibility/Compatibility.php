@@ -18,8 +18,26 @@ final class Compatibility {
 	const AS_COMPATIBILITY_ACTION = 'power_partner_compatibility_scheduler';
 	const OPTION_NAME             = 'power_partner_compatibility_scheduled';
 
+	/** Issue #22 一次性補排的守門 option（不可用 $previous_version，見 backfill_issue22_subscription_emails 註解） */
+	const ISSUE22_BACKFILL_OPTION = 'power_partner_issue22_backfilled';
+
+	/** Issue #22 分批補排的 ActionScheduler hook */
+	const ISSUE22_BACKFILL_ACTION = 'power_partner_issue22_backfill_batch';
+
+	/** Issue #22 每批處理的訂閱數 */
+	const ISSUE22_BACKFILL_BATCH_SIZE = 50;
+
 	/** Constructor */
 	public function __construct() {
+		/**
+		 * Issue #22 分批補排的 handler 必須綁在下面的 early return「之前」。
+		 *
+		 * 補排是跨多個 request 的：第一批排程之後，OPTION_NAME 已等於當前版本，
+		 * 之後每個 request 都會走 early return——若綁在 return 之後，
+		 * 後續批次的 ActionScheduler action 永遠找不到 callback，補排會停在第一批。
+		 */
+		\add_action( self::ISSUE22_BACKFILL_ACTION, [ __CLASS__, 'run_issue22_backfill_batch' ], 10, 1 );
+
 		$scheduled_version = \get_option(self::OPTION_NAME);
 		if (is_string($scheduled_version) && $scheduled_version === Plugin::$version) {
 			return;
@@ -103,20 +121,41 @@ final class Compatibility {
 	 * @return void
 	 */
 	private static function backfill_issue22_subscription_emails(): void {
-		$option_name = 'power_partner_issue22_backfilled';
-
-		if (\get_option($option_name)) {
+		if (\get_option(self::ISSUE22_BACKFILL_OPTION)) {
 			return;
 		}
 
+		// 立刻寫旗標再排程：compatibility() 綁在 upgrader_process_complete 上，
+		// 任何外掛/佈景更新都會觸發，不先寫旗標會重複排程
+		\update_option(self::ISSUE22_BACKFILL_OPTION, Plugin::$version);
+
+		\as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => 1 ]);
+	}
+
+	/**
+	 * 分批執行 issue #22 的補排
+	 *
+	 * 為什麼要分批：wcs_get_subscriptions() 會為每一列 hydrate 一個完整的 WC_Subscription
+	 * 物件，再對每一筆做 ActionScheduler 寫入。訂閱數千筆的站台一次撈完會 OOM 或撞
+	 * max_execution_time，而 compatibility() 是綁在 upgrader_process_complete 上的——
+	 * 那是同步的 wp-admin 請求，任何外掛更新都會觸發。
+	 *
+	 * 每批處理完就排下一批，讓 ActionScheduler 自己控制節奏。
+	 *
+	 * @param int|string $page 頁碼（從 1 開始）
+	 * @return void
+	 */
+	public static function run_issue22_backfill_batch( int|string $page = 1 ): void {
 		if (! \function_exists('wcs_get_subscriptions')) {
 			return;
 		}
 
+		$page          = max(1, (int) $page);
 		$subscriptions = \wcs_get_subscriptions(
 			[
 				'subscription_status'    => [ 'active', 'on-hold' ],
-				'subscriptions_per_page' => -1,
+				'subscriptions_per_page' => self::ISSUE22_BACKFILL_BATCH_SIZE,
+				'paged'                  => $page,
 				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
 					[
 						'key'     => SiteSync::LINKED_SITE_IDS_META_KEY,
@@ -126,18 +165,37 @@ final class Compatibility {
 			]
 		);
 
+		if (! $subscriptions) {
+			Plugin::logger('issue #22 一次性補排完成（已無更多訂閱）', 'info', [ 'last_page' => $page ]);
+			return;
+		}
+
 		$count = 0;
 		foreach ($subscriptions as $subscription) {
-			\do_action(ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, [], []);
+			$site_ids = ShopSubscription::get_linked_site_ids( (int) $subscription->get_id() );
+			// 傳真實的 site ids，符合 hook 的公開契約（新值 / 舊值）
+			\do_action(
+				ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+				$subscription,
+				\array_values($site_ids),
+				\array_values($site_ids)
+			);
 			++$count;
 		}
 
-		\update_option($option_name, Plugin::$version);
 		Plugin::logger(
-			"issue #22 一次性補排完成，處理 {$count} 筆訂閱",
+			"issue #22 補排第 {$page} 批完成，處理 {$count} 筆訂閱",
 			'info',
-			[ 'subscription_count' => $count ]
+			[
+				'page'  => $page,
+				'count' => $count,
+			]
 		);
+
+		// 還有可能有下一批
+		if ($count >= self::ISSUE22_BACKFILL_BATCH_SIZE) {
+			\as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => $page + 1 ]);
+		}
 	}
 
 	/**

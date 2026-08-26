@@ -149,6 +149,10 @@ final class SubscriptionEmailScheduler extends Base {
 		/**
 		 * 掃描替換後仍殘留的 ##TOKEN##（issue #23）
 		 *
+		 * 為什麼是 warning 而非 error：殘留佔位符有大量良性來源——訪客結帳沒有
+		 * ##LAST_NAME##、3.5.1 以前的舊訂閱沒有 pp_site_url——每封生命週期信都會命中。
+		 * 記成 error 會把真正需要處理的故障淹沒在雜訊裡。
+		 *
 		 * Token::replace() 對空值是 continue（保留字面佔位符），所以缺值會以 ##XXX## 的樣子
 		 * 寄到終端客戶手上。這裡只記 log 不做任何修改：
 		 *   - 不中止寄送——生命週期信（催繳 / 訂閱結束）比一個佔位符重要得多，
@@ -164,7 +168,7 @@ final class SubscriptionEmailScheduler extends Base {
 		if ( $leftover_tokens ) {
 			Plugin::logger(
 				"訂閱 #{$subscription->get_id()} 的信件有未取代的變數：" . \implode( ', ', $leftover_tokens ),
-				'error',
+				'warning',
 				[
 					'subscription_id' => $subscription->get_id(),
 					'email_key'       => $email->key,

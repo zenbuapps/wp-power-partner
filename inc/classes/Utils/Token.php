@@ -114,14 +114,17 @@ abstract class Token {
 		}
 
 		/**
-		 * 已綁站卻取不到網址：這是真正的資料缺口，留 error log。
+		 * 已綁站卻取不到網址：留 log 供追查。
+		 *
+		 * 為什麼是 warning 而非 error：3.5.1 以前成立的訂閱都沒有 pp_site_url，
+		 * 每封生命週期信都會命中，記成 error 會淹沒真正的故障。
 		 * 不中止寄送——##URL## 對所有非開站模板都可用，但沒有一個模板「必須」有它，
 		 * 以缺 URL 擋掉一封催繳信，客戶會連催繳通知都收不到，比看到佔位符嚴重得多。
 		 */
 		if ( SubscriptionUtils::is_site_sync( $subscription ) ) {
 			Plugin::logger(
 				"訂閱 #{$subscription->get_id()} 已綁定站台卻取不到站台網址，##URL## 將以字面佔位符外顯",
-				'error',
+				'warning',
 				[
 					'subscription_id' => $subscription->get_id(),
 					'parent_order_id' => $order instanceof \WC_Order ? $order->get_id() : null,
