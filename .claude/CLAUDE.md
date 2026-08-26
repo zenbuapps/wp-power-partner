@@ -117,6 +117,7 @@ PowerCloud API key 儲存方式:
 | `lc_id` | `shop_subscription` | Multi-value: 授權碼 IDs |
 | `email_payloads_tmp` | `shop_subscription` | 暫存: 延遲發信後刪除 |
 | `pp_site_url` | `shop_subscription` | 站台網址（含 scheme）。issue #23：網域在兩種架構下都**不存在於開站 API 回應**——PowerCloud 是 `FetchPowerCloud::site_sync()` 本地生成的 `$namespace.'.wpsite.pro'`（原本只在一次性的 `email_payloads_tmp`，寄完信就刪）、WPCD 要等 `/customer-notification` 回調帶回。兩條路徑各自寫入此 meta，`##URL##` 只讀它。**第一個站先寫、之後不覆蓋** |
+| `_pp_site_sync_completed_at` | order item | issue #24 冪等鍵：此項目開站成功的 unix timestamp。**只在 HTTP 2xx 才寫入**，讓開站失敗後的合法重試不被誤擋。綁在 item 而非訂閱——WPCD 的 `pp_linked_site_ids` 要等非同步回調才寫、一張訂單多商品各開一站是合法的、且該 meta 會被後台與兩個 REST 回調改動 |
 | `power_partner_host_type` | product/variation | `'powercloud'` 或 `'wpcd'` |
 | `power_partner_host_position` | product/variation | 區域: `jp`, `tw`, `us_west`, `uk_london`, `sg`, `hk`, `canada` |
 | `power_partner_linked_site` | product/variation | 模板站 ID |
@@ -223,6 +224,12 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 7. **ActionScheduler 註冊順序** — Scheduler `::register()` 必須在任何可能觸發排程的 action 之前呼叫（Bootstrap 中已正確設定，不要重排）。
 
 8. **PowerCloud 開站回應 201** — 成功回應碼是 HTTP 201（非 200），`SiteSync::site_sync_powercloud()` 依此判斷是否發送 Email。
+
+15. **開站有冪等鍵與併發鎖，動 `site_sync_by_subscription()` 前先讀懂順序** — `count($order_ids) !== 1` 只擋「續訂」，擋不住「付款完成事件重送」（重送時 related orders 仍是 1 筆）。現在有兩層：**併發鎖**（`pp_site_sync_lock_{order_id}`，裸 `INSERT IGNORE` + `try/finally`，timeout 900 秒 > API 的 600 秒）擋同一瞬間的併發；**item 層級冪等旗標**（`_pp_site_sync_completed_at`）擋事後重送。**鎖必須在三道既有守衛之後才取**——否則每次續訂事件都白搶一次鎖，且會在同一個 PHP process 留下殘鎖連鎖擋掉後續開站。`add_option()` **不能當鎖**（它是 `INSERT ... ON DUPLICATE KEY UPDATE`，重複不會失敗），`wp_cache_add()` 也不行（預設物件快取不跨 request）。
+
+16. **`email_payloads_tmp` 是 FIFO 佇列，不是單筆** — 一張訂單多商品各開一站時，兩個 `powerhouse_delay_send_email` 排程的 args 完全相同（同一個 `to` + `subscription_id`），無法區分。改成佇列前，第二站會覆蓋第一站 → 先跑的排程寄出第二站帳密並刪 meta → 第一站帳密永久遺失。`normalize_payload_queue()` 的 `array_is_list()` 分支負責相容舊格式（升級當下已排程但未執行的 action），**不可移除**。
+
+17. **開站回應的 `data` 型別在兩架構不同** — PowerCloud 是 assoc array、WPCD 是 **stdClass**（`Fetch::site_sync()` 的 `json_decode` 沒帶 assoc）。寫入 meta 前一律經 `normalize_response_data()` 正規化，否則讀取端的 `is_array()` 對 stdClass 判 false（WPCD 訂單備註會變成空字串）。另外成功判定要用 **2xx 區間**，不是 `=== 200`——PowerCloud 成功回 201。
 
 9. **延遲寄信 4 分鐘** — PowerCloud 開站後透過 `as_schedule_single_action(time() + 240, ...)` 延遲 4 分鐘發送帳密 Email，暫存資料在 `email_payloads_tmp` meta。
 

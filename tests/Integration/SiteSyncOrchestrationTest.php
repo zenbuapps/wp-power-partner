@@ -670,9 +670,11 @@ class SiteSyncOrchestrationTest extends TestCase {
 			$site_url,
 			'pp_site_url 應為含 scheme 的 wpsite.pro 網域'
 		);
+		// issue #24：email_payloads_tmp 改為 FIFO 佇列，payload 在第 0 筆
 		$this->assertIsArray( $payloads );
+		$this->assertTrue( array_is_list( $payloads ), 'email_payloads_tmp 應為 list（FIFO 佇列）' );
 		$this->assertSame(
-			$payloads['DOMAIN'] ?? null,
+			$payloads[0]['DOMAIN'] ?? null,
 			$site_url,
 			'pp_site_url 應與開站信 payload 的 DOMAIN 完全一致'
 		);
@@ -696,8 +698,8 @@ class SiteSyncOrchestrationTest extends TestCase {
 		$payloads = $fresh_sub->get_meta( 'email_payloads_tmp' );
 
 		$this->assertIsArray( $payloads );
-		$this->assertArrayHasKey( 'URL', $payloads, '開站信 payload 應含 URL token' );
-		$this->assertSame( $payloads['FRONTURL'] ?? null, $payloads['URL'] ?? null );
+		$this->assertArrayHasKey( 'URL', $payloads[0] ?? [], '開站信 payload 應含 URL token' );
+		$this->assertSame( $payloads[0]['FRONTURL'] ?? null, $payloads[0]['URL'] ?? null );
 	}
 
 	/**
