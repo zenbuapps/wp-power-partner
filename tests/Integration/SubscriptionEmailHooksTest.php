@@ -1436,4 +1436,35 @@ class SubscriptionEmailHooksTest extends TestCase {
 			'補排白名單絕不可含 site_sync——會原地重現 issue #21 並擴散到 WPCD'
 		);
 	}
+
+	/**
+	 * 一次性補救：既有訂閱（已綁站但沒排程）經由同一個 hook 也應補排
+	 *
+	 * 對應 Compatibility::backfill_issue22_subscription_emails() 的行為——
+	 * 它直接 do_action 這個 hook，這裡驗證那條路徑確實有效。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_既有已綁站訂閱直接觸發hook也應補排next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		// 模擬「既有受害訂閱」：已綁站，但因為時序問題從來沒排程過
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->update_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-site-001' );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：既有訂閱不應已有排程' );
+
+		// Compatibility 的一次性補救就是這樣呼叫
+		do_action( \J7\PowerPartner\ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, [], [] );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, '既有已綁站訂閱應能經由同一個 hook 補排' );
+		$this->assertEqualsWithDelta( $next_payment_ts - 7 * DAY_IN_SECONDS, $ts, 60 );
+	}
 }

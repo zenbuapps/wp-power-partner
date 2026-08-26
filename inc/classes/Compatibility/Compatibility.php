@@ -8,6 +8,8 @@ use J7\PowerPartner\Plugin;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Action;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Status;
 use J7\PowerPartner\Domains\Settings\Core\WatchSettingHooks;
+use J7\PowerPartner\Product\SiteSync;
+use J7\PowerPartner\ShopSubscription;
 
 /** Class Compatibility 不同版本間的相容性設定 */
 final class Compatibility {
@@ -64,6 +66,9 @@ final class Compatibility {
 			self::reschedule_disable_site_scheduler();
 		}
 
+		// issue #22：一次性補排既有訂閱的 next_payment / trial_end 信
+		self::backfill_issue22_subscription_emails();
+
 		/**
 		 * ============== END 相容性代碼 ==============
 		 */
@@ -72,6 +77,67 @@ final class Compatibility {
 		\update_option(self::OPTION_NAME, Plugin::$version);
 		\wp_cache_flush();
 		Plugin::logger(Plugin::$version . ' 已執行兼容性設定', 'info', []);
+	}
+
+	/**
+	 * 一次性補排既有訂閱的 next_payment / trial_end 信（issue #22）
+	 *
+	 * 3.5.1 以前，這幾種信對「新成立的訂閱」從來沒有排進 ActionScheduler——
+	 * 排程的唯一入口是 woocommerce_subscription_date_updated，而它 fire 時
+	 * pp_linked_site_ids 還沒寫入，schedule_email() 的 is_site_sync() 守門直接 return。
+	 * 新的補排機制（監聽 pp_linked_site_ids_updated）只救「未來會綁定或重綁」的訂閱，
+	 * 既有的受害訂閱要靠這裡補。
+	 *
+	 * 復用同一個 hook 而不是自己排程：單一程式路徑、天然 idempotent（下游的
+	 * maybe_unschedule + schedule_single 是淨零成長），且狀態守門與「寄送時點已過就跳過」
+	 * 全部生效。
+	 *
+	 * ⚠️ 不可改用 WatchSettingHooks::reschedule_all_subscription_email()——
+	 *    它第一件事是 as_unschedule_all_actions($hook)，會把催繳信 / 成功信 / 結束信 /
+	 *    customer_cancelled 一起清空，而那些信它不會重建。
+	 *
+	 * ⚠️ 守門用獨立 option key，不可用 $previous_version：constructor 在
+	 *    版本不同時會 delete_option(self::OPTION_NAME)，所以 compatibility() 內讀到的
+	 *    $previous_version 永遠是 '0.0.1'，version_compare 區塊每次升版都會跑。
+	 *
+	 * @return void
+	 */
+	private static function backfill_issue22_subscription_emails(): void {
+		$option_name = 'power_partner_issue22_backfilled';
+
+		if (\get_option($option_name)) {
+			return;
+		}
+
+		if (! \function_exists('wcs_get_subscriptions')) {
+			return;
+		}
+
+		$subscriptions = \wcs_get_subscriptions(
+			[
+				'subscription_status'    => [ 'active', 'on-hold' ],
+				'subscriptions_per_page' => -1,
+				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
+					[
+						'key'     => SiteSync::LINKED_SITE_IDS_META_KEY,
+						'compare' => 'EXISTS',
+					],
+				],
+			]
+		);
+
+		$count = 0;
+		foreach ($subscriptions as $subscription) {
+			\do_action(ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, [], []);
+			++$count;
+		}
+
+		\update_option($option_name, Plugin::$version);
+		Plugin::logger(
+			"issue #22 一次性補排完成，處理 {$count} 筆訂閱",
+			'info',
+			[ 'subscription_count' => $count ]
+		);
 	}
 
 	/**
