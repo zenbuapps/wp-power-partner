@@ -63,6 +63,11 @@ export const baseTokens: TBase[] = [
 export const siteSyncTokens: TBase[] = [
 	...baseTokens,
 	{
+		// issue #23：後端已把 URL 帶進開站信 payload，UI 也要露出來，否則合約不一致
+		label: '網站 URL',
+		value: '##URL##',
+	},
+	{
 		label: 'WordPress帳戶頁',
 		value: '##WORDPRESSAPPWCSITESACCOUNTPAGE##',
 	},

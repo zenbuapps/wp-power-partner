@@ -636,4 +636,90 @@ class SiteSyncOrchestrationTest extends TestCase {
 			'email_payloads_tmp 不存在時不應發送任何 Email'
 		);
 	}
+
+	// ========== R14: 後置 — PowerCloud 201 時把站台網址寫入 pp_site_url（issue #23）==========
+
+	/**
+	 * Rule: PowerCloud 開站成功時，站台網址必須落地到訂閱的 pp_site_url。
+	 *
+	 * 網域是 FetchPowerCloud::site_sync() 本地生成的（$namespace . '.wpsite.pro'），
+	 * 回應 body 裡沒有——原本只存在於一次性的 email_payloads_tmp，寄完信就刪，
+	 * 導致 ##URL## 在 PowerCloud 架構下永遠是空的。
+	 *
+	 * namespace 是隨機生成的，所以唯一能寫死的強斷言是「pp_site_url 等於 payload 的 DOMAIN」。
+	 *
+	 * @group happy
+	 */
+	public function test_powercloud_201_persists_site_url_to_subscription(): void {
+		$this->skip_if_no_subscriptions();
+		$subscription = $this->create_subscription_for_site_sync( 'powercloud', 'tpl-001', 'plan-001' );
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-8101' ] ) );
+
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$fresh_sub = \wcs_get_subscription( $subscription->get_id() );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh_sub );
+
+		$site_url = (string) $fresh_sub->get_meta( SiteSync::SITE_URL_META_KEY, true );
+		$payloads = $fresh_sub->get_meta( 'email_payloads_tmp' );
+
+		$this->assertNotSame( '', $site_url, 'PowerCloud 開站成功後應寫入 pp_site_url（issue #23）' );
+		$this->assertMatchesRegularExpression(
+			'#^https://[a-z0-9\-]+\.wpsite\.pro$#',
+			$site_url,
+			'pp_site_url 應為含 scheme 的 wpsite.pro 網域'
+		);
+		$this->assertIsArray( $payloads );
+		$this->assertSame(
+			$payloads['DOMAIN'] ?? null,
+			$site_url,
+			'pp_site_url 應與開站信 payload 的 DOMAIN 完全一致'
+		);
+	}
+
+	/**
+	 * Rule: 開站信 payload 應包含 URL token（issue #23）。
+	 *
+	 * @group happy
+	 */
+	public function test_powercloud_201_email_payload_contains_url_token(): void {
+		$this->skip_if_no_subscriptions();
+		$subscription = $this->create_subscription_for_site_sync( 'powercloud', 'tpl-001', 'plan-001' );
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-8102' ] ) );
+
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$fresh_sub = \wcs_get_subscription( $subscription->get_id() );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh_sub );
+		$payloads = $fresh_sub->get_meta( 'email_payloads_tmp' );
+
+		$this->assertIsArray( $payloads );
+		$this->assertArrayHasKey( 'URL', $payloads, '開站信 payload 應含 URL token' );
+		$this->assertSame( $payloads['FRONTURL'] ?? null, $payloads['URL'] ?? null );
+	}
+
+	/**
+	 * Rule: 開站失敗（非 2xx）時不應寫入 pp_site_url。
+	 *
+	 * @group error
+	 */
+	public function test_powercloud_failure_does_not_persist_site_url(): void {
+		$this->skip_if_no_subscriptions();
+		$subscription = $this->create_subscription_for_site_sync( 'powercloud', 'tpl-001', 'plan-001' );
+
+		$this->mock_http( 400, (string) \wp_json_encode( [ 'message' => 'bad request' ] ) );
+
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$fresh_sub = \wcs_get_subscription( $subscription->get_id() );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh_sub );
+
+		$this->assertSame(
+			'',
+			(string) $fresh_sub->get_meta( SiteSync::SITE_URL_META_KEY, true ),
+			'開站失敗時不應寫入 pp_site_url'
+		);
+	}
 }

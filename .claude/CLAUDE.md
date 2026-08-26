@@ -116,6 +116,7 @@ PowerCloud API key 儲存方式:
 | `is_power_partner_site_sync` | `shop_subscription` | `'1'` 標記為 PP 訂閱 |
 | `lc_id` | `shop_subscription` | Multi-value: 授權碼 IDs |
 | `email_payloads_tmp` | `shop_subscription` | 暫存: 延遲發信後刪除 |
+| `pp_site_url` | `shop_subscription` | 站台網址（含 scheme）。issue #23：網域在兩種架構下都**不存在於開站 API 回應**——PowerCloud 是 `FetchPowerCloud::site_sync()` 本地生成的 `$namespace.'.wpsite.pro'`（原本只在一次性的 `email_payloads_tmp`，寄完信就刪）、WPCD 要等 `/customer-notification` 回調帶回。兩條路徑各自寫入此 meta，`##URL##` 只讀它。**第一個站先寫、之後不覆蓋** |
 | `power_partner_host_type` | product/variation | `'powercloud'` 或 `'wpcd'` |
 | `power_partner_host_position` | product/variation | 區域: `jp`, `tw`, `us_west`, `uk_london`, `sg`, `hk`, `canada` |
 | `power_partner_linked_site` | product/variation | 模板站 ID |
@@ -198,6 +199,7 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 `##DOMAIN##` `##FRONTURL##` `##ADMINURL##`
 `##SITEUSERNAME##` `##SITEPASSWORD##` `##IPV4##`
 `##ORDER_ID##` `##ORDER_ITEMS##` `##ORDER_STATUS##` `##ORDER_DATE##`
+`##URL##`（站台網址，來源 `pp_site_url`；開站信 payload 也已帶入）
 `##CHECKOUT_PAYMENT_URL##` `##VIEW_ORDER_URL##`
 
 ---
@@ -211,6 +213,8 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 3. **模板選項快取 7 天** — 在商品編輯器使用「清除快取」按鈕或呼叫 `POST /clear-template-sites-cache`。
 
 4. **Email 順序** — `Token::replace()` 在 `wpautop()` 之前執行，不可反轉順序。
+
+5. **`pp_create_site_responses` 的結構是 list，讀法只有一個入口** — 實際存的是 `[{status,message,data}]`。issue #23 之前 `Order.php` 讀 `[0]['data']`、`Token.php` 讀 `['data']`（少一層），後者必然取不到值。現已收斂到 `SiteSync::get_create_site_responses()` / `get_first_site_response_data()` / `extract_site_url()`，**不要再各自 `json_decode`**。注意 `data` 型別在兩架構不同：PowerCloud 是 assoc array、WPCD 是 stdClass。
 
 5. **僅首次付款觸發開站** — `SiteSync::site_sync_by_subscription()` 檢查 `count($order_ids) === 1`（僅父訂單）。續訂**不會**觸發新建站。
 

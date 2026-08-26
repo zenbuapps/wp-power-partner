@@ -231,6 +231,22 @@ final class Main
 
 				$new_site_id = $body_params['NEW_SITE_ID'] ?? null;
 				if ($subscription && $new_site_id) {
+					/**
+					 * Issue #23：把 WPCD 的站台網址落地到訂閱上。
+					 *
+					 * WPCD 開站是非同步的，網域在開站當下不存在，只有這個回調帶得回來。
+					 * 必須在 update_linked_site_ids() 之前寫入——後者會 fire
+					 * pp_linked_site_ids_updated（issue #22 的補排 hook），
+					 * 讓監聽者拿到的訂閱狀態是完整的。
+					 *
+					 * 只在尚未寫入時寫，語義與 PowerCloud 分支一致（第一個站先寫、之後不覆蓋）。
+					 */
+					$callback_site_url = (string) ( $body_params['FRONTURL'] ?? $body_params['DOMAIN'] ?? '' );
+					if ( $callback_site_url && '' === (string) $subscription->get_meta( SiteSync::SITE_URL_META_KEY, true ) ) {
+						$subscription->update_meta_data( SiteSync::SITE_URL_META_KEY, $callback_site_url );
+						$subscription->save();
+					}
+
 					ShopSubscription::update_linked_site_ids(
 						(int) $subscription->get_id(),
 						[
@@ -259,6 +275,7 @@ final class Main
 			$tokens['ADMINURL']                       = $body_params['ADMINURL'] ?? '';
 			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'] ?? '';
 			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'] ?? '';
+			$tokens['URL']                            = $tokens['FRONTURL'] ?: $tokens['DOMAIN']; // issue #23
 
 			// 回調 payload 不全時留痕：這是 CloudServer 端的問題，但後果會落在終端客戶身上（收不到開通信）
 			$missing_params = [];

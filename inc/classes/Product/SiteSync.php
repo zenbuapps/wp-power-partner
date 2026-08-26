@@ -26,6 +26,23 @@ final class SiteSync {
 	// the site id linked in cloud site
 	const LINKED_SITE_IDS_META_KEY = 'pp_linked_site_ids'; // pp === Power Partner
 
+	/**
+	 * 訂閱 meta：此訂閱的站台網址（含 scheme）
+	 *
+	 * Issue #23：網域在兩種架構下都不存在於「開站 API 回應」裡——
+	 *   - PowerCloud：網域是 FetchPowerCloud::site_sync() 本地生成的（$namespace . '.wpsite.pro'），
+	 *     回應 body 只有 websiteId。原本只被塞進一次性的 email_payloads_tmp，寄完信就刪 → 永久遺失。
+	 *   - WPCD：開站是非同步的，網域稍後才由 CloudServer 回調 /customer-notification 帶回來。
+	 *
+	 * 兩條路徑各自寫入這一個結構穩定的 meta，Token::get_subscription_tokens() 只讀它。
+	 * 刻意不塞進 pp_create_site_responses：那份 meta 在父訂單上、data 型別是 mixed
+	 * （PowerCloud assoc array / WPCD stdClass），且 WPCD 回調拿不到「這是第幾個 item」的資訊。
+	 *
+	 * 寫入語義是「第一個站先寫、之後不覆蓋」——##URL## 語義上是單數，
+	 * 多商品訂閱時固定指向第一個站，避免同一封催繳信在不同時間點指向不同的站。
+	 */
+	const SITE_URL_META_KEY = 'pp_site_url';
+
 	/** Constructor */
 	public function __construct() {
 		\add_action(Action::INITIAL_PAYMENT_COMPLETE->get_action_hook(), [ $this, 'site_sync_by_subscription' ], 1, 2);
@@ -228,6 +245,22 @@ final class SiteSync {
 				);
 			}
 
+			$site_url = 'https://' . $wordpress_obj->domain;
+
+			/**
+			 * Issue #23：把網域落地。
+			 *
+			 * $wordpress_obj->domain 是 FetchPowerCloud::site_sync() 本地生成的
+			 * （$namespace . '.wpsite.pro'），PowerCloud 的回應 body 裡沒有它。
+			 * 原本它只被塞進一次性的 email_payloads_tmp（寄信後即刪），
+			 * 所以 ##URL## 在 PowerCloud 架構下永遠取不到值。
+			 *
+			 * 只在尚未寫入時寫——多商品訂閱時固定指向第一個站（見 SITE_URL_META_KEY 註解）。
+			 */
+			if ( '' === (string) $subscription->get_meta( self::SITE_URL_META_KEY, true ) ) {
+				$subscription->update_meta_data( self::SITE_URL_META_KEY, $site_url );
+			}
+
 			$order_token = Token::get_order_tokens($parent_order);
 
 			// 拿到 email payloads
@@ -238,9 +271,10 @@ final class SiteSync {
 					'REF_ORDER_ID'                   => $parent_order->get_id(),
 					'WORDPRESSAPPWCSITESACCOUNTPAGE' => '',
 					'IPV4'                           => '163.61.60.30',
-					'DOMAIN'                         => 'https://' . $wordpress_obj->domain,
-					'FRONTURL'                       => 'https://' . $wordpress_obj->domain,
-					'ADMINURL'                       => 'https://' . $wordpress_obj->domain . '/wp-admin',
+					'DOMAIN'                         => $site_url,
+					'FRONTURL'                       => $site_url,
+					'ADMINURL'                       => $site_url . '/wp-admin',
+					'URL'                            => $site_url, // issue #23：開站信模板也能用 ##URL##
 					'SITEUSERNAME'                   => $wordpress_obj->wp_admin_email,
 					'SITEPASSWORD'                   => $wordpress_obj->wp_admin_password,
 					'NEW_SITE_ID'                    => '',
@@ -261,6 +295,77 @@ final class SiteSync {
 		}
 
 		return $response_obj;
+	}
+
+	/**
+	 * 讀取 pp_create_site_responses（唯一 accessor）
+	 *
+	 * 這份 meta 的實際結構是 list：[{"status":..,"message":..,"data":{..}}]。
+	 * Issue #23 之前，Order.php 讀 [0]['data']、Token.php 讀 ['data']——
+	 * 同一個 meta key 兩種讀法，後者必然取不到值。
+	 * 所有讀取端一律走這裡，不要再各自 json_decode。
+	 *
+	 * @param \WC_Order $order 訂單
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function get_create_site_responses( \WC_Order $order ): array {
+		$raw = $order->get_meta( self::CREATE_SITE_RESPONSES_META_KEY, true );
+		if ( ! is_string( $raw ) || '' === $raw ) {
+			return [];
+		}
+
+		$decoded = \json_decode( $raw, true );
+		if ( ! is_array( $decoded ) ) {
+			return [];
+		}
+
+		/** @var array<int, array<string, mixed>> $responses */
+		$responses = \array_values( \array_filter( $decoded, 'is_array' ) );
+
+		return $responses;
+	}
+
+	/**
+	 * 取得第 0 筆開站回應的 data
+	 *
+	 * @param \WC_Order $order 訂單
+	 * @return array<string, mixed> 取不到時回傳空陣列
+	 */
+	public static function get_first_site_response_data( \WC_Order $order ): array {
+		$responses = self::get_create_site_responses( $order );
+		$first     = $responses[0] ?? [];
+		$data      = $first['data'] ?? [];
+
+		/** @var array<string, mixed> $result */
+		$result = is_array( $data ) ? $data : [];
+
+		return $result;
+	}
+
+	/**
+	 * 從開站回應的 data 撈站台網址
+	 *
+	 * 欄位優先序刻意對齊既有的 DailyBillingCron::DOMAIN_KEYS / resolve_domain()，不發明第三套。
+	 *
+	 * @param array<string, mixed> $data 開站回應的 data
+	 * @return string 缺 scheme 時補 https://；取不到時回傳空字串
+	 */
+	public static function extract_site_url( array $data ): string {
+		foreach ( [ 'url', 'primaryDomain', 'domain', 'subDomain', 'wildcardDomain' ] as $key ) {
+			$value = $data[ $key ] ?? null;
+			if ( ! is_scalar( $value ) ) {
+				continue;
+			}
+
+			$value = \trim( (string) $value );
+			if ( '' === $value ) {
+				continue;
+			}
+
+			return \preg_match( '#^https?://#i', $value ) ? $value : 'https://' . $value;
+		}
+
+		return '';
 	}
 
 	/**

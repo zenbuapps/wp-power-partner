@@ -143,10 +143,41 @@ final class SubscriptionEmailScheduler extends Base {
 
 		$to = $is_customer_cancelled ? $admin_email : $last_order->get_billing_email();
 
+		$subject = Token::replace( $email->subject, $tokens );
+		$body    = Token::replace( $email->body, $tokens );
+
+		/**
+		 * 掃描替換後仍殘留的 ##TOKEN##（issue #23）
+		 *
+		 * Token::replace() 對空值是 continue（保留字面佔位符），所以缺值會以 ##XXX## 的樣子
+		 * 寄到終端客戶手上。這裡只記 log 不做任何修改：
+		 *   - 不中止寄送——生命週期信（催繳 / 訂閱結束）比一個佔位符重要得多，
+		 *     以缺 token 擋信會讓客戶連催繳通知都收不到。
+		 *   - 不刪除佔位符——刪掉會留下「你的網站：」這種斷句，
+		 *     而且會把「經銷商自己打錯字」與「系統資料缺失」兩件事混在一起處理。
+		 */
+		$leftover_tokens = [];
+		if ( \preg_match_all( '/##[A-Z0-9_]+##/', $subject . ' ' . $body, $matches ) ) {
+			$leftover_tokens = \array_values( \array_unique( $matches[0] ) );
+		}
+
+		if ( $leftover_tokens ) {
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 的信件有未取代的變數：" . \implode( ', ', $leftover_tokens ),
+				'error',
+				[
+					'subscription_id' => $subscription->get_id(),
+					'email_key'       => $email->key,
+					'action_name'     => $email->action_name,
+					'leftover_tokens' => $leftover_tokens,
+				]
+			);
+		}
+
 		$success = \wp_mail(
 			$to,
-			Token::replace( $email->subject, $tokens ),
-			Token::replace( $email->body, $tokens ),
+			$subject,
+			$body,
 			$headers,
 		);
 

@@ -53,19 +53,13 @@ final class Order {
 		if ( SiteSync::CREATE_SITE_RESPONSES_META_KEY === $column ) {
 			$order_id = $post->ID;
 			$order    = \wc_get_order( $order_id );
-			if ( ! $order ) {
+			// wc_get_order() 也可能回 WC_Order_Refund，accessor 要求 WC_Order
+			if ( ! $order instanceof \WC_Order ) {
 				return;
 			}
 
-			$responses_string = $order->get_meta( SiteSync::CREATE_SITE_RESPONSES_META_KEY );
-
-			$data = [];
-			if ( is_string( $responses_string ) && ! empty( $responses_string ) ) {
-				$responses = json_decode( $responses_string, true );
-				$responses = is_array( $responses ) ? $responses : [];
-				$first     = isset( $responses[0] ) && is_array( $responses[0] ) ? $responses[0] : [];
-				$data      = isset( $first['data'] ) && is_array( $first['data'] ) ? $first['data'] : [];
-			}
+			// issue #23：讀法統一走 SiteSync 的單一 accessor
+			$data = SiteSync::get_first_site_response_data( $order );
 
 			if ( ! empty( $data ) ) {
 				foreach ( $data as $key => $value ) {
@@ -104,19 +98,13 @@ final class Order {
 		global $post;
 		$order_id = $post->ID;
 		$order    = \wc_get_order( $order_id );
-		if ( ! $order ) {
+		// wc_get_order() 也可能回 WC_Order_Refund，accessor 要求 WC_Order
+		if ( ! $order instanceof \WC_Order ) {
 			echo '找不到訂單 #' . $order_id; // phpcs:ignore
 			return;
 		}
-		$responses_string = $order->get_meta( SiteSync::CREATE_SITE_RESPONSES_META_KEY );
-
-		$data = [];
-		if ( is_string( $responses_string ) && ! empty( $responses_string ) ) {
-			$responses = json_decode( $responses_string, true );
-			$responses = is_array( $responses ) ? $responses : [];
-			$first     = isset( $responses[0] ) && is_array( $responses[0] ) ? $responses[0] : [];
-			$data      = isset( $first['data'] ) && is_array( $first['data'] ) ? $first['data'] : [];
-		}
+		// issue #23：讀法統一走 SiteSync 的單一 accessor
+		$data = SiteSync::get_first_site_response_data( $order );
 
 		if ( ! empty( $data ) ) {
 			foreach ( $data as $key => $value ) {
