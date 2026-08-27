@@ -649,7 +649,18 @@ class SiteSyncIdempotencyTest extends TestCase {
 			$fresh->get_meta( 'email_payloads_tmp' ),
 			'寄送被防呆擋下時必須保留 payload——它是 wp_admin_password 唯一的存放處'
 		);
-		$this->assertEmpty( $this->sent_emails, '防呆應中止寄送' );
+
+		$recipients = array_column( $this->sent_emails, 'to' );
+		$this->assertNotContains(
+			'site@example.com',
+			$recipients,
+			'防呆應中止寄給客戶（不寄半成品）'
+		);
+		$this->assertContains(
+			(string) \get_option( 'admin_email' ),
+			$recipients,
+			'但要寄告警信給經銷商——否則沒有任何人知道客戶收不到帳密'
+		);
 
 		$property->setValue( null, null );
 	}
@@ -751,5 +762,282 @@ class SiteSyncIdempotencyTest extends TestCase {
 			$this->request_count,
 			'前一次已成功時，延後重試應被冪等旗標擋下，不可再開一個站'
 		);
+	}
+
+	// ========== 逾時接管後的鎖歸屬 ==========
+
+	/**
+	 * 殘鎖被接管後，原持有者的釋放不可刪掉接管者的鎖
+	 *
+	 * A 取鎖後開站極慢（> SITE_SYNC_LOCK_TIMEOUT），B 判定殘鎖並原子接管；
+	 * A 完成時若無條件 delete_option()，就會把 B 正在持有的鎖刪掉，
+	 * 保護窗口提前結束，下一個付款重送事件會在 B 尚未落冪等旗標時再開一個站。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_殘鎖被接管後原持有者釋放不可刪掉接管者的鎖(): void {
+		$this->skip_if_no_subscriptions();
+
+		$lock_key = SiteSync::SITE_SYNC_LOCK_PREFIX . 999001;
+
+		$reflection = new \ReflectionClass( SiteSync::class );
+		$acquire    = $reflection->getMethod( 'acquire_lock' );
+		$acquire->setAccessible( true );
+		$release = $reflection->getMethod( 'release_lock' );
+		$release->setAccessible( true );
+
+		// A 取得鎖
+		$a_value = $acquire->invoke( null, $lock_key, SiteSync::SITE_SYNC_LOCK_TIMEOUT );
+		$this->assertNotNull( $a_value, 'A 應取得鎖' );
+
+		// 讓 A 的鎖看起來已逾時（模擬 A 還活著但跑很久）
+		\update_option( $lock_key, (string) ( time() - SiteSync::SITE_SYNC_LOCK_TIMEOUT - 10 ) );
+		\wp_cache_delete( $lock_key, 'options' );
+
+		// B 接管殘鎖
+		$b_value = $acquire->invoke( null, $lock_key, SiteSync::SITE_SYNC_LOCK_TIMEOUT );
+		$this->assertNotNull( $b_value, 'B 應能接管逾時殘鎖' );
+
+		// A 這時才跑完，釋放它「以為」自己持有的鎖
+		$release->invoke( null, $lock_key, (string) $a_value );
+
+		\wp_cache_delete( $lock_key, 'options' );
+		$this->assertNotFalse(
+			\get_option( $lock_key ),
+			'A 的釋放不可刪掉 B 的鎖——條件式 DELETE 應該 affect 0 row'
+		);
+
+		// B 自己釋放才真的清掉
+		$release->invoke( null, $lock_key, (string) $b_value );
+		\wp_cache_delete( $lock_key, 'options' );
+		$this->assertFalse( \get_option( $lock_key ), 'B 釋放後鎖應消失' );
+	}
+
+	// ========== 開站回應的讀取優先序 ==========
+
+	/**
+	 * 先失敗後成功時，accessor 應回報成功那一筆
+	 *
+	 * pp_create_site_responses 改為「合併」而非覆寫後，第 0 筆會永遠是那次失敗的回應，
+	 * 訂單列表欄位 / metabox / ##URL## fallback 會一直顯示錯誤資訊。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_先失敗後成功時accessor應回報成功那一筆(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+		$order_id     = $subscription->get_parent_id();
+
+		// 第一次開站失敗（非 2xx → 不落冪等旗標）
+		$this->mock_http( 500, (string) \wp_json_encode( [ 'message' => 'boom' ] ) );
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		// 事件重送，這次成功
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-ok', 'url' => 'https://ok.wpsite.pro' ] ) );
+		$this->replay_payment_complete( $subscription->get_id() );
+
+		$parent_order = \wc_get_order( $order_id );
+		$this->assertInstanceOf( \WC_Order::class, $parent_order );
+
+		$this->assertCount(
+			2,
+			SiteSync::get_create_site_responses( $parent_order ),
+			'前置條件：兩筆回應都應保留（合併而非覆寫）'
+		);
+
+		$data = SiteSync::get_first_site_response_data( $parent_order );
+		$this->assertSame(
+			'ws-ok',
+			$data['websiteId'] ?? null,
+			'accessor 應回報第一筆成功的回應，而不是第 0 筆失敗的'
+		);
+	}
+
+	// ========== 訂單備註的憑證遮罩 ==========
+
+	/**
+	 * 開站回應帶憑證時，訂單備註不可出現明文
+	 *
+	 * 訂單備註是經銷商可見、且會出現在 WooCommerce 訂單備註 REST API 的欄位。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_開站回應帶憑證時訂單備註不可出現明文(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+		$order_id     = $subscription->get_parent_id();
+
+		$this->mock_http(
+			201,
+			(string) \wp_json_encode(
+				[
+					'websiteId' => 'ws-secret',
+					'wordpress' => [
+						'autoInstall' => [
+							'adminUser'     => 'someone',
+							'adminPassword' => 'SuperSecret123',
+						],
+					],
+					'apiKey'    => 'ak_live_should_not_leak',
+				]
+			)
+		);
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$notes = implode( "\n", $this->get_order_notes( $order_id ) );
+
+		$this->assertStringNotContainsString( 'SuperSecret123', $notes, '訂單備註不可出現站台後台密碼明文' );
+		$this->assertStringNotContainsString( 'ak_live_should_not_leak', $notes, '訂單備註不可出現 API key 明文' );
+		$this->assertStringContainsString( 'ws-secret', $notes, '非敏感欄位仍應正常顯示' );
+
+		// 存進 meta 的原文不動——DisableHooks 的相容 fallback 要讀 websiteId
+		$parent_order = \wc_get_order( $order_id );
+		$this->assertInstanceOf( \WC_Order::class, $parent_order );
+		$data = SiteSync::get_first_site_response_data( $parent_order );
+		$this->assertSame( 'SuperSecret123', $data['wordpress']['autoInstall']['adminPassword'] ?? null, 'meta 應保留原文' );
+	}
+
+	// ========== FIFO 佇列的頭部阻塞 ==========
+
+	/**
+	 * 頭部 payload 持續失敗時，不可把後面的站一起卡死
+	 *
+	 * 排程數量與 payload 數量是一對一的，「失敗就原地保留不消費」會把排程額度
+	 * 用光而佇列原地不動——第二個站的帳密永遠寄不出去。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_頭部payload失敗不可卡住後面的站(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_settings_with_emails(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+
+		// 站 1 缺 SITEPASSWORD（必失敗）、站 2 完整（應寄得出去）
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://site-1.wpsite.pro',
+					'ADMINURL'     => 'https://site-1.wpsite.pro/wp-admin',
+					'SITEUSERNAME' => 'u1',
+					'SITEPASSWORD' => '',
+				],
+				[
+					'FRONTURL'     => 'https://site-2.wpsite.pro',
+					'ADMINURL'     => 'https://site-2.wpsite.pro/wp-admin',
+					'SITEUSERNAME' => 'u2',
+					'SITEPASSWORD' => 'pw-2',
+				],
+			]
+		);
+		$subscription->save();
+
+		$this->mock_wp_mail();
+		// wp_mail 在測試環境的實際投遞會失敗，這裡短路成「投遞成功」，
+		// 讓本測試只驗證佇列推進邏輯（mock_wp_mail 的 wp_mail filter 先跑，記錄照常）
+		\add_filter( 'pre_wp_mail', '__return_true', 10, 1 );
+
+		$site_sync = new SiteSync();
+		$site_sync->send_email( 'site@example.com', $subscription_id );  // 排程 1：站 1 失敗
+		$site_sync->send_email( 'site@example.com', $subscription_id );  // 排程 2：應輪到站 2
+
+		$bodies = implode( "\n", array_column( $this->sent_emails, 'message' ) );
+		$this->assertStringContainsString(
+			'pw-2',
+			$bodies,
+			'站 1 失敗不可卡住站 2——第二個排程應該處理到站 2 的 payload'
+		);
+
+		$fresh = \wcs_get_subscription( $subscription_id );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh );
+		$queue = $fresh->get_meta( 'email_payloads_tmp' );
+		\remove_filter( 'pre_wp_mail', '__return_true', 10 );
+		$this->assertIsArray( $queue );
+		$this->assertCount( 1, $queue, '站 2 已寄出、站 1 仍待重試，佇列應剩 1 筆' );
+		$this->assertSame( 'https://site-1.wpsite.pro', $queue[0]['FRONTURL'] ?? null, '留下的應是失敗的站 1' );
+	}
+
+	/**
+	 * 連續失敗達上限後應丟棄，避免佇列永遠卡住
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_連續失敗達上限後應丟棄payload(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_settings_with_emails(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://x.wpsite.pro',
+					'SITEPASSWORD' => '',
+				],
+			]
+		);
+		$subscription->save();
+
+		$this->mock_wp_mail();
+
+		$site_sync = new SiteSync();
+		for ( $i = 0; $i < SiteSync::EMAIL_PAYLOAD_MAX_ATTEMPTS; $i++ ) {
+			$site_sync->send_email( 'site@example.com', $subscription_id );
+		}
+
+		$fresh = \wcs_get_subscription( $subscription_id );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh );
+		$this->assertEmpty(
+			$fresh->get_meta( 'email_payloads_tmp' ),
+			'連續失敗達上限後應丟棄，否則佇列永遠卡住'
+		);
+
+		$notes = implode( "\n", $this->get_order_notes( $subscription_id ) );
+		$this->assertStringContainsString( '停止重試', $notes, '放棄時應留下訂單備註，讓經銷商知道要手動補寄' );
 	}
 }

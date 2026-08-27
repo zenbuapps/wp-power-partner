@@ -52,9 +52,31 @@ final class SubscriptionEmailHooks {
 	 *    加進來會原地重現 issue #21——而且因為 fire 當下 meta 已寫入、守門已通過，
 	 *    連原本不受影響的 WPCD 也會一起開始重複寄壞信。
 	 *
+	 * ⚠️ 只列「真的有日期錨點」的兩種，不含 watch_next_payment / watch_trial_end。
+	 *    理由：SubscriptionEmail::get_timestamp() 是以
+	 *    `isset($this->times->{$action_name})` 決定錨點，而 Powerhouse 的 Times DTO
+	 *    只宣告 trial_end / next_payment / last_order_date_created / end / end_of_prepaid_term。
+	 *    watch_* 不在其中 → 一律落到 `time() + shift`：
+	 *      - operator=before 或 days=0（UI 常態）→ 時點已過 → 被 $skip_if_past 丟掉，補了也是空轉
+	 *      - operator=after → 排出「從補排當下起算 N 天」，錨點是「補排的時刻」而不是扣款日，語義錯的
+	 *    watch_* 的正常排程入口是 powerhouse_subscription_at_watch_* hook，
+	 *    那條路徑的「當下」才是對的錨點，不需要也不應該由補排代勞。
+	 *
 	 * @var array<string>
 	 */
-	private const BACKFILL_ACTIONS = [ 'next_payment', 'watch_next_payment', 'trial_end', 'watch_trial_end' ];
+	private const BACKFILL_ACTIONS = [ 'next_payment', 'trial_end' ];
+
+	/**
+	 * 網站綁定被清空時，要一併取消的未寄出信件（issue #22）
+	 *
+	 * 比 BACKFILL_ACTIONS 多了 watch_*：清除走的是
+	 * SubscriptionEmailScheduler::unschedule()（查 pending action 後刪除），
+	 * 不經過 get_timestamp()，所以對 watch_* 完全有效——
+	 * 失去綁定的訂閱不該留著任何里程碑信，補得了補不了是另一回事。
+	 *
+	 * @var array<string>
+	 */
+	private const UNBIND_UNSCHEDULE_ACTIONS = [ 'next_payment', 'watch_next_payment', 'trial_end', 'watch_trial_end' ];
 
 	/** @var object{subject:string, body:string} $default Default email */
 	public object $default;
@@ -324,7 +346,7 @@ final class SubscriptionEmailHooks {
 
 			// 綁定被清空（管理員後台移除，或 change_linked_site_ids() 把站台移轉到別筆訂閱）
 			if ( ! SubscriptionUtils::is_site_sync( $subscription ) ) {
-				$this->unschedule_emails_by_actions( $subscription, self::BACKFILL_ACTIONS );
+				$this->unschedule_emails_by_actions( $subscription, self::UNBIND_UNSCHEDULE_ACTIONS );
 				return;
 			}
 
@@ -587,6 +609,7 @@ final class SubscriptionEmailHooks {
 
 		$success_emails = [];
 		$failed_emails  = [];
+		$aborted_tokens = [];
 		foreach ( $emails as $email ) {
 			// 取得 subject
 			$subject = $email->subject;
@@ -617,6 +640,7 @@ final class SubscriptionEmailHooks {
 					5
 				);
 				$failed_emails[] = $email->action_name;
+				$aborted_tokens  = array_values( array_unique( array_merge( $aborted_tokens, $missing_tokens ) ) );
 				continue;
 			}
 
@@ -639,6 +663,53 @@ final class SubscriptionEmailHooks {
 			}
 		}
 
+		/**
+		 * 防呆把「所有」模板都擋掉時，主動通知經銷商（issue #21 的後果控管）
+		 *
+		 * 防呆本身是對的——寧可不寄，也不要把滿是 ##SITEPASSWORD## 的信寄給終端客戶。
+		 * 但它把失敗模式從「客戶收到一封有佔位符的信」變成「客戶一封都收不到」，
+		 * 而唯一的痕跡是經銷商不會去看的 error log；WPCD 的 /customer-notification
+		 * 還是回 200，CloudServer 也不會重送。結果是沒有任何人知道客戶沒拿到帳密。
+		 *
+		 * 收件人用站台 admin_email（經銷商本人）而非 ALERT_MAIL_TO：這一題的處置
+		 * （改信件模板、或去查 CloudServer 為什麼少送欄位、或手動補寄帳密給客戶）
+		 * 都在經銷商這一側，與 DailyBillingCron 的計費告警（服務商處置）不同。
+		 *
+		 * 只在「一封都沒寄成功」時才發，避免多模板情境下的雜訊；
+		 * 且直接用 wp_mail 而不是再走一次 send_mail()，免得遞迴。
+		 */
+		if ( $aborted_tokens && ! $success_emails ) {
+			self::notify_dealer_email_aborted( $to, $aborted_tokens, $tokens );
+		}
+
 		return [ $success_emails, $failed_emails ];
+	}
+
+	/**
+	 * 通知經銷商：開站通知信因缺關鍵站台變數而完全沒寄出
+	 *
+	 * @param string               $to             原本要寄給誰（終端客戶）
+	 * @param array<string>        $missing_tokens 缺少的 token 名稱
+	 * @param array<string, mixed> $tokens         當下手上的 tokens（只取 key 做診斷，不外洩值）
+	 * @return void
+	 */
+	private static function notify_dealer_email_aborted( string $to, array $missing_tokens, array $tokens ): void {
+		$admin_email = (string) \get_option( 'admin_email' );
+		if ( ! $admin_email || ! \is_email( $admin_email ) ) {
+			return;
+		}
+
+		$order_id = isset( $tokens['REF_ORDER_ID'] ) ? (string) $tokens['REF_ORDER_ID'] : (string) ( $tokens['ORDER_ID'] ?? '' );
+
+		$subject = '【Power Partner】開站通知信未寄出，客戶尚未收到帳密';
+		$body    = '<p>系統偵測到開站通知信缺少關鍵站台變數，為避免把 <code>##XXX##</code> 佔位符寄給客戶，已中止寄送。</p>'
+		. '<p><strong>客戶信箱：</strong>' . \esc_html( $to ) . '</p>'
+		. ( '' !== $order_id ? '<p><strong>訂單編號：</strong>#' . \esc_html( $order_id ) . '</p>' : '' )
+		. '<p><strong>缺少的變數：</strong>' . \esc_html( implode( ', ', $missing_tokens ) ) . '</p>'
+		. '<p><strong>目前可用的變數：</strong>' . \esc_html( implode( ', ', array_keys( $tokens ) ) ) . '</p>'
+		. '<p>處置方式：確認信件模板是否用到了這個站台架構拿不到的變數，或聯繫服務商確認開站回調是否漏送欄位。'
+		. '修正後請於後台手動補寄帳密給客戶（開站狀態頁的「寄送帳密」）。</p>';
+
+		\wp_mail( $admin_email, $subject, $body, [ 'Content-Type: text/html; charset=UTF-8' ] );
 	}
 }

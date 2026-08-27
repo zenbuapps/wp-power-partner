@@ -971,15 +971,16 @@ class SubscriptionEmailHooksTest extends TestCase {
 			]
 		);
 
-		$mail_called = false;
+		$recipients = [];
 		add_filter(
 			'pre_wp_mail',
-			function ( $return ) use ( &$mail_called ) {
-				$mail_called = true;
+			function ( $return, $atts ) use ( &$recipients ) {
+				$to           = $atts['to'] ?? '';
+				$recipients[] = is_array( $to ) ? implode( ',', $to ) : (string) $to;
 				return true;
 			},
 			10,
-			1
+			2
 		);
 
 		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
@@ -992,9 +993,61 @@ class SubscriptionEmailHooksTest extends TestCase {
 			]
 		);
 
-		$this->assertFalse( $mail_called, '缺少關鍵站台變數時不應呼叫 wp_mail（寧可不寄，也不寄半成品）' );
+		$this->assertNotContains( 'customer@example.com', $recipients, '缺少關鍵站台變數時不應把半成品寄給客戶' );
 		$this->assertSame( [], $success_emails, '不應有成功項目' );
 		$this->assertSame( [ 'site_sync' ], $failed_emails, '被防呆擋下的信應計入 failed_emails' );
+		$this->assertContains(
+			(string) get_option( 'admin_email' ),
+			$recipients,
+			'全部模板都被防呆擋下時應寄告警信給經銷商——否則沒有任何人知道客戶收不到帳密'
+		);
+	}
+
+	/**
+	 * 有模板成功寄出時，不應額外寄告警信
+	 *
+	 * 守住告警的「不吵」邊界：只有「一封都沒寄成功」才值得打擾經銷商。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_send_mail_有模板寄出成功時不應寄告警信給經銷商(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$recipients = [];
+		add_filter(
+			'pre_wp_mail',
+			function ( $return, $atts ) use ( &$recipients ) {
+				$to           = $atts['to'] ?? '';
+				$recipients[] = is_array( $to ) ? implode( ',', $to ) : (string) $to;
+				return true;
+			},
+			10,
+			2
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[ 'FRONTURL' => 'https://abc.wpsite.pro' ]
+		);
+
+		$this->assertSame( [ 'site_sync' ], $success_emails, '模板未用到缺席的 token，應照常寄出' );
+		$this->assertSame( [], $failed_emails );
+		$this->assertSame( [ 'customer@example.com' ], $recipients, '寄成功時只該有客戶那一封，不應多寄告警信' );
 	}
 
 	/**
@@ -1460,11 +1513,114 @@ class SubscriptionEmailHooksTest extends TestCase {
 
 		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：既有訂閱不應已有排程' );
 
-		// Compatibility 的一次性補救就是這樣呼叫
+		// 綁定事件的公開路徑（WPCD 回調 / 後台編輯 / change_linked_site_ids 都走這裡）
 		do_action( \J7\PowerPartner\ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, [], [] );
 
 		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
 		$this->assertNotNull( $ts, '既有已綁站訂閱應能經由同一個 hook 補排' );
 		$this->assertEqualsWithDelta( $next_payment_ts - 7 * DAY_IN_SECONDS, $ts, 60 );
+	}
+
+	// ========== Compatibility 的一次性分批補排 ==========
+
+	/**
+	 * 一次性分批補排應排出 next_payment 信
+	 *
+	 * 同時驗證查詢參數（orderby=ID）在 wcs_get_subscriptions 可用——
+	 * 若 orderby 不被接受，這個查詢會回空、補排整批靜默失效。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_一次性分批補排應排出next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		// 直接寫 meta，不走 update_linked_site_ids()——避免綁定事件先把信排掉，
+		// 這樣才測得到「批次補排」本身有沒有作用
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-001', false );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：批次跑之前不應有排程' );
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, '批次補排應為既有已綁站訂閱排出 next_payment 信' );
+		$this->assertEqualsWithDelta( $next_payment_ts - 7 * DAY_IN_SECONDS, $ts, 60 );
+	}
+
+	/**
+	 * 一次性分批補排不可 fire pp_linked_site_ids_updated
+	 *
+	 * 那個 hook 的公開契約是「綁定真的變更後」。批次補排時綁定沒有變動，
+	 * 假造事件會讓依契約寫的第三方監聽者在升級時對每一筆訂閱各收到一次不存在的變更。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_一次性分批補排不應fire綁定變更hook(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-002', false );
+		$subscription->save();
+
+		$fired = 0;
+		add_action(
+			\J7\PowerPartner\ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		$this->assertSame( 0, $fired, '批次補排不可假造綁定變更事件' );
+	}
+
+	/**
+	 * 批次中若有取不到物件的訂閱，不可中斷整條補排鏈
+	 *
+	 * wcs_get_subscriptions() 是 `$out[$id] = wcs_get_subscription($id)`，
+	 * 後者取不到時會塞 false。少了守衛，->get_id() 會 fatal，
+	 * 而 fatal 會讓這個 ActionScheduler action 失敗、後續批次全部不再排。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_批次補排遇到無效訂閱不應中斷(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-003', false );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		// 在結果集前面插入一筆 false，模擬「查到 id 但 hydrate 不出物件」
+		$injector = static function ( $subscriptions ) use ( $subscription ) {
+			return [ 0 => false ] + [ $subscription->get_id() => $subscription ];
+		};
+		add_filter( 'woocommerce_got_subscriptions', $injector, 10, 1 );
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		remove_filter( 'woocommerce_got_subscriptions', $injector, 10 );
+
+		$this->assertNotNull(
+			$this->get_pending_action_timestamp( $sub_id, 'next_payment' ),
+			'無效項目應被跳過，同批次的有效訂閱仍要補排成功'
+		);
 	}
 }

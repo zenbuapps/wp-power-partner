@@ -197,16 +197,27 @@ final class ShopSubscription {
 	 * Check if two site id arrays are the same
 	 * 檢查兩個 site id 陣列是否相同
 	 *
+	 * ⚠️ 必須以「字串」比較，不可 (int) 正規化。
+	 *
+	 * PowerCloud 的 websiteId 是 UUID（例：`a1b2c3d4-...`），`(int)` 之後全部變成 `0`——
+	 * 於是「從 UUID-A 換綁到 UUID-B」會被判成無變更，update_linked_site_ids() 直接
+	 * return false：meta 不寫入（綁定靜默遺失）、pp_linked_site_ids_updated 也不 fire
+	 * （issue #22 的補排、以及任何第三方監聽者全部收不到事件）。
+	 *
+	 * 換成字串比較後，WPCD 的數字 id 行為不變：'101' 與 101 經 strval 後同樣是 '101'。
+	 * 排序指定 SORT_STRING——預設的 SORT_REGULAR 會把純數字字串當數值比，
+	 * UUID 與數字 id 混在同一筆訂閱時排序結果不穩定，會讓相同集合被判成不同。
+	 *
 	 * @param array<int|string, mixed> $old_ids Old site ids
 	 * @param array<int|string, mixed> $new_ids New site ids
 	 * @return bool
 	 */
 	private static function is_same_site_ids( array $old_ids, array $new_ids ): bool {
-		$normalized_old_ids = array_values( array_map( static fn( $v ): int => (int) $v, $old_ids ) );
-		sort( $normalized_old_ids );
+		$normalized_old_ids = array_values( array_map( static fn( $v ): string => (string) $v, $old_ids ) );
+		sort( $normalized_old_ids, SORT_STRING );
 
-		$normalized_new_ids = array_values( array_map( static fn( $v ): int => (int) $v, $new_ids ) );
-		sort( $normalized_new_ids );
+		$normalized_new_ids = array_values( array_map( static fn( $v ): string => (string) $v, $new_ids ) );
+		sort( $normalized_new_ids, SORT_STRING );
 
 		return $normalized_old_ids === $normalized_new_ids;
 	}

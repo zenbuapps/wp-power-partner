@@ -223,6 +223,20 @@ final class Main
 			$order          = \wc_get_order($order_id);
 			$customer_email = $customer->user_email;
 
+			/**
+			 * Issue #23：站台網址一律先正規化，供「存進 pp_site_url」與「##URL## token」共用。
+			 *
+			 * 回調可能只給裸網域（無 scheme），直接使用會讓 <a href="##URL##"> 渲染成相對連結。
+			 * 兩個用途必須共用同一個值，否則這一封開站信裡的 ##URL## 會與之後每一封
+			 * 生命週期信（讀 pp_site_url）指向不同的字串。
+			 */
+			$callback_site_url = SiteSync::extract_site_url(
+				[
+					'url'    => (string) ( $body_params['FRONTURL'] ?? '' ),
+					'domain' => (string) ( $body_params['DOMAIN'] ?? '' ),
+				]
+			);
+
 			if ($order instanceof \WC_Order) {
 				$customer_email = $order->get_billing_email();
 				$subscriptions  = \wcs_get_subscriptions_for_order($order->get_id());
@@ -239,15 +253,8 @@ final class Main
 					 * 讓監聽者拿到的訂閱狀態是完整的。
 					 *
 					 * 只在尚未寫入時寫，語義與 PowerCloud 分支一致（第一個站先寫、之後不覆蓋）。
+					 * $callback_site_url 已在函式開頭正規化過（與 ##URL## token 共用同一個值）。
 					 */
-					// 用 SiteSync::extract_site_url() 正規化——回調可能只給裸網域（無 scheme），
-					// 直接存進去會讓 <a href="##URL##"> 渲染成相對連結
-					$callback_site_url = SiteSync::extract_site_url(
-						[
-							'url'    => (string) ( $body_params['FRONTURL'] ?? '' ),
-							'domain' => (string) ( $body_params['DOMAIN'] ?? '' ),
-						]
-					);
 					if ( $callback_site_url && '' === (string) $subscription->get_meta( SiteSync::SITE_URL_META_KEY, true ) ) {
 						$subscription->update_meta_data( SiteSync::SITE_URL_META_KEY, $callback_site_url );
 						$subscription->save();
@@ -281,7 +288,8 @@ final class Main
 			$tokens['ADMINURL']                       = $body_params['ADMINURL'] ?? '';
 			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'] ?? '';
 			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'] ?? '';
-			$tokens['URL']                            = $tokens['FRONTURL'] ?: $tokens['DOMAIN']; // issue #23
+			// issue #23：與 pp_site_url 共用同一個已補 scheme 的值，兩者不可分歧
+			$tokens['URL']                            = $callback_site_url ?: ( $tokens['FRONTURL'] ?: $tokens['DOMAIN'] );
 
 			// 回調 payload 不全時留痕：這是 CloudServer 端的問題，但後果會落在終端客戶身上（收不到開通信）
 			$missing_params = [];

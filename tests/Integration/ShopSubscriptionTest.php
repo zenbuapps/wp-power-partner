@@ -366,4 +366,71 @@ class ShopSubscriptionTest extends TestCase {
 		$this->assertFalse( $result, '內容未變更時 update_linked_site_ids 應回傳 false' );
 		$this->assertSame( 0, $fired, '內容未變更時不應 fire hook' );
 	}
+
+	/**
+	 * PowerCloud UUID 換綁時必須被認出是「變更」
+	 *
+	 * is_same_site_ids() 若以 (int) 正規化，所有 UUID 都會變成 0，
+	 * 於是 UUID-A → UUID-B 會被判成無變更：meta 不寫入（綁定靜默遺失）、
+	 * pp_linked_site_ids_updated 也不 fire（issue #22 的補排收不到事件）。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_update_linked_site_ids_UUID換綁應被視為變更(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		$uuid_a = 'a1b2c3d4-1111-4aaa-8bbb-000000000001';
+		$uuid_b = 'a1b2c3d4-2222-4aaa-8bbb-000000000002';
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ $uuid_a ] );
+
+		$fired = 0;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ $uuid_b ] );
+
+		$this->assertTrue( $result, 'UUID 換綁應被視為變更（(int) 正規化會把兩個 UUID 都變成 0）' );
+		$this->assertSame( 1, $fired, 'UUID 換綁應 fire 一次 hook' );
+
+		$ids = array_values( ShopSubscription::get_linked_site_ids( $sub_id ) );
+		$this->assertSame( [ $uuid_b ], $ids, '換綁後應真的寫入新的 UUID' );
+	}
+
+	/**
+	 * 數字 site id 的既有行為不可因為改字串比較而改變
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_update_linked_site_ids_數字id的相同判定行為不變(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ '101', '202' ] );
+
+		// 同一組 id、順序不同、型別不同（int vs string）→ 仍應判定為無變更
+		$this->assertFalse(
+			ShopSubscription::update_linked_site_ids( $sub_id, [ 202, 101 ] ),
+			'數字 id 的順序與型別差異不應被當成變更'
+		);
+
+		// 真的多一個站 → 應判定為變更
+		$this->assertTrue(
+			ShopSubscription::update_linked_site_ids( $sub_id, [ '101', '202', '303' ] ),
+			'新增一個站應被視為變更'
+		);
+	}
 }

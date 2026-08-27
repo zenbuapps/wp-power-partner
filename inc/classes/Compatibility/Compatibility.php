@@ -8,8 +8,8 @@ use J7\PowerPartner\Plugin;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Action;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Status;
 use J7\PowerPartner\Domains\Settings\Core\WatchSettingHooks;
+use J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks;
 use J7\PowerPartner\Product\SiteSync;
-use J7\PowerPartner\ShopSubscription;
 
 /** Class Compatibility 不同版本間的相容性設定 */
 final class Compatibility {
@@ -118,6 +118,25 @@ final class Compatibility {
 	 *    版本不同時會 delete_option(self::OPTION_NAME)，所以 compatibility() 內讀到的
 	 *    $previous_version 永遠是 '0.0.1'，version_compare 區塊每次升版都會跑。
 	 *
+	 * 📌 與上方 `version_compare('3.1.0')` 區塊的關係（刻意保留的重疊）：
+	 *    因為上述的 $previous_version 缺陷，那個區塊事實上每次升版都會執行，
+	 *    其中的 WatchSettingHooks::reschedule_all_subscription_email() 會對所有
+	 *    `_schedule_next_payment > now` 的 active/on-hold/pending-cancel 訂閱
+	 *    fire WATCH_NEXT_PAYMENT hook，而 constructor 的 $mapper 把 next_payment
+	 *    與 watch_next_payment 都綁在該 hook 上——也就是說它已經涵蓋了這裡的目標集合。
+	 *
+	 *    仍然保留本方法，理由有三：
+	 *      1. reschedule_all_subscription_email() 用 'limit' => -1 一次撈完所有訂閱，
+	 *         而它掛在 upgrader_process_complete（同步的 wp-admin request）上；
+	 *         訂閱數千筆的站台會 OOM 或撞 max_execution_time，此時補排整批失效。
+	 *         這裡的 50 筆分批是那條路徑失敗時的安全網。
+	 *      2. 這裡多了 $skip_if_past 保護（見 schedule_email()），不會把
+	 *         「時點已過」的提醒夾成「現在」而立刻寄出。
+	 *      3. 下游是 maybe_unschedule + schedule_single（unique 信淨零成長），
+	 *         重疊執行不會產生重複信件。
+	 *
+	 *    若哪天修好了 $previous_version 的守門缺陷，這裡就可以整段移除。
+	 *
 	 * @return void
 	 */
 	private static function backfill_issue22_subscription_emails(): void {
@@ -156,6 +175,15 @@ final class Compatibility {
 				'subscription_status'    => [ 'active', 'on-hold' ],
 				'subscriptions_per_page' => self::ISSUE22_BACKFILL_BATCH_SIZE,
 				'paged'                  => $page,
+				/**
+				 * 明確指定穩定排序。
+				 *
+				 * WCS 的預設是 start_date DESC，而 offset 分頁在
+				 * 排序鍵有重複值時（批次匯入的訂閱常常同一秒建立）不保證跨頁穩定，
+				 * 會出現同一筆被掃兩次、另一筆從未被掃到。ID 是唯一鍵，不會重複。
+				 */
+				'orderby'                => 'ID',
+				'order'                  => 'ASC',
 				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
 					[
 						'key'     => SiteSync::LINKED_SITE_IDS_META_KEY,
@@ -170,16 +198,36 @@ final class Compatibility {
 			return;
 		}
 
+		$email_hooks = SubscriptionEmailHooks::instance();
+
 		$count = 0;
 		foreach ($subscriptions as $subscription) {
-			$site_ids = ShopSubscription::get_linked_site_ids( (int) $subscription->get_id() );
-			// 傳真實的 site ids，符合 hook 的公開契約（新值 / 舊值）
-			\do_action(
-				ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
-				$subscription,
-				\array_values($site_ids),
-				\array_values($site_ids)
-			);
+			/**
+			 * WCS 的 wcs_get_subscriptions() 是 `$out[$id] = wcs_get_subscription($id)`，
+			 * 後者取不到物件時會塞 false 進來（訂閱在查詢與 hydrate 之間被刪除）。
+			 * 少了這道守衛，->get_id() 會 fatal，而 fatal 會讓這個 ActionScheduler
+			 * action 標記失敗、後續批次全部不再排——整條補排鏈就斷在這裡。
+			 *
+			 * 標成 mixed 是因為 stub 宣告的回傳型別是 WC_Subscription[]，
+			 * PHPStan 會把下面的 instanceof 判成恆真——但實際資料可能是 false。
+			 *
+			 * @var mixed $subscription
+			 */
+			if (! ( $subscription instanceof \WC_Subscription )) {
+				++$count; // 仍要計數，否則這一頁會被誤判為「最後一頁」而中止分批
+				continue;
+			}
+
+			/**
+			 * 直接呼叫補排方法，不 fire pp_linked_site_ids_updated。
+			 *
+			 * 那個 hook 的公開契約是「pp_linked_site_ids 真的變更後」（見
+			 * ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION 與 .claude/CLAUDE.md），
+			 * 而這裡的綁定根本沒有變動。用 $new === $old 假造一次事件，會讓任何
+			 * 依契約寫成「站台剛被掛上/卸下，同步到下游」的第三方監聽者，
+			 * 在外掛升級時對站上每一筆訂閱各收到一次不存在的變更。
+			 */
+			$email_hooks->backfill_subscription_emails($subscription);
 			++$count;
 		}
 

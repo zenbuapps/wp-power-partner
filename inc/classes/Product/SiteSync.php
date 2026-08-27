@@ -70,6 +70,40 @@ final class SiteSync {
 	/** 鎖競爭時延後重試開站的 ActionScheduler hook（issue #24） */
 	const RETRY_AFTER_LOCK_ACTION = 'pp_site_sync_retry_after_lock';
 
+	/**
+	 * 開站通知信最多嘗試幾次（issue #24）
+	 *
+	 * 排程數量與 payload 數量是一對一的（每開一個站排一個 powerhouse_delay_send_email），
+	 * 所以「失敗就原地保留不消費」會把排程額度用光而佇列原地不動——
+	 * 多商品訂單時，頭部那筆若持續失敗，後面的站永遠輪不到（head-of-line blocking）。
+	 * 改為「失敗 → 移到隊尾 + 排一次延後重試」，並以此上限保證重試次數有限。
+	 */
+	const EMAIL_PAYLOAD_MAX_ATTEMPTS = 3;
+
+	/** Payload 內部欄位：已嘗試寄送次數。不是 token，寄信前會被剝掉 */
+	const EMAIL_PAYLOAD_ATTEMPTS_KEY = '_pp_send_attempts';
+
+	/** 開站通知信寄送失敗後的重試間隔（秒） */
+	const EMAIL_RETRY_DELAY = 600;
+
+	/**
+	 * 顯示層遮罩用的敏感 key 關鍵字（不分大小寫子字串比對）
+	 *
+	 * 開站回應的 data 是對端 API 的回應原文，可能把建立請求裡的憑證原樣 echo 回來
+	 * （PowerCloud 的建站請求帶 wordpress.autoInstall.adminPassword）。
+	 * 訂單備註與訂單列表欄位都是經銷商可見、且訂單備註會出現在 WooCommerce 的
+	 * 訂單備註 REST API，明文寫進去等於把客戶站台的後台密碼放在沒有存取控制假設的地方。
+	 *
+	 * 用「key 關鍵字」而不是允許清單：對端欄位會演進，允許清單漏一個就是洩漏，
+	 * 關鍵字漏一個只是多顯示一個非敏感欄位——兩種錯誤的代價不對稱。
+	 *
+	 * ⚠️ 只用於「顯示」。存進 meta 的 data 保持原文，因為 DisableHooks /
+	 *    DisableSiteScheduler 的相容 fallback 要從裡面讀 websiteId。
+	 *
+	 * @var array<string>
+	 */
+	const SENSITIVE_KEY_PATTERNS = [ 'password', 'passwd', 'secret', 'token', 'apikey', 'api_key', 'credential', 'privatekey', 'private_key' ];
+
 	/** Constructor */
 	public function __construct() {
 		\add_action(Action::INITIAL_PAYMENT_COMPLETE->get_action_hook(), [ $this, 'site_sync_by_subscription' ], 1, 2);
@@ -92,8 +126,8 @@ final class SiteSync {
 	 */
 	public function site_sync_by_subscription(\WC_Subscription $subscription, array $args ): void { // phpcs:ignore
 
-		$lock_key      = '';
-		$lock_acquired = false;
+		$lock_key   = '';
+		$lock_value = null;
 
 		try {
 			$order_ids = $subscription->get_related_orders();
@@ -133,11 +167,12 @@ final class SiteSync {
 			 *
 			 * 鎖必須在三道守衛「之後」才取，否則每一次續訂事件都會白搶一次鎖。
 			 */
-			$lock_key      = self::SITE_SYNC_LOCK_PREFIX . $parent_order_id;
-			$lock_acquired = self::acquire_lock($lock_key, self::SITE_SYNC_LOCK_TIMEOUT);
+			$lock_key   = self::SITE_SYNC_LOCK_PREFIX . $parent_order_id;
+			$lock_value = self::acquire_lock($lock_key, self::SITE_SYNC_LOCK_TIMEOUT);
 
-			if (! $lock_acquired) {
-				$locked_at = (int) \get_option($lock_key);
+			if (null === $lock_value) {
+				// 鎖值是 `{timestamp}:{隨機}`，取前半（舊版純時間戳同樣取得到）
+				$locked_at = (int) \explode( ':', (string) \get_option($lock_key) )[0];
 				$note      = \sprintf(
 					'偵測到重複的開站請求：訂單 #%1$d 另一個開站程序仍在進行中（起始於 %2$s），本次略過，未呼叫開站 API',
 					$parent_order_id,
@@ -146,8 +181,9 @@ final class SiteSync {
 				$subscription->add_order_note($note);
 				$parent_order->add_order_note($note);
 				Plugin::logger(
+					// 防護「生效」不是故障：付款事件重送在部分金流是常態，記 error 會淹沒真正的錯誤
 					$note,
-					'error',
+					'warning',
 					[
 						'trigger'         => 'lock',
 						'subscription_id' => $subscription->get_id(),
@@ -225,8 +261,9 @@ final class SiteSync {
 					$subscription->add_order_note($note);
 					$parent_order->add_order_note($note);
 					Plugin::logger(
+						// 同上：冪等旗標擋下重送是預期路徑，不是錯誤
 						$note,
-						'error',
+						'warning',
 						[
 							'trigger'         => 'idempotency',
 							'subscription_id' => $subscription->get_id(),
@@ -356,9 +393,13 @@ final class SiteSync {
 				 * （/websites 端點就會帶 adminPassword），會被寫進經銷商可見、
 				 * 且出現在 WC 訂單備註 REST API 的欄位。
 				 */
+				// 憑證類欄位在寫進訂單備註前一律遮罩（見 SENSITIVE_KEY_PATTERNS）
+				$display_data = self::mask_sensitive($response['data']);
+				$display_data = is_array($display_data) ? $display_data : [];
+
 				if (self::is_successful_status($first_status)) {
 					$note = '';
-					foreach ($response['data'] as $key => $value) {
+					foreach ($display_data as $key => $value) {
 						$note .= $key . ': ' . ( \is_scalar($value) ? (string) $value : (string) \wp_json_encode($value) ) . '<br />';
 					}
 					if ('' === $note) {
@@ -369,7 +410,7 @@ final class SiteSync {
 						'開站失敗，HTTP %1$d，訊息：%2$s，回應：%3$s',
 						$first_status,
 						$response['message'],
-						(string) \wp_json_encode($response['data'])
+						(string) \wp_json_encode($display_data)
 					);
 				}
 
@@ -408,8 +449,8 @@ final class SiteSync {
 			 * finally 也跑不到的只有 fatal error / OOM / process kill——
 			 * 那時靠 SITE_SYNC_LOCK_TIMEOUT 的殘鎖清除機制回收。
 			 */
-			if ($lock_acquired) {
-				self::release_lock($lock_key);
+			if (null !== $lock_value) {
+				self::release_lock($lock_key, $lock_value);
 			}
 		}
 	}
@@ -423,26 +464,37 @@ final class SiteSync {
 	 * 唯一可靠的是 wp_options.option_name 的 UNIQUE index + INSERT IGNORE，
 	 * 也就是 WP_Upgrader::create_lock() 的作法——但該類別只在 wp-admin 載入，前台 request 拿不到。
 	 *
+	 * ⚠️ 回傳的是「我寫進去的那個值」而不是 bool——release_lock() 必須拿它做條件式刪除，
+	 * 　　否則逾時接管之後，原持有者的 finally 會把接管者的鎖刪掉（見 release_lock() 註解）。
+	 *
+	 * 鎖值格式是 `{unix_timestamp}:{隨機字串}`：
+	 *   - 前半供逾時判定（(int) 或 explode 都取得到）
+	 *   - 後半是持有者身分，讓 release_lock() 的條件式刪除能分辨「這是不是我的鎖」。
+	 *     只用時間戳不夠——秒級精度下，接管者寫入的值可能與被接管者完全相同，
+	 *     條件式刪除就會誤判成自己的而刪掉別人的鎖。
+	 *
 	 * @param string $lock_key 鎖的 option name
 	 * @param int    $timeout  殘鎖判定門檻（秒）
-	 * @return bool 是否取得鎖
+	 * @return string|null 取得鎖時回傳寫入的鎖值（`{timestamp}:{隨機}`），沒取得回傳 null
 	 */
-	private static function acquire_lock( string $lock_key, int $timeout ): bool {
+	private static function acquire_lock( string $lock_key, int $timeout ): ?string {
 		global $wpdb;
+
+		$now = \time() . ':' . \wp_generate_password( 12, false );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$inserted = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT IGNORE INTO `{$wpdb->options}` (`option_name`, `option_value`, `autoload`) VALUES (%s, %s, 'no') /* PP SITE SYNC LOCK */",
 				$lock_key,
-				(string) \time()
+				$now
 			)
 		);
 
 		if ($inserted) {
 			// INSERT IGNORE 繞過 WP 的 options cache，不清 notoptions 會讓後續 get_option() 讀到 false
 			\wp_cache_delete('notoptions', 'options');
-			return true;
+			return $now;
 		}
 
 		\wp_cache_delete($lock_key, 'options');
@@ -450,12 +502,14 @@ final class SiteSync {
 		$existing = \get_option($lock_key);
 
 		if (! $existing) {
-			return false;
+			return null;
 		}
 
 		// 鎖還在有效期內 → 真的有另一個開站程序在跑
-		if ( (int) $existing > ( \time() - $timeout )) {
-			return false;
+		// 鎖值是 `{timestamp}:{隨機}`，取前半判定逾時（舊版純時間戳的鎖值同樣取得到）
+		$locked_at = (int) \explode( ':', (string) $existing )[0];
+		if ( $locked_at > ( \time() - $timeout )) {
+			return null;
 		}
 
 		/**
@@ -468,8 +522,6 @@ final class SiteSync {
 		 * 改用條件式 UPDATE：WHERE option_value = 我讀到的那個舊值。
 		 * MySQL 保證只有一個 request 的 UPDATE 會 affect 到 1 row，另一個 affect 0 row。
 		 */
-		$now = (string) \time();
-
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$taken = $wpdb->query(
 			$wpdb->prepare(
@@ -485,29 +537,52 @@ final class SiteSync {
 
 		if (1 !== (int) $taken) {
 			// 另一個 request 搶先接管了這把殘鎖
-			return false;
+			return null;
 		}
 
 		Plugin::logger(
 			"開站鎖 {$lock_key} 已逾時，已原子性接管",
-			'error',
+			'warning',
 			[
 				'lock_key'  => $lock_key,
-				'locked_at' => (int) $existing,
+				'locked_at' => $locked_at,
 			]
 		);
 
-		return true;
+		return $now;
 	}
 
 	/**
 	 * 釋放開站併發鎖
 	 *
-	 * @param string $lock_key 鎖的 option name
+	 * ⚠️ 必須是條件式刪除（DELETE ... WHERE option_value = 我寫進去的那個值），
+	 *    不可用 delete_option()。理由與接管用條件式 UPDATE 的理由是同一個：
+	 *
+	 *    A 於 T0 取得鎖，開站 API 慢（timeout 600 秒，ActionScheduler 下沒有 max_execution_time）
+	 *    跑到 T0+901；B 在 T0+901 判定殘鎖並原子接管（鎖值改成 T0+901）；A 在 T0+905 完成，
+	 *    finally 若無條件 delete_option() 就會把「B 正在持有」的鎖刪掉——保護窗口提前消失，
+	 *    此時抵達的第三個付款重送事件會拿到全新的鎖，而 B 還沒寫下冪等旗標，於是重複開站。
+	 *
+	 *    條件式刪除讓 A 的 DELETE affect 0 row（option_value 已經不是 A 的值），鎖留給 B。
+	 *
+	 * @param string $lock_key   鎖的 option name
+	 * @param string $lock_value acquire_lock() 回傳的鎖值
 	 * @return void
 	 */
-	private static function release_lock( string $lock_key ): void {
-		\delete_option($lock_key);
+	private static function release_lock( string $lock_key, string $lock_value ): void {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM `{$wpdb->options}` WHERE `option_name` = %s AND `option_value` = %s /* PP SITE SYNC LOCK RELEASE */",
+				$lock_key,
+				$lock_value
+			)
+		);
+
+		\wp_cache_delete($lock_key, 'options');
+		\wp_cache_delete('notoptions', 'options');
 	}
 
 	/**
@@ -524,8 +599,36 @@ final class SiteSync {
 	 * @param int $status HTTP status code
 	 * @return bool
 	 */
-	private static function is_successful_status( int $status ): bool {
+	public static function is_successful_status( int $status ): bool {
 		return $status >= 200 && $status < 300;
+	}
+
+	/**
+	 * 顯示前遮罩憑證類欄位（見 SENSITIVE_KEY_PATTERNS）
+	 *
+	 * @param mixed  $value 原始值
+	 * @param string $key   該值所在的 key（頂層呼叫留空）
+	 * @return mixed 遮罩後的值
+	 */
+	public static function mask_sensitive( mixed $value, string $key = '' ) {
+		if ( '' !== $key ) {
+			foreach ( self::SENSITIVE_KEY_PATTERNS as $pattern ) {
+				if ( false !== \stripos( $key, $pattern ) ) {
+					return '***';
+				}
+			}
+		}
+
+		if ( ! is_array( $value ) ) {
+			return $value;
+		}
+
+		$masked = [];
+		foreach ( $value as $k => $v ) {
+			$masked[ $k ] = self::mask_sensitive( $v, (string) $k );
+		}
+
+		return $masked;
 	}
 
 	/**
@@ -715,15 +818,40 @@ final class SiteSync {
 	}
 
 	/**
-	 * 取得第 0 筆開站回應的 data
+	 * 取得「代表這張訂單」的那一筆開站回應 data
+	 *
+	 * 優先序：第一筆 HTTP 2xx 的回應 → 沒有成功的才退回第 0 筆。
+	 *
+	 * 為什麼不是單純的第 0 筆：site_sync_by_subscription() 對 pp_create_site_responses
+	 * 是「與既有紀錄合併」而非覆寫（多商品部分重試時才不會把第一個站的紀錄擠掉），
+	 * 於是「第一次開站失敗（未落冪等旗標）→ 合法重試成功」的訂單，
+	 * meta 會長成 [失敗, 成功]，第 0 筆永遠是那筆失敗的。
+	 * 這個 accessor 同時餵給訂單列表欄位、metabox 與 Token 的 ##URL## fallback，
+	 * 取到失敗那筆會讓後台一直顯示錯誤資訊、經銷商誤以為站沒開成功。
+	 * （master 是無條件覆寫，最新的勝出；改成合併後必須由讀取端補上這個優先序。）
+	 *
+	 * 全部都失敗時仍回第 0 筆——錯誤內容本身是有價值的追查資訊，不該被吞成空陣列。
 	 *
 	 * @param \WC_Order $order 訂單
 	 * @return array<string, mixed> 取不到時回傳空陣列
 	 */
 	public static function get_first_site_response_data( \WC_Order $order ): array {
 		$responses = self::get_create_site_responses( $order );
-		$first     = $responses[0] ?? [];
-		$data      = $first['data'] ?? [];
+
+		foreach ( $responses as $response ) {
+			if ( ! self::is_successful_status( (int) ( $response['status'] ?? 0 ) ) ) {
+				continue;
+			}
+
+			$data = $response['data'] ?? [];
+			if ( is_array( $data ) && $data ) {
+				/** @var array<string, mixed> $data */
+				return $data;
+			}
+		}
+
+		$first = $responses[0] ?? [];
+		$data  = $first['data'] ?? [];
 
 		/** @var array<string, mixed> $result */
 		$result = is_array( $data ) ? $data : [];
@@ -837,35 +965,85 @@ final class SiteSync {
 			return;
 		}
 
-		/** @var array<string, string> $payload */
-		$payload = $queue[0];
-
-		[ $success_emails, $failed_emails ] = EmailService::send_mail($to, $payload);
-
 		/**
-		 * 寄送失敗時「不」消費佇列（issue #21 與 #24 的交互作用）。
+		 * 先把頭部取出來，佇列一定會前進。
 		 *
-		 * 原因：send_mail() 除了 wp_mail 本身失敗，還會在關鍵站台變數缺失時「主動中止寄送」
-		 * （issue #21 的防呆）。而這份 payload 是 wp_admin_password 唯一的存放處——
-		 * 一旦 array_shift 後刪掉 meta，密碼就永久遺失，沒有任何補寄路徑。
-		 * 保留 payload，讓管理員修正模板或設定後還能重試。
+		 * 舊版是「失敗就原地 return 不消費」，用意是保住 payload（它是 wp_admin_password
+		 * 唯一的存放處，刪掉就永久遺失）。但排程與 payload 是一對一的，原地不動等於
+		 * 把排程額度燒掉而佇列沒動——多商品訂單時，頭部持續失敗會讓後面的站一起卡死，
+		 * 而且沒有任何機制會再回來讀這份 meta。
+		 *
+		 * 現在改成：失敗 → 計數 +1、payload 移到隊尾、排一次延後重試；
+		 * 連續失敗達 EMAIL_PAYLOAD_MAX_ATTEMPTS 次才真的丟棄（並記 critical）。
+		 * 保住 payload 的原意仍在，只是有了明確的終止條件與後續路徑。
 		 */
-		if ($failed_emails) {
-			Plugin::logger(
-				"訂閱 #{$subscription->get_id()} 開站通知信未成功寄出，保留 email_payloads_tmp 以便補寄",
-				'error',
-				[
-					'to'             => $to,
-					'failed_emails'  => $failed_emails,
-					'success_emails' => $success_emails,
-					'queue_size'     => count($queue),
-				],
-				5
-			);
-			return;
-		}
+		/** @var array<string, mixed> $payload */
+		$payload  = (array) \array_shift($queue);
+		$attempts = (int) ( $payload[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] ?? 0 );
 
-		\array_shift($queue);
+		// 內部計數欄位不是 token，寄信前剝掉，免得被當成 ##_PP_SEND_ATTEMPTS## 處理
+		$tokens = $payload;
+		unset( $tokens[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] );
+
+		/** @var array<string, string> $tokens */
+		[ $success_emails, $failed_emails ] = EmailService::send_mail($to, $tokens);
+
+		if ($failed_emails) {
+			++$attempts;
+
+			if ($attempts < self::EMAIL_PAYLOAD_MAX_ATTEMPTS) {
+				// 放回隊尾，讓同一訂閱的其他站先寄出去
+				$payload[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] = $attempts;
+				$queue[] = $payload;
+
+				\as_schedule_single_action(
+					\time() + self::EMAIL_RETRY_DELAY,
+					'powerhouse_delay_send_email',
+					[
+						'to'              => $to,
+						'subscription_id' => $subscription->get_id(),
+					]
+				);
+
+				Plugin::logger(
+					"訂閱 #{$subscription->get_id()} 開站通知信未成功寄出（第 {$attempts} 次），已移到佇列尾端並排定重試",
+					'error',
+					[
+						'to'             => $to,
+						'attempts'       => $attempts,
+						'failed_emails'  => $failed_emails,
+						'success_emails' => $success_emails,
+						'queue_size'     => count($queue),
+					],
+					5
+				);
+			} else {
+				/**
+				 * 達到上限才丟棄。這裡是唯一會讓 wp_admin_password 消失的路徑，
+				 * 所以記 critical——經銷商需要知道有客戶沒收到帳密，得手動用
+				 * POST /send-site-credentials-email 補寄。
+				 */
+				Plugin::logger(
+					"訂閱 #{$subscription->get_id()} 開站通知信連續 {$attempts} 次未寄出，已放棄此筆（避免卡住佇列後方的站），請手動補寄帳密",
+					'critical',
+					[
+						'to'            => $to,
+						'attempts'      => $attempts,
+						'failed_emails' => $failed_emails,
+						'queue_size'    => count($queue),
+					],
+					5
+				);
+
+				$subscription->add_order_note(
+					\sprintf(
+						'開站通知信連續 %1$d 次寄送失敗，系統已停止重試。請確認信件模板與寄信設定後，於後台手動補寄帳密給 %2$s',
+						$attempts,
+						$to
+					)
+				);
+			}
+		}
 
 		if ($queue) {
 			// 同一訂閱還有其他站的帳密沒寄，留給下一個排程
