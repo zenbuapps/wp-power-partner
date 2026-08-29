@@ -327,61 +327,58 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | user 為 null     | 回應沒有帶 user 物件      |
         | user 缺 dealerId | 有 user 但少了 dealerId  |
 
-  Rule: 錯誤處理 - 任何異常一律告警：寫 error log + 寄信給服務商
-    # 本功能全域適用，以下每一條「記錄 error log」的 Rule 都同時寄出告警信。
+  Rule: 錯誤處理 - 任何異常一律只寫 error log，不得寄信給任何人
+    # 本功能全域適用，以下每一條「記錄 error log」的 Rule 都依此辦理。
+    # 「任何人」= 經銷商（站台 admin_email）與服務商信箱兩者皆不寄。
     #
-    # ## 收件人是服務商，不是站台 admin_email（重要，勿改回去）
-    # 站台 admin_email 是經銷商，而這裡每一種原因的處置 —— 進後台改設定、查兩端契約、
-    # 聯絡接收端管理員 —— 都是服務商這邊要做的事。寄給經銷商只會讓他收到看不懂也修不了
-    # 的信；由服務商集中收，才有人真的會處理。收件人可用 filter 覆寫。
+    # ## 為什麼不寄給經銷商（重要，勿改回去）
+    # 收信人（站台 admin_email）是經銷商，而這裡每一種原因的處置 —— 進後台改設定、
+    # 找開發者、聯絡接收端管理員 —— 都不是收一封信就能解決的事。
+    # 本外掛又是「裝了就無條件註冊排程」，不問有沒有連結過帳號：模板站與由它 clone
+    # 出來的終端客戶站全都會照跑，照寄的話每天一封，而這類站根本不是運作中的經銷商站、
+    # 沒有任何錢會漏 —— 噪音會把真正該被看見的告警一起淹掉。
     #
-    # ## 一封信要回答兩個問題
-    # 「是誰」：網域（主旨與內文都要，收件匣同時收得到所有經銷商站的告警，主旨全都一樣時
-    #   分不出是哪一台、也搜尋不到；站名 blogname 不能當識別 —— 沒改過站名的站全叫
-    #   「我的網站」）、站台名稱、前後台連結、站台管理員（名稱 + email，才知道要找誰）、
-    #   partner_id、已綁定 dealer_id（與接收端對帳時要報的兩個號碼）。
-    # 「什麼問題」：業務日期、原因代碼、處置說明。
-    # 內文分成「① 哪一台站 / ② 發生什麼事 / ③ 未送出的計費」三個區塊，
-    # 分別對應「找誰」「怎麼修」「急不急」。
+    # ## 為什麼也不寄給服務商（重要，勿改回去）
+    # 曾經改寄服務商信箱（info@morepower.club，v3.5.1 加入），隨即一併移除：換個收件人並沒有
+    # 換掉問題 —— 處置一樣是回站上翻 log、對兩端契約，信只是把同一份資訊多送一份到
+    # 收件匣。兩種收件人都試過、都移除了；要再加回寄信前，先回答「收信人拿到信之後，
+    # 會做什麼是光看 log 做不到的」。
+    # 異常改由 error log 與接收端的 stale 資料發現。
     #
-    # 金額與站數只在算得出來時才顯示 —— 前置中止發生在抓網站清單之前，硬填 0 會讓
-    # 收信人以為「今天本來就沒錢可收」。
-    #
-    # log 同時寫一份，帶結構化 context：站台網址、partner_id、已綁定 dealer_id、
-    # 業務日、原因代碼（信可能被擋、被誤刪，log 是留在站上的那一份）。
+    # log 一律帶結構化 context：站台網址、partner_id、已綁定 dealer_id、業務日、原因代碼。
+    # partner_id 與 dealer_id 是與接收端對帳時要報的兩個號碼，缺了就得再回站上查一次。
+    # 金額與站數只在算得出來時才帶 —— 前置中止發生在抓網站清單之前，硬填 0 會讓讀 log
+    # 的人以為「今天本來就沒錢可收」。
 
-    Example: 中止路徑同時寫 log 與寄信
+    Example: 任何中止路徑都不寄信
       Given 中止原因為 "no_api_key"
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
-      And 寄出告警信給服務商信箱
-      And 沒有寄給站台 admin_email
+      And 沒有寄出任何通知信
 
-  Rule: 錯誤處理 - 設定類的中止路徑一律告警
-    # 這些路徑不會自行復原、也不進重試流程，漏推一天等於少收一天錢，必須有人看得見。
+  Rule: 錯誤處理 - 設定類的中止路徑一律寫 error log
+    # 這些路徑不會自行復原、也不進重試流程，漏推一天等於少收一天錢，必須留得下痕跡。
     # 其中 no_api_key 最嚴重：排程情境沒有登入者，只讀得到全域 key，
     # 因此「只存了舊版 per-user key」的站台從第一天起就永遠中止。
 
-    Scenario Outline: 中止原因與告警內容
+    Scenario Outline: 中止原因與 log 內容
       Given 中止原因為 "<reason>"
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
-      And 寄出告警信給服務商信箱
-      And 告警內容含 "<關鍵字>"
+      And error log 內容含 "<關鍵字>"
 
-      Examples: 須告警的設定類中止路徑
+      Examples: 須寫告警 log 的設定類中止路徑
         | reason              | 關鍵字     | 說明                                       |
         | no_api_key          | 新架構權限   | 請到「新架構權限」tab 重新認證以寫入全域 key       |
         | no_dealer_id        | dealer_id  | 疑似 /websites 回應欄位改版                  |
         | multiple_dealer_ids | 權限        | API key 權限範圍異常，權限模型可能已變更          |
 
   Rule: 錯誤處理 - partner_id 未設定時不走告警路徑
-    # 上一條 Rule 的例外：連 raise_alert() 都不呼叫，只留原地的 error log。
+    # 上一條 Rule 的例外：連 log_alert() 都不呼叫，只留原地的 error log。
     # partner_id 只在後台按下「連結帳號」時才寫入，因此「裝了外掛但從未連結」的站
-    # （含模板站與由它 clone 出來的終端客戶站）每天都會走到這裡。告警信全部集中寄到
-    # 同一個信箱，這條路徑照寄的話量最大，而這類站沒有任何錢會漏 —— 收件匣會被它淹掉。
+    # 每天都會走到這裡 —— 這類站沒有任何錢會漏，不值得多一筆帶完整 context 的告警。
     # 真經銷商若尚未連結，人就在後台，介面上直接看得到連結表單。
 
     Example: partner_id 未設定時只留原地 log
@@ -389,9 +386,9 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
-      And 沒有寄出任何告警信
+      And 沒有寄出任何通知信
 
-  Rule: 錯誤處理 - dealer_id 與本地綁定值不符時中止推送並告警
+  Rule: 錯誤處理 - dealer_id 與本地綁定值不符時中止推送並寫 error log
     # 代表 PowerCloud 帳號被換，或本地狀態異常。接收端同樣不會自動換綁，
     # 硬推只會被拒絕，因此直接中止；也不得以新值覆寫本地綁定
 
@@ -401,11 +398,10 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
-      And 寄出告警信給服務商信箱
       And 系統沒有排程下次重試
       And option "power_partner_billing_dealer_id" 仍為 "00000000-old0-old0-old0-000000000000"
 
-  Rule: 錯誤處理 - 永久性錯誤一律立即告警，不進入一般重試
+  Rule: 錯誤處理 - 永久性錯誤一律立即寫 error log，不進入一般重試
     # 判定依據是接收端回應 body 的 data.error_code，**不是 message 文案**。
     #
     # ## 為什麼不比對文案（重要，勿改回去）
@@ -424,8 +420,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       Given CloudServer 回應 HTTP <status> 且 data.error_code 為 "<error_code>"
       When 排程觸發計費推送
       Then 記錄 error log
-      And 寄出告警信給服務商信箱
-      And 告警內容含錯誤代碼 "<error_code>"
+      And error log 內容含錯誤代碼 "<error_code>"
       And 系統沒有排程下次重試
 
       Examples: 接收端定義的永久性錯誤
@@ -472,18 +467,17 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | 0       | 排程 30 分鐘後重試      | 首次失敗，第 1 次重試     |
         | 1       | 排程 30 分鐘後重試      | 第 2 次重試              |
         | 2       | 排程 30 分鐘後重試      | 第 3 次重試              |
-        | 3       | 不再重試並告警          | 已達上限                 |
+        | 3       | 不再重試並寫 error log  | 已達上限                 |
 
-  Rule: 錯誤處理 - 重試次數達上限仍失敗時，告警並停止重試
-    # 漏推一天等於少收一天錢，必須有人看得見
+  Rule: 錯誤處理 - 重試次數達上限仍失敗時，寫 error log 並停止重試
+    # 漏推一天等於少收一天錢，必須留得下痕跡
 
-    Example: 第 3 次重試仍失敗時告警
+    Example: 第 3 次重試仍失敗時寫 error log
       Given 已重試 3 次
       And CloudServer 回應 HTTP 500
       When 排程觸發計費推送
       Then 記錄 error log
-      And 寄出告警信給服務商信箱
-      And 告警帶未送出的站數與金額
+      And error log 帶未送出的站數與金額
       And 系統沒有排程下次重試
 
   Rule: 錯誤處理 - 網站的 dailyCost 缺值或非數值時，該站以 0 計並寫 warning log
@@ -603,7 +597,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       Then 系統沒有推送至 CloudServer
       And 記錄告警 log
 
-  Rule: 邊界條件 - 可計費網站解析不出擁有者（經銷商 id）時視為異常，中止推送並告警
+  Rule: 邊界條件 - 可計費網站解析不出擁有者（經銷商 id）時視為異常，中止推送並寫 error log
     # 這是上一條多租戶守衛的旁路：相異 dealerId 集合刻意略過解析不出 id 的站，
     # 而計費清單完全不看 dealerId。因此當 API key 權限範圍意外放大（正是守衛要防的事）、
     # 且多出來的站 user 為 null（或缺 dealerId）時，相異 id 集合仍只有一個 → 守衛不觸發 →
@@ -622,7 +616,6 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       When 排程觸發計費推送
       Then 系統沒有推送至 CloudServer
       And 記錄 error log
-      And 寄出告警信給服務商信箱
 
       Examples: 兩種形狀（頂層 userId 仍存在，證明它不是識別值）
         | 缺 dealerId 的形狀 |
@@ -657,7 +650,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       Then 系統推送至 CloudServer
       And 推送清單的總金額為 0.00
 
-  Rule: 邊界條件 - 清單非空卻篩不出任何可計費網站時，視為異常並告警
+  Rule: 邊界條件 - 清單非空卻篩不出任何可計費網站時，視為異常並寫 error log
     # 仍照上一條規則推送（那是刻意的），但必須留下訊號。
     # 接收端對空 sites 不特判：total = 0 照樣寫入帶冪等標記的點數紀錄 ——
     # 該 (partner_id, billing_date) 的冪等鍵就此消耗，當天之後任何正確推送都只會得到
@@ -668,7 +661,7 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
     #
     # 與「網站清單為空時仍需推送空 sites」不衝突，兩者互補，用清單筆數區分：
     #   清單筆數 = 0                → 照常推送空 sites（正常情況：經銷商真的沒站了）
-    #   清單筆數 > 0 且可計費數 = 0  → 異常（狀態字典改版）：告警，仍照常推送
+    #   清單筆數 > 0 且可計費數 = 0  → 異常（狀態字典改版）：寫 error 告警 log，仍照常推送
 
     Example: 全部狀態都不認得時提升為 error
       Given PowerCloud 回應以下網站：
@@ -679,7 +672,6 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       Then 系統推送至 CloudServer
       And 推送清單的總金額為 0.00
       And 記錄 error log，內容含出現過的相異 status "Running" 與 "restarting"
-      And 寄出告警信給服務商信箱
 
     Example: 至少有一個可計費網站時不得誤報
       Given PowerCloud 回應以下網站：
@@ -687,4 +679,4 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | a.wpsite.pro | running | 10.50     | 181f2bbe-…   |
         | b.wpsite.pro | stopped | 20.00     | 181f2bbe-…   |
       When 排程觸發計費推送
-      Then 系統沒有寫出 no_billable_site 告警
+      Then 系統沒有寫出 no_billable_site 告警 log
