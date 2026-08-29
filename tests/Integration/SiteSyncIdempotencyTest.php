@@ -1040,4 +1040,536 @@ class SiteSyncIdempotencyTest extends TestCase {
 		$notes = implode( "\n", $this->get_order_notes( $subscription_id ) );
 		$this->assertStringContainsString( '停止重試', $notes, '放棄時應留下訂單備註，讓經銷商知道要手動補寄' );
 	}
+
+	// ========== branch review 修正 ==========
+
+	/**
+	 * 計算某訂閱的 pending 鎖競爭重試排程數
+	 *
+	 * @param int $subscription_id 訂閱 ID
+	 * @return int
+	 */
+	private function count_retry_actions( int $subscription_id ): int {
+		$matched = 0;
+		foreach ( \as_get_scheduled_actions(
+			[
+				'hook'     => SiteSync::RETRY_AFTER_LOCK_ACTION,
+				'status'   => \ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 100,
+			]
+		) as $action ) {
+			$args = $action->get_args();
+			if ( (int) ( $args['subscription_id'] ?? 0 ) === $subscription_id ) {
+				++$matched;
+			}
+		}
+		return $matched;
+	}
+
+	/**
+	 * 設定 site_sync 信件模板並重建 singleton
+	 *
+	 * @param array<int, array<string, mixed>> $configs 模板設定
+	 * @return void
+	 */
+	private function setup_site_sync_emails( array $configs ): void {
+		$this->setup_settings_with_emails( $configs );
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+	}
+
+	/**
+	 * 不同訂閱同時撞鎖時，必須各自排到重試
+	 *
+	 * ActionScheduler 的 $unique 判斷（ActionScheduler_DBStore::build_where_clause_for_insert）
+	 * 只比對 hook 與 group_id，args 完全不進 WHERE。group 留空即 group_id = 0，
+	 * 用它去重等於「全站只允許一個 pp_site_sync_retry_after_lock」——
+	 * 訂閱 A 等重試的這 960 秒內，訂閱 B 的重試會被靜默丟棄（as_schedule_single_action 回 0，
+	 * 而回傳值沒有任何人檢查），B 的客戶付了錢永遠沒有站。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_不同訂閱同時撞鎖時應各自排到重試(): void {
+		$this->skip_if_no_subscriptions();
+
+		$sub_a = $this->create_subscription();
+		$sub_b = $this->create_subscription();
+
+		\add_option( SiteSync::SITE_SYNC_LOCK_PREFIX . $sub_a->get_parent_id(), (string) time(), '', false );
+		\add_option( SiteSync::SITE_SYNC_LOCK_PREFIX . $sub_b->get_parent_id(), (string) time(), '', false );
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-multi' ] ) );
+
+		$site_sync = new SiteSync();
+		$site_sync->site_sync_by_subscription( $sub_a, [] );
+		$site_sync->site_sync_by_subscription( $sub_b, [] );
+
+		$this->assertSame( 1, $this->count_retry_actions( $sub_a->get_id() ), 'A 應排到重試' );
+		$this->assertSame(
+			1,
+			$this->count_retry_actions( $sub_b->get_id() ),
+			'B 也必須排到重試——去重若用 AS 的 $unique（只看 hook + group_id），B 會被 A 擋掉而永遠不開站'
+		);
+	}
+
+	/**
+	 * 同一訂閱重複撞鎖時仍然只排一次重試
+	 *
+	 * 去重從 $unique 換成 as_has_scheduled_action() 之後，這條原本的保證不可退化。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_同一訂閱重複撞鎖仍只排一次重試(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+		\add_option( SiteSync::SITE_SYNC_LOCK_PREFIX . $subscription->get_parent_id(), (string) time(), '', false );
+
+		$this->mock_http( 201, (string) \wp_json_encode( [ 'websiteId' => 'ws-dup' ] ) );
+
+		$site_sync = new SiteSync();
+		$site_sync->site_sync_by_subscription( $subscription, [] );
+		$this->replay_payment_complete( $subscription->get_id() );
+
+		$this->assertSame(
+			1,
+			$this->count_retry_actions( $subscription->get_id() ),
+			'同一訂閱多次撞鎖只該堆出一個重試'
+		);
+	}
+
+	/**
+	 * 開站回應 2xx 但缺 websiteId 時，必須留下可追查的告警
+	 *
+	 * 綁定站台比「HTTP 2xx」多一個條件：回應要真的帶回 websiteId。
+	 * 缺了它 pp_linked_site_ids 是空的 → is_site_sync() 為 false →
+	 * 停用/恢復、所有生命週期信、issue #22 補排全部靜默失效，
+	 * 而冪等旗標仍會落下（刻意的：放行重試會讓 PowerCloud 再建一個站，計費不可逆）。
+	 * 唯一能讓這件事被發現的就是這則告警。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_開站回應缺websiteId時應留下可追查的告警(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription();
+
+		// 201 但 body 沒有 websiteId：對端契約異動、body 被截斷、或非同步受理都會長這樣
+		$this->mock_http( 201, '{}' );
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		$this->assertEmpty(
+			ShopSubscription::get_linked_site_ids( $subscription->get_id() ),
+			'前置條件：沒有 websiteId 就綁不了站'
+		);
+
+		$notes = implode( "\n", $this->get_order_notes( $subscription->get_id() ) );
+		$this->assertStringContainsString(
+			'websiteId',
+			$notes,
+			'綁不了站必須寫訂單備註——否則這個訂閱的停用/恢復與生命週期信全部失效，卻沒有任何人會知道'
+		);
+
+		$order = \wc_get_order( $subscription->get_parent_id() );
+		$this->assertInstanceOf( \WC_Order::class, $order );
+		$items = $order->get_items();
+		$item  = reset( $items );
+		$this->assertNotFalse( $item );
+		$this->assertNotEmpty(
+			$item->get_meta( SiteSync::SITE_SYNC_DONE_META_KEY, true ),
+			'冪等旗標仍要落下：放行重試會讓 PowerCloud 再建一個站，計費與客戶困惑都不可逆'
+		);
+	}
+
+	/**
+	 * 寄信拋出例外時，佇列仍要前進並排定重試
+	 *
+	 * payload 已被 array_shift 取出，但佇列新狀態要等函式尾端的 save() 才落地。
+	 * 例外若不接住，meta 不會改寫、不會排重試，而這個 powerhouse_delay_send_email
+	 * 排程已經被消耗掉——排程數與 payload 數是一對一的，雙站訂單會因此剩下一份
+	 * 沒有排程會去讀的 payload，而那是明文 wp_admin_password 唯一的存放處。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_寄信拋出例外時佇列仍要前進並排定重試(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_site_sync_emails(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>前台：##FRONTURL##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://boom.wpsite.pro',
+					'ADMINURL'     => 'https://boom.wpsite.pro/wp-admin',
+					'SITEUSERNAME' => 'u1',
+					'SITEPASSWORD' => 'pw-1',
+				],
+			]
+		);
+		$subscription->save();
+
+		// 寄信外掛自己 throw 是真實情境
+		$thrower = static function () {
+			throw new \RuntimeException( 'mail plugin exploded' );
+		};
+		\add_filter( 'pre_wp_mail', $thrower, 10, 1 );
+
+		( new SiteSync() )->send_email( 'site@example.com', $subscription_id );
+
+		\remove_filter( 'pre_wp_mail', $thrower, 10 );
+
+		$fresh = \wcs_get_subscription( $subscription_id );
+		$this->assertInstanceOf( \WC_Subscription::class, $fresh );
+		$queue = $fresh->get_meta( 'email_payloads_tmp' );
+		$this->assertIsArray( $queue );
+		$this->assertCount( 1, $queue, '例外不可讓 payload 消失，也不可讓佇列停在原地' );
+		$this->assertSame(
+			1,
+			(int) ( $queue[0][ SiteSync::EMAIL_PAYLOAD_ATTEMPTS_KEY ] ?? 0 ),
+			'例外要與 wp_mail 回 false 走同一條計數路徑'
+		);
+		$this->assertTrue(
+			\as_has_scheduled_action(
+				'powerhouse_delay_send_email',
+				[
+					'to'              => 'site@example.com',
+					'subscription_id' => $subscription_id,
+				]
+			),
+			'例外後必須補一個排程，否則這份 payload 再也沒有人會去讀'
+		);
+	}
+
+	/**
+	 * 重試時不可重寄「上一輪已寄達」的模板
+	 *
+	 * payload 是整份重排的，站台設兩個以上 site_sync 模板時（A 寄達、B 失敗），
+	 * 沒有跳過機制就會在每次重試把 A 再寄給客戶一次，
+	 * 最多讓客戶收到 EMAIL_PAYLOAD_MAX_ATTEMPTS 封內容相同的帳密信。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_重試時不可重寄已寄達的模板(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_site_sync_emails(
+			[
+				// A：不用站台變數 → 防呆不會擋，會真的寄出去
+				$this->make_email_config(
+					[
+						'key'         => 'tpl_a_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>歡迎光臨 MARKER-A</p>',
+						'enabled'     => '1',
+					]
+				),
+				// B：用到 payload 給不出的 SITEPASSWORD → 被防呆擋下 → 整份 payload 重排
+				$this->make_email_config(
+					[
+						'key'         => 'tpl_b_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://partial.wpsite.pro',
+					'SITEPASSWORD' => '',
+				],
+			]
+		);
+		$subscription->save();
+
+		$bodies   = [];
+		$recorder = static function ( $return, $atts ) use ( &$bodies ) {
+			$bodies[] = (string) ( $atts['message'] ?? '' );
+			return true;
+		};
+		\add_filter( 'pre_wp_mail', $recorder, 10, 2 );
+
+		$site_sync = new SiteSync();
+		$site_sync->send_email( 'site@example.com', $subscription_id );  // 第 1 輪：A 寄達、B 被擋
+		$after_first = count( array_filter( $bodies, static fn( $b ) => str_contains( $b, 'MARKER-A' ) ) );
+
+		$site_sync->send_email( 'site@example.com', $subscription_id );  // 第 2 輪：重試
+		$after_second = count( array_filter( $bodies, static fn( $b ) => str_contains( $b, 'MARKER-A' ) ) );
+
+		\remove_filter( 'pre_wp_mail', $recorder, 10 );
+
+		$this->assertSame( 1, $after_first, '第一輪 A 應寄出' );
+		$this->assertSame(
+			1,
+			$after_second,
+			'重試不可再寄一次 A——payload 是整份重排的，客戶會收到重複的帳密信'
+		);
+	}
+
+	/**
+	 * 防呆中止的重試不可重複寄告警給經銷商
+	 *
+	 * 防呆中止是確定性的：payload 的 tokens 每輪都一樣，必然再次全擋。
+	 * 不去重的話同一件事會寄出 EMAIL_PAYLOAD_MAX_ATTEMPTS 封相同告警，
+	 * 把經銷商真正需要看的那一封淹掉。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_防呆重試時不可重複寄告警給經銷商(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_site_sync_emails(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'body'        => '<p>密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$subscription    = $this->create_subscription();
+		$subscription_id = $subscription->get_id();
+		$subscription->update_meta_data(
+			'email_payloads_tmp',
+			[
+				[
+					'FRONTURL'     => 'https://alert.wpsite.pro',
+					'SITEPASSWORD' => '',
+				],
+			]
+		);
+		$subscription->save();
+
+		$admin_email = (string) \get_option( 'admin_email' );
+		$recipients  = [];
+		$recorder    = static function ( $return, $atts ) use ( &$recipients ) {
+			$to           = $atts['to'] ?? '';
+			$recipients[] = is_array( $to ) ? implode( ',', $to ) : (string) $to;
+			return true;
+		};
+		\add_filter( 'pre_wp_mail', $recorder, 10, 2 );
+
+		$site_sync = new SiteSync();
+		for ( $i = 0; $i < SiteSync::EMAIL_PAYLOAD_MAX_ATTEMPTS; $i++ ) {
+			$site_sync->send_email( 'site@example.com', $subscription_id );
+		}
+
+		\remove_filter( 'pre_wp_mail', $recorder, 10 );
+
+		$alerts = count( array_filter( $recipients, static fn( $r ) => $r === $admin_email ) );
+		$this->assertSame(
+			1,
+			$alerts,
+			'告警只該在第一次發——重試必然被同樣擋下，重複告警會把真正要看的那一封淹掉'
+		);
+	}
+
+	/**
+	 * WPCD 回調的第二個站不可擠掉第一個站
+	 *
+	 * update_linked_site_ids() 收到的陣列就是綁定的完整清單。傳 [$new_site_id]
+	 * 等於宣告「這個訂閱只有這一個站」，一張訂單兩個商品各開一站時，
+	 * 第二次回調會把站 1 的 id 擠掉：站 1 從此不會被停用/恢復，
+	 * 而 pp_site_url 是「第一個站先寫、之後不覆蓋」，於是 ##URL## 指向站 1、綁定卻只剩站 2。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_WPCD回調第二個站不可擠掉第一個站(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription( 1, 'wpcd' );
+		$order        = \wc_get_order( $subscription->get_parent_id() );
+		$this->assertInstanceOf( \WC_Order::class, $order );
+
+		$customer_id = $order->get_customer_id();
+
+		$callback = static function ( int $customer_id, int $order_id, string $site_id, string $domain ) {
+			$request = new \WP_REST_Request( 'POST', '/power-partner/customer-notification' );
+			$request->set_header( 'Content-Type', 'application/json' );
+			$request->set_body(
+				(string) \wp_json_encode(
+					[
+						'CUSTOMER_ID'   => $customer_id,
+						'REF_ORDER_ID'  => $order_id,
+						'NEW_SITE_ID'   => $site_id,
+						'DOMAIN'        => $domain,
+						'FRONTURL'      => 'https://' . $domain,
+						'ADMINURL'      => 'https://' . $domain . '/wp-admin',
+						'SITEUSERNAME'  => 'admin',
+						'SITEPASSWORD'  => 'pw',
+						'IPV4'          => '1.2.3.4',
+					]
+				)
+			);
+			Main::instance()->post_customer_notification_callback( $request );
+		};
+
+		$callback( $customer_id, $order->get_id(), '101', 'site-1.example.com' );
+		$callback( $customer_id, $order->get_id(), '202', 'site-2.example.com' );
+
+		$linked = array_values( ShopSubscription::get_linked_site_ids( $subscription->get_id() ) );
+		sort( $linked, SORT_STRING );
+
+		$this->assertSame(
+			[ '101', '202' ],
+			$linked,
+			'第二個站要附加而不是覆寫——被擠掉的站從此不會被停用/恢復，錢卻照扣'
+		);
+	}
+
+	/**
+	 * 同一個 site id 重送回調不可長出重複列
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_WPCD回調重送同一個站不重複綁定(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_subscription( 1, 'wpcd' );
+		$order        = \wc_get_order( $subscription->get_parent_id() );
+		$this->assertInstanceOf( \WC_Order::class, $order );
+
+		for ( $i = 0; $i < 2; $i++ ) {
+			$request = new \WP_REST_Request( 'POST', '/power-partner/customer-notification' );
+			$request->set_header( 'Content-Type', 'application/json' );
+			$request->set_body(
+				(string) \wp_json_encode(
+					[
+						'CUSTOMER_ID'  => $order->get_customer_id(),
+						'REF_ORDER_ID' => $order->get_id(),
+						'NEW_SITE_ID'  => '303',
+						'DOMAIN'       => 'dup.example.com',
+						'FRONTURL'     => 'https://dup.example.com',
+						'ADMINURL'     => 'https://dup.example.com/wp-admin',
+						'SITEUSERNAME' => 'admin',
+						'SITEPASSWORD' => 'pw',
+					]
+				)
+			);
+			Main::instance()->post_customer_notification_callback( $request );
+		}
+
+		$this->assertSame(
+			[ '303' ],
+			array_values( ShopSubscription::get_linked_site_ids( $subscription->get_id() ) ),
+			'CloudServer 重送同一個 site id 不該長出重複列'
+		);
+	}
+
+	/**
+	 * 開站回應寫進 log 時不可留下明文憑證
+	 *
+	 * 訂單備註、訂單列表欄位、metabox 三處都已經過 mask_sensitive()，
+	 * 但 plugin log 也是經銷商看得到的顯示層（Query Monitor / log 檢視器），
+	 * 而且那則是 info 等級——最不會被清掉的一份。
+	 * 對照常見陷阱 12：API key 禁止 raw 落地 log，同一個原則。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_開站回應寫進log時不可留下明文憑證(): void {
+		$this->skip_if_no_subscriptions();
+
+		CapturingLogHandler::$entries = [];
+		$capture                      = static fn() => [ new CapturingLogHandler() ];
+		\add_filter( 'woocommerce_register_log_handlers', $capture, 10, 1 );
+
+		$subscription = $this->create_subscription();
+		$this->mock_http(
+			201,
+			(string) \wp_json_encode(
+				[
+					'websiteId' => 'ws-log-mask',
+					'wordpress' => [
+						'autoInstall' => [
+							'adminUser'     => 'admin',
+							'adminPassword' => 'SuperSecret123',
+						],
+					],
+				]
+			)
+		);
+
+		( new SiteSync() )->site_sync_by_subscription( $subscription, [] );
+
+		\remove_filter( 'woocommerce_register_log_handlers', $capture, 10 );
+
+		$dump = (string) \wp_json_encode( CapturingLogHandler::$entries );
+
+		$this->assertStringContainsString(
+			'ws-log-mask',
+			$dump,
+			'前置條件：開站回應必須真的有寫進 log，否則下面的斷言是空的'
+		);
+		$this->assertStringNotContainsString(
+			'SuperSecret123',
+			$dump,
+			'log 也是顯示層——明文密碼落地等於留下唯一一份沒有存取控制假設的副本'
+		);
+	}
+}
+
+/**
+ * 測試用的 WC log handler：把每一則 log 收進靜態陣列供斷言
+ *
+ * WC::logger() 內部是 `new \WC_Logger()`（不帶 handlers），
+ * 因此每次呼叫都會重跑 woocommerce_register_log_handlers filter。
+ */
+class CapturingLogHandler implements \WC_Log_Handler_Interface {
+
+	/** @var array<int, array{level: string, message: string, context: array<string, mixed>}> */
+	public static array $entries = [];
+
+	/**
+	 * Handle a log entry.
+	 *
+	 * @param int                  $timestamp Log timestamp.
+	 * @param string               $level     Log level.
+	 * @param string               $message   Log message.
+	 * @param array<string, mixed> $context   Additional information.
+	 * @return bool
+	 */
+	public function handle( $timestamp, $level, $message, $context ) {
+		self::$entries[] = [
+			'level'   => (string) $level,
+			'message' => (string) $message,
+			'context' => (array) $context,
+		];
+		return true;
+	}
 }

@@ -1623,4 +1623,138 @@ class SubscriptionEmailHooksTest extends TestCase {
 			'無效項目應被跳過，同批次的有效訂閱仍要補排成功'
 		);
 	}
+
+	// ========== 分批補排的分頁正確性 ==========
+
+	/**
+	 * 攔截 wcs_get_subscriptions() 實際送出的 query args
+	 *
+	 * @param callable $run 要執行的動作
+	 * @return array<int, array<string, mixed>> 每次查詢的 query args
+	 */
+	private function capture_subscription_query_args( callable $run ): array {
+		$captured = [];
+		$spy      = static function ( $query_args, $args ) use ( &$captured ) {
+			$captured[] = $query_args;
+			return $query_args;
+		};
+
+		add_filter( 'woocommerce_get_subscriptions_query_args', $spy, 10, 2 );
+		$run();
+		remove_filter( 'woocommerce_get_subscriptions_query_args', $spy, 10 );
+
+		return $captured;
+	}
+
+	/**
+	 * 分批補排的第 N 頁必須帶正確的 offset
+	 *
+	 * wcs_get_subscriptions() 的 wp_parse_args 預設帶 'offset' => 0 並無條件塞進 query args。
+	 * HPOS 的 OrdersTableQuery::process_limit() 是「offset 未設定時才用 paged 換算」，
+	 * 而它的 SKIPPED_VALUES 是 ['', [], null]（strict 比對）——0 不在其中，
+	 * 於是 offset 被視為「有設定且為 0」，paged 整個被無視，每一批都撈到同一批人。
+	 *
+	 * 後果有兩層：第 BATCH_SIZE 筆之後的訂閱永遠補不到（issue #22 對 HPOS 站台等於沒修），
+	 * 而且每批處理數恆等於 BATCH_SIZE → 「還有下一批」的條件恆真 → 無限排程鏈。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_分批補排第二頁必須帶正確的offset(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 2 );
+			}
+		);
+
+		$this->assertNotEmpty( $captured, '第 2 頁應該真的發出查詢' );
+		$this->assertSame(
+			\J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_BATCH_SIZE,
+			(int) ( $captured[0]['offset'] ?? -1 ),
+			'第 2 頁必須帶 offset = BATCH_SIZE——只給 paged 在 HPOS 下會被 offset=0 蓋掉，每批都撈同一批人'
+		);
+	}
+
+	/**
+	 * 第一頁的 offset 應為 0
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_分批補排第一頁offset為零(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+			}
+		);
+
+		$this->assertNotEmpty( $captured );
+		$this->assertSame( 0, (int) ( $captured[0]['offset'] ?? -1 ), '第 1 頁的 offset 應為 0' );
+	}
+
+	/**
+	 * 超過頁數上限時應中止，不再發查詢
+	 *
+	 * 分批是「處理滿一批就排下一頁」的自我遞迴，任何讓查詢回傳固定筆數的缺陷
+	 * 都會變成無限排程鏈。這道安全閥是最後一層防線。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_分批補排超過頁數上限應中止(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch(
+					\J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_MAX_PAGES + 1
+				);
+			}
+		);
+
+		$this->assertSame( [], $captured, '超過上限應直接 return，連查詢都不該發' );
+	}
+
+	/**
+	 * 一次性補排的旗標必須等排程真的排進去才寫
+	 *
+	 * as_enqueue_async_action() 在 ActionScheduler 尚未初始化時回 0 而不排任何東西，
+	 * 而 compatibility() 也綁在 upgrader_process_complete（同步 wp-admin request）上。
+	 * 「先寫旗標」在那種情形下會把旗標寫死——旗標沒有清除路徑、後台也沒有手動入口，
+	 * 整個補排就此永久跳過且無從察覺。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_一次性補排排程失敗時不可寫入旗標(): void {
+		$this->skip_if_no_subscriptions();
+
+		\delete_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION );
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Compatibility\Compatibility::class );
+		$method     = $reflection->getMethod( 'backfill_issue22_subscription_emails' );
+		$method->setAccessible( true );
+
+		// 讓排程「排不進去」（AS 未就緒時 as_enqueue_async_action 回 0 就是這個效果）
+		$blocker = static fn() => 0;
+		add_filter( 'pre_as_enqueue_async_action', $blocker, 10, 1 );
+		$method->invoke( null );
+		remove_filter( 'pre_as_enqueue_async_action', $blocker, 10 );
+
+		$this->assertFalse(
+			\get_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION ),
+			'排程沒排進去就寫旗標，等於讓補排永久跳過且無從察覺'
+		);
+
+		// 排程正常時才寫旗標
+		$method->invoke( null );
+		$this->assertNotFalse(
+			\get_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION ),
+			'排程成功後應寫入旗標，避免下次重複排程'
+		);
+	}
 }
