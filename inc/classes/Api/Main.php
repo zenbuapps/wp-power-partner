@@ -260,11 +260,29 @@ final class Main
 						$subscription->save();
 					}
 
+					/**
+					 * ⚠️ 必須是「附加」而不是「覆寫」。
+					 *
+					 * update_linked_site_ids() 收到的陣列就是綁定的完整清單——
+					 * 原本這裡傳 [(string) $new_site_id]，等於宣告「這個訂閱只有這一個站」。
+					 * 一張訂單兩個商品各開一站是合法路徑，第二次回調會把第一個站的 id 擠掉：
+					 * 站 1 從此不會被停用/恢復，而 pp_site_url 是「第一個站先寫、之後不覆蓋」，
+					 * 於是 ##URL## 仍指向站 1、綁定卻只剩站 2，兩邊指到不同的站。
+					 * 更糟的是 pp_linked_site_ids_updated 會 fire，把這次「靜默遺失」
+					 * 當成一次正常的綁定變更通知出去。
+					 *
+					 * 另外三個寫入點（PowerCloud 開站、/link-site、後台手動編輯）都是附加語義，
+					 * 這裡對齊它們；in_array 去重讓 CloudServer 重送同一個 site id 不會長出重複列。
+					 */
+					$existing_site_ids = ShopSubscription::get_linked_site_ids((int) $subscription->get_id());
+					$merged_site_ids   = array_values($existing_site_ids);
+					if (! in_array((string) $new_site_id, $merged_site_ids, true)) {
+						$merged_site_ids[] = (string) $new_site_id;
+					}
+
 					ShopSubscription::update_linked_site_ids(
 						(int) $subscription->get_id(),
-						[
-							(string) $new_site_id,
-						]
+						$merged_site_ids
 					);
 				}
 			}

@@ -598,19 +598,52 @@ final class SubscriptionEmailHooks {
 	/**
 	 * Send mail
 	 *
+	 * 回傳多出來的第三、四個元素是給「會重試的呼叫端」用的（目前只有 Product\SiteSync::send_email()）：
+	 *   - [2] $aborted_emails：被 REQUIRED_SITE_TOKENS 防呆擋下的部分，是 $failed_emails 的子集合
+	 *   - [3] $success_keys：這一輪真的寄成功的 email **key**
+	 *
+	 * 為什麼成功清單要另外給 key：$success_emails / $failed_emails 裝的是 action_name，
+	 * 而所有開站通知模板的 action_name 都是 'site_sync'——多模板時完全分不出是哪一封。
+	 * 重試要「跳過已寄成功的模板」就必須用唯一鍵，也就是 Email DTO 的 key。
+	 *
+	 * 既有呼叫端寫 `[ $success, $failed ] = send_mail(...)` 不受影響——
+	 * PHP 的 list 解構會忽略多出來的元素。
+	 *
 	 * @param string               $to 收件者
 	 * @param array<string, mixed> $tokens 取代字串
-	 * @return array{0:array<string>,1:array<string>} 成功與失敗的 email action names
+	 * @param array<string, mixed> $options 選項：
+	 *                                      skip_keys (array<string>) 要跳過的 email key（前次已寄成功，避免重試時重寄）；
+	 *                                      notify_dealer_on_abort (bool，預設 true) 全數被防呆擋下時是否寄告警給經銷商。
+	 *                                      重試路徑要傳 false——tokens 每次都一樣，防呆必然再次全擋，
+	 *                                      不關掉的話經銷商會為同一件事收到 EMAIL_PAYLOAD_MAX_ATTEMPTS 封相同告警。
+	 * @return array{0:array<string>,1:array<string>,2:array<string>,3:array<string>} 成功、失敗、其中被防呆擋下的（皆為 action name），以及成功的 email key
 	 */
-	public static function send_mail( string $to, array $tokens ): array {
+	public static function send_mail( string $to, array $tokens, array $options = [] ): array {
 		// 取得 site_sync 的 email 模板
 		$email_service = self::instance();
 		$emails        = $email_service->get_emails( 'site_sync' );
 
+		$skip_keys_raw = $options['skip_keys'] ?? [];
+		$skip_keys     = is_array( $skip_keys_raw ) ? array_map( static fn( $v ): string => (string) $v, $skip_keys_raw ) : [];
+		$notify_dealer = ! isset( $options['notify_dealer_on_abort'] ) || (bool) $options['notify_dealer_on_abort'];
+
 		$success_emails = [];
 		$failed_emails  = [];
+		$aborted_emails = [];
+		$success_keys   = [];
 		$aborted_tokens = [];
 		foreach ( $emails as $email ) {
+			/**
+			 * 這封在前一輪已經寄達過，重試時不可再寄一次。
+			 *
+			 * payload 是整份重排的（見 Product\SiteSync::send_email()），
+			 * 少了這道跳過，「A 成功、B 失敗」的多模板站台會在每次重試時把 A 再寄給客戶一次，
+			 * 最多讓客戶收到 EMAIL_PAYLOAD_MAX_ATTEMPTS 封內容相同的帳密信。
+			 */
+			if ( in_array( (string) $email->key, $skip_keys, true ) ) {
+				continue;
+			}
+
 			// 取得 subject
 			$subject = $email->subject;
 			$subject = empty( $subject ) ? $email_service->default->subject : $subject;
@@ -639,8 +672,9 @@ final class SubscriptionEmailHooks {
 					],
 					5
 				);
-				$failed_emails[] = $email->action_name;
-				$aborted_tokens  = array_values( array_unique( array_merge( $aborted_tokens, $missing_tokens ) ) );
+				$failed_emails[]  = $email->action_name;
+				$aborted_emails[] = $email->action_name;
+				$aborted_tokens   = array_values( array_unique( array_merge( $aborted_tokens, $missing_tokens ) ) );
 				continue;
 			}
 
@@ -658,6 +692,7 @@ final class SubscriptionEmailHooks {
 
 			if ( $result ) {
 				$success_emails[] = $email->action_name;
+				$success_keys[]   = (string) $email->key;
 			} else {
 				$failed_emails[] = $email->action_name;
 			}
@@ -677,12 +712,16 @@ final class SubscriptionEmailHooks {
 		 *
 		 * 只在「一封都沒寄成功」時才發，避免多模板情境下的雜訊；
 		 * 且直接用 wp_mail 而不是再走一次 send_mail()，免得遞迴。
+		 *
+		 * $notify_dealer 讓重試路徑把它關掉：防呆中止是確定性的（tokens 每次一樣，
+		 * 必然再次全擋），不關的話同一件事會寄出 EMAIL_PAYLOAD_MAX_ATTEMPTS 封相同告警，
+		 * 把經銷商真正需要看的那一封淹掉。
 		 */
-		if ( $aborted_tokens && ! $success_emails ) {
+		if ( $aborted_tokens && ! $success_emails && $notify_dealer ) {
 			self::notify_dealer_email_aborted( $to, $aborted_tokens, $tokens );
 		}
 
-		return [ $success_emails, $failed_emails ];
+		return [ $success_emails, $failed_emails, $aborted_emails, $success_keys ];
 	}
 
 	/**

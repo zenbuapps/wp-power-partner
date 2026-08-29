@@ -27,6 +27,15 @@ final class Compatibility {
 	/** Issue #22 每批處理的訂閱數 */
 	const ISSUE22_BACKFILL_BATCH_SIZE = 50;
 
+	/**
+	 * Issue #22 分批補排的頁數上限（安全閥）
+	 *
+	 * 分批是「處理滿一批就排下一頁」的自我遞迴，任何讓查詢回傳固定筆數的缺陷
+	 * （例如分頁參數失效）都會變成無限排程鏈。50 × 2000 = 10 萬筆訂閱，
+	 * 遠超過實務規模，撞到就是有問題，寧可停下來留 log。
+	 */
+	const ISSUE22_BACKFILL_MAX_PAGES = 2000;
+
 	/** Constructor */
 	public function __construct() {
 		/**
@@ -144,11 +153,43 @@ final class Compatibility {
 			return;
 		}
 
-		// 立刻寫旗標再排程：compatibility() 綁在 upgrader_process_complete 上，
-		// 任何外掛/佈景更新都會觸發，不先寫旗標會重複排程
-		\update_option(self::ISSUE22_BACKFILL_OPTION, Plugin::$version);
+		/**
+		 * 已經排進去的就不要再排一次。
+		 *
+		 * compatibility() 綁在 upgrader_process_complete 上，任何外掛/佈景更新都會觸發；
+		 * 旗標改成「排程成功才寫」之後（見下方），這道檢查取代原本
+		 * 「先寫旗標」所提供的防重複排程保護。
+		 */
+		if (\as_has_scheduled_action(self::ISSUE22_BACKFILL_ACTION)) {
+			return;
+		}
 
-		\as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => 1 ]);
+		/**
+		 * ⚠️ 必須先確認排程真的排進去了，才寫旗標。
+		 *
+		 * as_enqueue_async_action() 在 ActionScheduler 尚未初始化時直接回 0 而不排任何東西
+		 * （AS 3.9.3 functions.php 的 ActionScheduler::is_initialized() 守門）。
+		 * 而 compatibility() 也綁在 upgrader_process_complete 上——那是同步的 wp-admin 請求，
+		 * 不保證 AS 已就緒。原本的「先寫旗標再排程」在這種情形下會把旗標寫死：
+		 * 旗標沒有任何清除路徑、後台也沒有手動觸發入口，整個 issue #22 的一次性補排
+		 * 就此永久跳過且無從察覺。
+		 *
+		 * 反過來「排程成功才寫旗標」最壞的情況只是兩個 request 競態下各排一條批次鏈，
+		 * 而補排本身是 idempotent（下游 maybe_unschedule + schedule_single 淨零成長），
+		 * 多跑一遍不會產生重複信件——兩種錯誤的代價不對稱。
+		 */
+		$action_id = \as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => 1 ]);
+
+		if (! $action_id) {
+			Plugin::logger(
+				'issue #22 一次性補排排程失敗（ActionScheduler 未就緒），旗標不寫入，下次相容性檢查時重試',
+				'error',
+				[]
+			);
+			return;
+		}
+
+		\update_option(self::ISSUE22_BACKFILL_OPTION, Plugin::$version);
 	}
 
 	/**
@@ -169,11 +210,43 @@ final class Compatibility {
 			return;
 		}
 
-		$page          = max(1, (int) $page);
+		$page = max(1, (int) $page);
+
+		if ($page > self::ISSUE22_BACKFILL_MAX_PAGES) {
+			Plugin::logger(
+				'issue #22 補排超過頁數上限，中止分批鏈（可能是分頁參數失效導致每批撈到同一批資料）',
+				'error',
+				[
+					'page'      => $page,
+					'max_pages' => self::ISSUE22_BACKFILL_MAX_PAGES,
+				]
+			);
+			return;
+		}
+
 		$subscriptions = \wcs_get_subscriptions(
 			[
 				'subscription_status'    => [ 'active', 'on-hold' ],
 				'subscriptions_per_page' => self::ISSUE22_BACKFILL_BATCH_SIZE,
+				/**
+				 * ⚠️ offset 必須自己算，不能只給 paged。
+				 *
+				 * wcs_get_subscriptions() 的 wp_parse_args 預設帶 'offset' => 0，
+				 * 而且無條件把它塞進 $query_args。HPOS 的 OrdersTableQuery::process_limit()
+				 * 是「offset 未設定時才用 paged 換算」：
+				 *     $offset = ( arg_isset('offset') ? absint(...) : false );
+				 *     if ( false === $offset ... ) { $offset = ($page - 1) * $row_count; }
+				 * 而 arg_isset() 的 SKIPPED_VALUES 是 ['', [], null]（strict 比對），0 不在其中
+				 * → offset 被視為「有設定」且值為 0 → paged 整個被無視，
+				 *   每一批都是 LIMIT 0, 50 撈到同一批人。
+				 *
+				 * 後果有兩層：第 51 筆之後的訂閱永遠補不到（issue #22 對 HPOS 站台等於沒修），
+				 * 而且 $count 恆等於 BATCH_SIZE → 下方「還有下一批」的條件恆真 → 無限排程鏈。
+				 * 非 HPOS 不受影響（WP_Query 的 empty($q['offset']) 對 0 為 true，會走 paged）。
+				 *
+				 * paged 一併保留：非 HPOS 路徑用它，兩邊算出來的區間一致。
+				 */
+				'offset'                 => ( $page - 1 ) * self::ISSUE22_BACKFILL_BATCH_SIZE,
 				'paged'                  => $page,
 				/**
 				 * 明確指定穩定排序。

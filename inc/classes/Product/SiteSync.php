@@ -83,6 +83,15 @@ final class SiteSync {
 	/** Payload 內部欄位：已嘗試寄送次數。不是 token，寄信前會被剝掉 */
 	const EMAIL_PAYLOAD_ATTEMPTS_KEY = '_pp_send_attempts';
 
+	/**
+	 * Payload 內部欄位：這份 payload 已經寄達過的 email key。不是 token，寄信前會被剝掉
+	 *
+	 * 重試是把「整份 payload」重排，所以站台設了多個 site_sync 模板時
+	 * （A 寄達、B 失敗），沒有這份清單就會在每次重試把 A 再寄給客戶一次。
+	 * 記 key 而不是 action_name——所有開站模板的 action_name 都是 'site_sync'，分不出是哪一封。
+	 */
+	const EMAIL_PAYLOAD_SENT_KEYS_KEY = '_pp_sent_email_keys';
+
 	/** 開站通知信寄送失敗後的重試間隔（秒） */
 	const EMAIL_RETRY_DELAY = 600;
 
@@ -202,15 +211,27 @@ final class SiteSync {
 				 * 重試時間排在鎖必然失效之後（timeout + 60 秒緩衝）：
 				 *   - 前一個程序正常跑完 → 冪等旗標已落，重試被旗標擋下，只多一筆 order note
 				 *   - 前一個程序已死 → 殘鎖可被接管，重試真的把站開出來
-				 * $unique=true 讓多次重送只堆出一個重試。
+				 *
+				 * ⚠️ 去重要用 as_has_scheduled_action()，不可用 as_schedule_single_action()
+				 *    的 $unique 參數。ActionScheduler 的 unique 判斷
+				 *    （ActionScheduler_DBStore::build_where_clause_for_insert）只比對
+				 *    hook 與 group_id，args 完全不進 WHERE：
+				 *        WHERE status IN ('pending','in-progress') AND hook = %s AND group_id = %d
+				 *    group 留空即 group_id = 0，等於「全站只允許一個 pp_site_sync_retry_after_lock」。
+				 *    訂閱 A 正在等重試的這 960 秒內，訂閱 B（不同客戶）若也撞到鎖，
+				 *    B 的 insert 會回 0 被靜默丟棄，而回傳值沒有任何人檢查
+				 *    → B 的客戶付了錢、永遠沒有站，且不留痕跡。
+				 *    as_has_scheduled_action() 才會把 args 納入查詢（AS functions.php:411）。
 				 */
-				\as_schedule_single_action(
-					\time() + self::SITE_SYNC_LOCK_TIMEOUT + MINUTE_IN_SECONDS,
-					self::RETRY_AFTER_LOCK_ACTION,
-					[ 'subscription_id' => $subscription->get_id() ],
-					'',
-					true
-				);
+				$retry_args = [ 'subscription_id' => $subscription->get_id() ];
+
+				if (! \as_has_scheduled_action(self::RETRY_AFTER_LOCK_ACTION, $retry_args)) {
+					\as_schedule_single_action(
+						\time() + self::SITE_SYNC_LOCK_TIMEOUT + MINUTE_IN_SECONDS,
+						self::RETRY_AFTER_LOCK_ACTION,
+						$retry_args
+					);
+				}
 
 				return;
 			}
@@ -371,7 +392,17 @@ final class SiteSync {
 				"訂閱 #{$subscription->get_id()}  order_id: #{$parent_order_id}",
 				'info',
 				[
-					'responses' => $responses,
+					/**
+					 * log 也是顯示層，一樣要遮罩。
+					 *
+					 * $responses 的 data 是對端 API 回應原文，而 PowerCloud 的建站請求帶
+					 * wordpress.autoInstall.adminPassword，回應可能原樣 echo 回來。
+					 * 訂單備註、訂單列表欄位、metabox 三處都已經過 mask_sensitive()，
+					 * 唯獨這裡是明文——而 plugin log 經銷商看得到（Query Monitor / log 檢視器），
+					 * 等於留下唯一一份明文副本，且是 info 等級（最不會被清）。
+					 * 對照 CLAUDE.md 陷阱 12：API key 禁止 raw 落地 log，同一個原則。
+					 */
+					'responses' => self::mask_sensitive($responses),
 				]
 			);
 
@@ -592,9 +623,14 @@ final class SiteSync {
 	 * （與 FetchPowerCloud::disable_site() / enable_site() 的既有慣例一致，見 issue #13）。
 	 *
 	 * ⚠️ 這個判斷同時決定三件事，三者必須永遠一致，否則會產生無法自動恢復的死局：
-	 *   1. site_sync_powercloud() 是否綁定站台、寫 pp_site_url、排開站通知信
+	 *   1. site_sync_powercloud() 是否寫 pp_site_url、排開站通知信
 	 *   2. 是否對該 order item 落下冪等旗標（落了就永久擋住重試）
 	 *   3. 訂單備註寫「開站成功」還是「開站失敗」
+	 *
+	 * ⚠️ 綁定站台（pp_linked_site_ids）比這三者「多一個條件」：回應要真的帶回 websiteId。
+	 *    2xx 卻沒有 websiteId 時，上述三件事照做、綁定做不了——那是不對稱但刻意的選擇，
+	 *    見 site_sync_powercloud() 內該分支的 else 註解（放行重試會重複開站與計費）。
+	 *    該路徑會寫 critical log + 訂單/訂閱備註，要求經銷商手動補綁，不是靜默通過。
 	 *
 	 * @param int $status HTTP status code
 	 * @return bool
@@ -711,7 +747,7 @@ final class SiteSync {
 		 */
 		if (self::is_successful_status( (int) $response_obj->status )) {
 			// Store websiteId in pp_linked_site_ids for subscription binding
-			$website_id = $response_obj->data['websiteId'] ?? '';
+			$website_id = is_array($response_obj->data) ? ( $response_obj->data['websiteId'] ?? '' ) : '';
 			if (!empty($website_id)) {
 				$existing_site_ids = ShopSubscription::get_linked_site_ids((int) $subscription->get_id());
 				$existing_site_ids_values = array_values($existing_site_ids);
@@ -721,6 +757,46 @@ final class SiteSync {
 				ShopSubscription::update_linked_site_ids(
 					(int) $subscription->get_id(),
 					$existing_site_ids_values
+				);
+			} else {
+				/**
+				 * 2xx 但回應裡沒有 websiteId —— 必須主動告警，這是無法自動恢復的狀態。
+				 *
+				 * FetchPowerCloud::site_sync() 的 data 是 json_decode($body, true)，
+				 * 空 body / 非 JSON / 對端改欄位名都會讓它變成 null 或缺 key；
+				 * 而成功判定已從 === 201 放寬為 2xx，200 / 202（非同步受理）也會走到這裡。
+				 *
+				 * 此時 pp_linked_site_ids 是空的 → is_site_sync() 為 false →
+				 * 停用/恢復、所有生命週期信、issue #22 補排全部失效，
+				 * 而呼叫端仍會落下冪等旗標，之後每一次合法重試都被擋。
+				 *
+				 * 刻意「照樣落旗標」而不是放行重試：重試會讓 PowerCloud 再建一個站
+				 * （計費、資源、客戶收到第二組帳密都是不可逆的），而缺的只是一個 id——
+				 * 經銷商可從 PowerCloud 後台以 namespace 查到 websiteId，
+				 * 用後台 metabox 或 POST /change-subscription 手動補綁即可收斂。
+				 * 代價不對稱，所以選「可修復但需人工」而不是「自動但可能重複開站」。
+				 */
+				$note = \sprintf(
+					'開站 API 回應成功（HTTP %1$d）但未帶 websiteId，訂閱 #%2$d 未能綁定站台。'
+					. '此訂閱的停用/恢復與生命週期信都不會作用，請至 PowerCloud 後台以 namespace「%3$s」查出 websiteId 後手動綁定。',
+					(int) $response_obj->status,
+					$subscription->get_id(),
+					(string) ( $wordpress_obj->namespace ?? '' )
+				);
+				$subscription->add_order_note($note);
+				$parent_order->add_order_note($note);
+				Plugin::logger(
+					$note,
+					'critical',
+					[
+						'subscription_id' => $subscription->get_id(),
+						'order_id'        => $parent_order->get_id(),
+						'status'          => (int) $response_obj->status,
+						'namespace'       => (string) ( $wordpress_obj->namespace ?? '' ),
+						// data 是對端原文，可能 echo 回 adminPassword，遮罩後才進 log
+						'response_data'   => self::mask_sensitive(self::normalize_response_data($response_obj->data ?? null)),
+					],
+					5
 				);
 			}
 
@@ -981,19 +1057,79 @@ final class SiteSync {
 		$payload  = (array) \array_shift($queue);
 		$attempts = (int) ( $payload[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] ?? 0 );
 
-		// 內部計數欄位不是 token，寄信前剝掉，免得被當成 ##_PP_SEND_ATTEMPTS## 處理
-		$tokens = $payload;
-		unset( $tokens[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] );
+		// 前幾輪已經寄達的模板，這一輪要跳過（見 EMAIL_PAYLOAD_SENT_KEYS_KEY）
+		$sent_keys_raw = $payload[ self::EMAIL_PAYLOAD_SENT_KEYS_KEY ] ?? [];
+		$sent_keys     = is_array($sent_keys_raw) ? array_values(array_map(static fn( $v ): string => (string) $v, $sent_keys_raw)) : [];
 
-		/** @var array<string, string> $tokens */
-		[ $success_emails, $failed_emails ] = EmailService::send_mail($to, $tokens);
+		// 內部欄位不是 token，寄信前剝掉，免得被當成 ##_PP_SEND_ATTEMPTS## 之類處理
+		$tokens = $payload;
+		unset( $tokens[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ], $tokens[ self::EMAIL_PAYLOAD_SENT_KEYS_KEY ] );
+
+		$success_emails = [];
+		$failed_emails  = [];
+		$aborted_emails = [];
+		$success_keys   = [];
+
+		/**
+		 * ⚠️ 例外必須在這裡接住，不能讓它往上拋。
+		 *
+		 * payload 已經被 array_shift 取出，但佇列的新狀態要等函式尾端的
+		 * $subscription->save() 才落地。send_mail() 一旦拋例外
+		 * （Token::replace() 撞到非預期值、寄信外掛自己 throw、Email DTO 出錯），
+		 * meta 不會被改寫、不會排重試，而這個 powerhouse_delay_send_email 排程
+		 * 已經被消耗掉了——排程數與 payload 數是一對一的，
+		 * 雙站訂單因此會剩下一份「沒有任何排程會再去讀」的 payload，
+		 * 而那是明文 wp_admin_password 唯一的存放處。
+		 *
+		 * 接住後走與「wp_mail 回 false」完全相同的計數/重排路徑。
+		 */
+		try {
+			/** @var array<string, string> $tokens */
+			[ $success_emails, $failed_emails, $aborted_emails, $success_keys ] = EmailService::send_mail(
+				$to,
+				$tokens,
+				[
+					// 前幾輪已寄達的模板不再寄一次（多模板站台才有差別）
+					'skip_keys'              => $sent_keys,
+					// 防呆告警只在第一次發：tokens 每輪都一樣，重試必然被同樣擋下，
+					// 不去重的話經銷商會為同一件事收到 EMAIL_PAYLOAD_MAX_ATTEMPTS 封相同的信
+					'notify_dealer_on_abort' => 0 === $attempts,
+				]
+			);
+		} catch (\Throwable $th) {
+			$success_emails = [];
+			$failed_emails  = [ 'exception' ];
+			$aborted_emails = [];
+			$success_keys   = [];
+
+			Plugin::logger(
+				"訂閱 #{$subscription->get_id()} 開站通知信寄送過程拋出例外",
+				'error',
+				[
+					'to'    => $to,
+					'error' => $th->getMessage(),
+				],
+				5
+			);
+		}
+
+		// 累積「已寄達」的模板，讓下一輪重試跳過它們
+		$sent_keys = array_values( array_unique( array_merge( $sent_keys, $success_keys ) ) );
 
 		if ($failed_emails) {
 			++$attempts;
 
 			if ($attempts < self::EMAIL_PAYLOAD_MAX_ATTEMPTS) {
-				// 放回隊尾，讓同一訂閱的其他站先寄出去
-				$payload[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ] = $attempts;
+				/**
+				 * 放回隊尾，讓同一訂閱的其他站先寄出去。
+				 *
+				 * 這裡刻意「不分辨失敗原因」——防呆中止雖然重試必然再失敗，
+				 * 但 payload 是 wp_admin_password 唯一的存放處，提前丟棄等於
+				 * 讓經銷商連手動補寄的原始資料都沒有。噪音（重複告警）已由
+				 * notify_dealer_on_abort 去重解決，代價遠低於資料遺失。
+				 */
+				$payload[ self::EMAIL_PAYLOAD_ATTEMPTS_KEY ]  = $attempts;
+				$payload[ self::EMAIL_PAYLOAD_SENT_KEYS_KEY ] = $sent_keys;
 				$queue[] = $payload;
 
 				\as_schedule_single_action(
@@ -1012,7 +1148,9 @@ final class SiteSync {
 						'to'             => $to,
 						'attempts'       => $attempts,
 						'failed_emails'  => $failed_emails,
+						'aborted_emails' => $aborted_emails,
 						'success_emails' => $success_emails,
+						'sent_keys'      => $sent_keys,
 						'queue_size'     => count($queue),
 					],
 					5
@@ -1020,25 +1158,45 @@ final class SiteSync {
 			} else {
 				/**
 				 * 達到上限才丟棄。這裡是唯一會讓 wp_admin_password 消失的路徑，
-				 * 所以記 critical——經銷商需要知道有客戶沒收到帳密，得手動用
-				 * POST /send-site-credentials-email 補寄。
+				 * 所以記 critical + 寫訂單備註——經銷商需要知道有客戶沒收到帳密，
+				 * 得手動用 POST /send-site-credentials-email 補寄。
+				 *
+				 * 備註要講清楚是哪一種失敗，否則經銷商不知道該修模板還是查寄信設定。
 				 */
+				if ($aborted_emails) {
+					$reason = \sprintf(
+						'連續 %1$d 次寄送失敗，系統已停止重試。失敗原因是信件模板用到了這個站台架構拿不到的變數（%2$s），請先修正模板',
+						$attempts,
+						\implode(', ', $aborted_emails)
+					);
+				} elseif ($sent_keys) {
+					$reason = \sprintf(
+						'連續 %1$d 次寄送失敗，系統已停止重試。部分模板曾寄達（%2$s），仍有模板未寄出',
+						$attempts,
+						\implode(', ', $sent_keys)
+					);
+				} else {
+					$reason = \sprintf('連續 %d 次寄送失敗，系統已停止重試', $attempts);
+				}
+
 				Plugin::logger(
-					"訂閱 #{$subscription->get_id()} 開站通知信連續 {$attempts} 次未寄出，已放棄此筆（避免卡住佇列後方的站），請手動補寄帳密",
+					"訂閱 #{$subscription->get_id()} 開站通知信已放棄此筆（避免卡住佇列後方的站）：{$reason}",
 					'critical',
 					[
-						'to'            => $to,
-						'attempts'      => $attempts,
-						'failed_emails' => $failed_emails,
-						'queue_size'    => count($queue),
+						'to'             => $to,
+						'attempts'       => $attempts,
+						'failed_emails'  => $failed_emails,
+						'aborted_emails' => $aborted_emails,
+						'success_emails' => $success_emails,
+						'queue_size'     => count($queue),
 					],
 					5
 				);
 
 				$subscription->add_order_note(
 					\sprintf(
-						'開站通知信連續 %1$d 次寄送失敗，系統已停止重試。請確認信件模板與寄信設定後，於後台手動補寄帳密給 %2$s',
-						$attempts,
+						'開站通知信未能完整寄出：%1$s。請確認信件模板與寄信設定後，於後台手動補寄帳密給 %2$s',
+						$reason,
 						$to
 					)
 				);
