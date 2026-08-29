@@ -96,7 +96,7 @@ PowerCloud API key 儲存方式:
 | `power_partner_partner_id` | string | cloud.luke.cafe 的 Partner ID |
 | `power_partner_account_info` | string | 加密帳號資訊 |
 | `power_partner_compatibility_scheduled` | string | 已跑過相容設定的版本號。⚠️ constructor 在版本不同時會先 `delete_option()`，所以 `compatibility()` 裡讀到的 `$previous_version` 永遠是 `'0.0.1'`——`version_compare('3.1.0')` 區塊事實上每次升版都會執行 |
-| `power_partner_issue22_backfilled` | string | issue #22 一次性補排的守門（值為當時版本號）。**不可改用 `$previous_version` 判斷**，理由同上 |
+| `power_partner_issue22_backfilled` | string | issue #22 一次性補排的守門（值為當時版本號）。**不可改用 `$previous_version` 判斷**，理由同上。⚠️ **必須等 `as_enqueue_async_action()` 回傳非 0 才寫入**——AS 未初始化時它回 0 且不排任何東西，而 `compatibility()` 也綁在 `upgrader_process_complete`（同步 wp-admin request）上；先寫旗標會讓補排永久跳過（旗標無清除路徑、後台無手動入口）。防重複排程改由 `as_has_scheduled_action()` 負責 |
 | `pp_site_sync_lock_{order_id}` | string | issue #24 開站併發鎖，`autoload=no`。值的格式是 `{unix_timestamp}:{隨機}`——前半供逾時判定，後半是持有者身分，讓釋放能做條件式刪除。正常路徑由 `try/finally` 清除，fatal/OOM 留下的殘鎖由逾時接管機制回收 |
 
 ## WordPress Transients
@@ -118,9 +118,9 @@ PowerCloud API key 儲存方式:
 | `_pp_create_site_responses_item` | order item | JSON: 逐項開站回應 |
 | `is_power_partner_site_sync` | `shop_subscription` | `'1'` 標記為 PP 訂閱 |
 | `lc_id` | `shop_subscription` | Multi-value: 授權碼 IDs |
-| `email_payloads_tmp` | `shop_subscription` | 暫存: 延遲發信後刪除 |
+| `email_payloads_tmp` | `shop_subscription` | 暫存: 延遲發信後刪除。FIFO 佇列，payload 內含兩個內部欄位 `_pp_send_attempts`（重試計數）與 `_pp_sent_email_keys`（已寄達的 email **key**），寄信前都會從 tokens 剝掉（見常見陷阱 18） |
 | `pp_site_url` | `shop_subscription` | 站台網址（含 scheme）。issue #23：網域在兩種架構下都**不存在於開站 API 回應**——PowerCloud 是 `FetchPowerCloud::site_sync()` 本地生成的 `$namespace.'.wpsite.pro'`（原本只在一次性的 `email_payloads_tmp`，寄完信就刪）、WPCD 要等 `/customer-notification` 回調帶回。兩條路徑各自寫入此 meta，`##URL##` 只讀它。**第一個站先寫、之後不覆蓋** |
-| `_pp_site_sync_completed_at` | order item | issue #24 冪等鍵：此項目開站成功的 unix timestamp。**只在 HTTP 2xx 才寫入**，讓開站失敗後的合法重試不被誤擋。綁在 item 而非訂閱——WPCD 的 `pp_linked_site_ids` 要等非同步回調才寫、一張訂單多商品各開一站是合法的、且該 meta 會被後台與兩個 REST 回調改動 |
+| `_pp_site_sync_completed_at` | order item | issue #24 冪等鍵：此項目開站成功的 unix timestamp。**只在 HTTP 2xx 才寫入**，讓開站失敗後的合法重試不被誤擋。綁在 item 而非訂閱——WPCD 的 `pp_linked_site_ids` 要等非同步回調才寫、一張訂單多商品各開一站是合法的、且該 meta 會被後台與兩個 REST 回調改動。⚠️ 綁定站台的條件比這個**多一項**（回應要真的帶回 `websiteId`），2xx 但缺 id 時旗標照落、綁定做不了，見常見陷阱 23 |
 | `power_partner_host_type` | product/variation | `'powercloud'` 或 `'wpcd'` |
 | `power_partner_host_position` | product/variation | 區域: `jp`, `tw`, `us_west`, `uk_london`, `sg`, `hk`, `canada` |
 | `power_partner_linked_site` | product/variation | 模板站 ID |
@@ -174,7 +174,7 @@ PowerCloud API key 儲存方式:
 
 | Hook | Args | 用途 |
 |---|---|---|
-| `pp_site_sync_retry_after_lock` | `subscription_id` | issue #24：搶不到開站鎖時排一次延後重試（`timeout + 60` 秒後，`$unique=true`）。真正決定要不要重開的是 item 上的冪等旗標 |
+| `pp_site_sync_retry_after_lock` | `subscription_id` | issue #24：搶不到開站鎖時排一次延後重試（`timeout + 60` 秒後）。真正決定要不要重開的是 item 上的冪等旗標。⛔ **去重必須用 `as_has_scheduled_action($hook, $args)`，不可用 `as_schedule_single_action()` 的 `$unique`**——AS 的 unique 判斷（`ActionScheduler_DBStore::build_where_clause_for_insert`）只比對 `hook` + `group_id`，args 完全不進 WHERE；group 留空即 `group_id = 0`，等於「全站只允許一個」，訂閱 A 等重試期間訂閱 B 的重試會被靜默丟棄（回 0 且無人檢查回傳值），B 的客戶付了錢永遠沒有站 |
 | `power_partner_issue22_backfill_batch` | `page` | issue #22：一次性補排的分批處理，每批 50 筆，處理滿一批就排下一頁。handler 必須綁在 `Compatibility::__construct()` 的 early return **之前**，否則第二批之後找不到 callback |
 | `power_partner_compatibility_scheduler` | — | 相容設定的非同步入口 |
 | `powerhouse_delay_send_email` | `to`, `subscription_id` | PowerCloud 開站後 240 秒寄帳密；寄送失敗時也用它排 `EMAIL_RETRY_DELAY` 後的重試。**hook 名不屬於本外掛命名空間，改 args 會動到跨 plugin 合約** |
@@ -253,7 +253,13 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 17. **開站有冪等鍵與併發鎖，動 `site_sync_by_subscription()` 前先讀懂順序** — `count($order_ids) !== 1` 只擋「續訂」，擋不住「付款完成事件重送」（重送時 related orders 仍是 1 筆）。現在有兩層：**併發鎖**（`pp_site_sync_lock_{order_id}`，裸 `INSERT IGNORE` + `try/finally`，timeout 900 秒 > API 的 600 秒）擋同一瞬間的併發；**item 層級冪等旗標**（`_pp_site_sync_completed_at`）擋事後重送。**鎖必須在三道既有守衛之後才取**——否則每次續訂事件都白搶一次鎖，且會在同一個 PHP process 留下殘鎖連鎖擋掉後續開站。`add_option()` **不能當鎖**（它是 `INSERT ... ON DUPLICATE KEY UPDATE`，重複不會失敗），`wp_cache_add()` 也不行（預設物件快取不跨 request）。 **鎖值格式是 `{timestamp}:{隨機}`**：前半判逾時，後半是持有者身分。釋放必須是條件式 `DELETE ... WHERE option_value = 我寫進去的值`，不可用 `delete_option()`——逾時接管後，原持有者（還活著、只是跑很久）的 `finally` 會把接管者的鎖刪掉，保護窗口提前消失。身分只用時間戳也不夠：秒級精度下接管者與被接管者的值可能完全相同。
 
-18. **`email_payloads_tmp` 是 FIFO 佇列，不是單筆** — 一張訂單多商品各開一站時，兩個 `powerhouse_delay_send_email` 排程的 args 完全相同（同一個 `to` + `subscription_id`），無法區分。改成佇列前，第二站會覆蓋第一站 → 先跑的排程寄出第二站帳密並刪 meta → 第一站帳密永久遺失。`normalize_payload_queue()` 的 `array_is_list()` 分支負責相容舊格式（升級當下已排程但未執行的 action），**不可移除**。 **寄送失敗時不可原地保留不消費**：排程數量與 payload 數量是一對一的，原地不動等於燒掉一個排程而佇列沒前進，頭部持續失敗會把後面的站一起卡死（head-of-line blocking）。現在的作法是「失敗 → 計數 +1、payload 移到隊尾、排一次 `EMAIL_RETRY_DELAY` 後的重試」，連續 `EMAIL_PAYLOAD_MAX_ATTEMPTS` 次才丟棄並記 critical + 寫訂單備註（那是明文 `wp_admin_password` 唯一的存放處，丟棄前必須讓經銷商知道要手動補寄）。內部計數欄位 `_pp_send_attempts` 在寄信前會從 tokens 剝掉。
+18. **`email_payloads_tmp` 是 FIFO 佇列，不是單筆** — 一張訂單多商品各開一站時，兩個 `powerhouse_delay_send_email` 排程的 args 完全相同（同一個 `to` + `subscription_id`），無法區分。改成佇列前，第二站會覆蓋第一站 → 先跑的排程寄出第二站帳密並刪 meta → 第一站帳密永久遺失。`normalize_payload_queue()` 的 `array_is_list()` 分支負責相容舊格式（升級當下已排程但未執行的 action），**不可移除**。 **寄送失敗時不可原地保留不消費**：排程數量與 payload 數量是一對一的，原地不動等於燒掉一個排程而佇列沒前進，頭部持續失敗會把後面的站一起卡死（head-of-line blocking）。現在的作法是「失敗 → 計數 +1、payload 移到隊尾、排一次 `EMAIL_RETRY_DELAY` 後的重試」，連續 `EMAIL_PAYLOAD_MAX_ATTEMPTS` 次才丟棄並記 critical + 寫訂單備註（那是明文 `wp_admin_password` 唯一的存放處，丟棄前必須讓經銷商知道要手動補寄）。內部欄位 `_pp_send_attempts` 與 `_pp_sent_email_keys` 在寄信前會從 tokens 剝掉。
+
+    ⚠️ **重試是「整份 payload」重排，所以必須跳過上一輪已寄達的模板**：站台可以設多個 `site_sync` 模板，A 寄達、B 失敗時若不跳過，客戶會收到最多 `EMAIL_PAYLOAD_MAX_ATTEMPTS` 封內容相同的帳密信。已寄達清單記在 `_pp_sent_email_keys`，經 `send_mail()` 的 `$options['skip_keys']` 傳回去。**記 email `key` 不是 `action_name`**——所有開站模板的 action_name 都是 `'site_sync'`，分不出是哪一封。
+
+    ⚠️ **`send_mail()` 的例外必須接住**：payload 已被 `array_shift` 取出，但佇列新狀態要等函式尾端的 `save()` 才落地。例外若往上拋，meta 不改寫、不排重試，而排程已被消耗——雙站訂單會剩下一份「沒有排程會再去讀」的 payload。接住後走與 `wp_mail` 回 false 相同的計數/重排路徑。
+
+    ⚠️ **不可因為「防呆中止是確定性失敗」就提前丟棄 payload**：它仍是 `wp_admin_password` 唯一的存放處，提前丟等於連手動補寄的原始資料都沒有。噪音（重複告警）由 `$options['notify_dealer_on_abort']` 去重解決（只在 `$attempts === 0` 時為 true），代價遠低於資料遺失。
 
 19. **開站回應的 `data` 型別在兩架構不同** — PowerCloud 是 assoc array、WPCD 是 **stdClass**（`Fetch::site_sync()` 的 `json_decode` 沒帶 assoc）。寫入 meta 前一律經 `normalize_response_data()` 正規化，否則讀取端的 `is_array()` 對 stdClass 判 false（WPCD 訂單備註會變成空字串）。另外成功判定要用 **2xx 區間**，不是 `=== 200`——PowerCloud 成功回 201。
 
@@ -261,4 +267,8 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 21. **`is_same_site_ids()` 必須用字串比較，不可 `(int)` 正規化** — PowerCloud 的 websiteId 是 UUID，`(int)` 之後全部變成 `0`：UUID-A → UUID-B 的換綁會被判成「無變更」，`update_linked_site_ids()` 直接 `return false`，meta 不寫入（綁定靜默遺失）、`pp_linked_site_ids_updated` 也不 fire（補排與第三方監聽者全部收不到）。排序要指定 `SORT_STRING`——預設的 `SORT_REGULAR` 會把純數字字串當數值比，UUID 與數字 id 混在同一筆訂閱時排序不穩定，會讓相同集合被判成不同。數字 id 的既有行為不受影響（`'101'` 與 `101` 經 strval 後同樣是 `'101'`）。
 
-22. **開站通知信被防呆全數擋下時要主動告警經銷商** — `send_mail()` 的 `REQUIRED_SITE_TOKENS` 防呆是對的（寧可不寄，也不要把 `##SITEPASSWORD##` 寄給終端客戶），但它把失敗模式從「客戶收到有佔位符的信」變成「客戶一封都收不到」，而 `/customer-notification` 仍回 200、CloudServer 不會重送——沒有任何人會知道。因此「有模板被擋下且一封都沒寄成功」時，直接以 `wp_mail` 寄告警到站台 `admin_email`（**不是** `DailyBillingCron` 的 `ALERT_MAIL_TO`：改模板、查回調、手動補寄都是經銷商這一側的事）。只在全滅時發，避免多模板情境的雜訊；不可再走一次 `send_mail()`，會遞迴。
+22. **開站通知信被防呆全數擋下時要主動告警經銷商** — `send_mail()` 的 `REQUIRED_SITE_TOKENS` 防呆是對的（寧可不寄，也不要把 `##SITEPASSWORD##` 寄給終端客戶），但它把失敗模式從「客戶收到有佔位符的信」變成「客戶一封都收不到」，而 `/customer-notification` 仍回 200、CloudServer 不會重送——沒有任何人會知道。因此「有模板被擋下且一封都沒寄成功」時，直接以 `wp_mail` 寄告警到站台 `admin_email`（**不是** `DailyBillingCron` 的 `ALERT_MAIL_TO`：改模板、查回調、手動補寄都是經銷商這一側的事）。只在全滅時發，避免多模板情境的雜訊；不可再走一次 `send_mail()`，會遞迴。**重試路徑要把它關掉**（`$options['notify_dealer_on_abort'] = false`）——tokens 每輪都一樣，防呆必然再次全擋，不去重會寄出 `EMAIL_PAYLOAD_MAX_ATTEMPTS` 封相同告警把真正要看的那封淹掉。
+
+23. **開站 2xx 不等於綁定成功——綁定多一個 `websiteId` 條件** — `site_sync_powercloud()` 只在 `$response_obj->data['websiteId']` 非空時才寫 `pp_linked_site_ids`，但 `pp_site_url`、開站通知信排程、以及呼叫端的冪等旗標全都只看 HTTP 2xx。`FetchPowerCloud::site_sync()` 的 `data` 是 `json_decode($body, true)`，空 body / 非 JSON / 對端改欄位名都會讓它變成 `null`；而成功判定已從 `=== 201` 放寬為 2xx（200 / 202 也會進來）。缺 id 時 `is_site_sync()` 為 false → 停用/恢復、所有生命週期信、issue #22 補排全部**靜默**失效。**旗標仍然照落是刻意的**：放行重試會讓 PowerCloud 再建一個站（計費、資源、客戶收到第二組帳密都不可逆），而缺的只是一個 id——經銷商可從 PowerCloud 後台以 `namespace` 查出 websiteId 手動補綁。代價不對稱，所以選「可修復但需人工」。⛔ 但**絕不可靜默通過**：該分支必須寫 critical log + 訂單/訂閱備註（含 namespace），否則沒有任何人會知道。
+
+24. **`update_linked_site_ids()` 收到的是「完整清單」，四個寫入點一律附加語義** — 傳 `[$new_site_id]` 等於宣告「這個訂閱只有這一個站」。`/customer-notification` 原本就是這樣傳，一張訂單兩個商品各開一站時，第二次回調會擠掉站 1：站 1 從此不會被停用/恢復（錢照扣），而 `pp_site_url` 是「第一個站先寫、之後不覆蓋」，於是 `##URL##` 指向站 1、綁定卻只剩站 2；更糟的是 `pp_linked_site_ids_updated` 會 fire，把這次靜默遺失當成一次正常變更通知出去。四個寫入點（PowerCloud 開站、`/customer-notification`、`/link-site`、後台手動編輯）除了後台手動編輯（本來就是全量覆寫的 UI）之外，一律「先 `get_linked_site_ids()` 再 `in_array` 去重附加」。
