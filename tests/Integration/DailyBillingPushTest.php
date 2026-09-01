@@ -15,9 +15,9 @@
  *                dealer_id、billing_date 取自最近一次排程 slot、首推成功後記錄本地綁定值、
  *                domain 優先序、Basic Auth
  *   後置（事件）- 成功寫 info log（含計費站數與總金額）、排程漂移超過門檻寫 error log
- *   錯誤處理    - 無 dealer_id / 清單取得失敗 / 推送重試 3 次 / 重試上限告警 /
+ *   錯誤處理    - 無 dealer_id / 清單取得失敗 / 推送重試 3 次 / 重試上限寫告警 log /
  *                dailyCost 異常值 / API Key 不落地 log / /websites 回應原文不落地 log /
- *                設定類中止一律告警（log + 寄信給服務商）/ 本地綁定值不符 / 接收端回 403 綁定不符
+ *                設定類中止一律寫告警 log（不寄信）/ 本地綁定值不符 / 接收端回 403 綁定不符
  *   邊界條件    - 清單為空仍推送空 sites（無本地綁定值才跳過）、多個開站用戶共用一個 dealerId
  *                仍正常推送、多個相異 dealerId 中止、可計費網站解析不出 dealerId 時中止、
  *                全部非 running 仍推送金額 0、清單非空卻無可計費網站時告警
@@ -421,36 +421,6 @@ class DailyBillingPushTest extends TestCase {
 		}
 
 		return '';
-	}
-
-	/**
-	 * 取得第一封告警信（主旨 + 內文串起來，供內容斷言）
-	 *
-	 * @return string 沒寄信時回傳空字串
-	 */
-	private function alert_mail(): string {
-		if ( ! $this->mails ) {
-			return '';
-		}
-
-		return (string) ( $this->mails[0]['subject'] ?? '' ) . ' ' . (string) ( $this->mails[0]['message'] ?? '' );
-	}
-
-	/**
-	 * 斷言告警信寄給服務商（ALERT_MAIL_TO），而不是站台 admin_email
-	 */
-	private function assert_alert_mail_recipient(): void {
-		$this->assertNotEmpty( $this->mails, '異常須寄告警信' );
-
-		$to      = $this->mails[0]['to'] ?? '';
-		$to_list = is_array( $to ) ? $to : [ $to ];
-
-		$this->assertContains( DailyBillingCron::ALERT_MAIL_TO, $to_list, '告警信收件人應為服務商信箱' );
-		$this->assertNotContains(
-			(string) \get_option( 'admin_email' ),
-			$to_list,
-			'不得寄給站台 admin_email —— 那是經銷商，這些問題不是他能修的'
-		);
 	}
 
 	/**
@@ -1134,7 +1104,7 @@ class DailyBillingPushTest extends TestCase {
 		);
 
 		$this->assertNotSame( '', $this->alert_log(), '達重試上限應寫出告警 log' );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 		$this->assertNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), '不應再排程重試' );
 	}
 
@@ -1168,73 +1138,11 @@ class DailyBillingPushTest extends TestCase {
 	}
 
 	/**
-	 * Rule: 告警信收件人是服務商，不是站台 admin_email
-	 *
-	 * 站台 admin_email 是經銷商，而這裡每一種原因的處置都是服務商這邊要做的事。
-	 *
-	 * @group smoke
-	 */
-	public function test_alert_mail_goes_to_service_provider(): void {
-		$this->mock_http( [ $this->make_website() ], [ 'cloud_status' => 500 ] );
-
-		DailyBillingCron::run(
-			[
-				'billing_date' => '2026-08-19',
-				'retried'      => 3,
-			]
-		);
-
-		$this->assert_alert_mail_recipient();
-	}
-
-	/**
-	 * Rule: 告警信須讓收信人不必登入後台就知道「是誰」與「什麼問題」
-	 *
-	 * 收件匣同時收得到所有經銷商站的告警，主旨全都一樣時分不出是哪一台、也搜尋不到；
-	 * 站名（blogname）不能當識別 —— 沒改過站名的站全叫「我的網站」。
-	 *
-	 * @group smoke
-	 */
-	public function test_alert_mail_identifies_who_and_what(): void {
-		$this->mock_http( [ $this->make_website() ], [ 'cloud_status' => 500 ] );
-
-		DailyBillingCron::run(
-			[
-				'billing_date' => '2026-08-19',
-				'retried'      => 3,
-			]
-		);
-
-		$this->assertNotEmpty( $this->mails, '應寄出告警信' );
-		$subject = (string) ( $this->mails[0]['subject'] ?? '' );
-		$body    = (string) ( $this->mails[0]['message'] ?? '' );
-
-		$host = (string) \wp_parse_url( (string) \site_url(), PHP_URL_HOST );
-		$this->assertNotSame( '', $host, '測試環境應解析得出網域' );
-		$this->assertStringContainsString( $host, $subject, '主旨須含網域，收件匣才分得出是哪一台' );
-		$this->assertStringContainsString( 'push_failed', $subject, '主旨須含原因代碼' );
-		$this->assertStringContainsString( '2026-08-19', $subject, '主旨須含業務日期' );
-
-		// ① 哪一台站
-		$this->assertStringContainsString( $host, $body, '內文須含網域' );
-		$this->assertStringContainsString( (string) \admin_url(), $body, '內文須含後台連結' );
-		$this->assertStringContainsString( (string) \get_option( 'admin_email' ), $body, '內文須含站台管理員，才知道要找誰' );
-		$this->assertStringContainsString( (string) self::PARTNER_ID, $body, '內文須含 partner_id，那是與接收端對帳的號碼' );
-
-		// ② 發生什麼事
-		$this->assertStringContainsString( 'push_failed', $body, '內文須含原因代碼' );
-		$this->assertStringContainsString( '已重試', $body, '內文須含處置說明' );
-
-		// ③ 未送出的計費
-		$this->assertStringContainsString( '未送出金額', $body, '算得出金額時須顯示，漏推一天等於少收一天錢' );
-	}
-
-	/**
 	 * Rule: partner_id 未設定時不走告警路徑，只留原地的 error log
 	 *
 	 * partner_id 只在後台按下「連結帳號」時才寫入，因此「裝了外掛但從未連結」的站
-	 * （含模板站與由它 clone 出來的站）每天都會走到這裡。告警信全部集中寄到同一個信箱，
-	 * 這條路徑照寄的話量最大，而這類站沒有任何錢會漏 —— 收件匣會被它淹掉。
+	 * （含模板站與由它 clone 出來的站）每天都會走到這裡 —— 這類站沒有任何錢會漏，
+	 * 不值得多一筆帶完整 context 的告警。
 	 *
 	 * @group error
 	 */
@@ -1244,7 +1152,7 @@ class DailyBillingPushTest extends TestCase {
 		$result = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
 
 		$this->assertSame( 'no_partner_id', $result['reason'] );
-		$this->assertEmpty( $this->mails, 'partner_id 未設定不得寄信 —— 未連結的站每天都會走到這裡' );
+		$this->assertEmpty( $this->mails, '一律不寄信（經銷商與服務商信箱皆不寄）' );
 		$this->assertSame( '', $this->alert_log(), 'partner_id 未設定不寫告警 log，只留原地的 error log' );
 		$this->assert_log( 'error' );
 	}
@@ -1268,11 +1176,6 @@ class DailyBillingPushTest extends TestCase {
 		$this->assertStringContainsString( 'no_api_key', $alert, 'context 須含原因代碼' );
 		$this->assertStringNotContainsString( 'total_amount', $alert, '算不出金額時不得帶金額' );
 		$this->assertStringNotContainsString( 'site_count', $alert, '算不出站數時不得帶站數' );
-
-		$mail = $this->alert_mail();
-		$this->assertNotSame( '', $mail, '前置中止仍須寄告警信' );
-		$this->assertStringNotContainsString( '未送出金額', $mail, '算不出金額時信件不得顯示金額列' );
-		$this->assertStringNotContainsString( '未送出站數', $mail, '算不出站數時信件不得顯示站數列' );
 	}
 
 	/**
@@ -1648,7 +1551,7 @@ class DailyBillingPushTest extends TestCase {
 		$this->assert_not_pushed( '本地綁定值不符時不得推送' );
 		$this->assert_log( 'error' );
 		$this->assertNotSame( '', $this->alert_log(), '綁定值變動須立即寫告警 log' );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 		$this->assertNull( $this->next_scheduled( DailyBillingCron::RETRY_HOOK ), '非暫時性錯誤，不應重試' );
 		$this->assertSame(
 			'00000000-old0-old0-old0-000000000000',
@@ -1776,7 +1679,7 @@ class DailyBillingPushTest extends TestCase {
 		$this->assertSame( $error_code, $result['reason'] );
 		$alert = $this->alert_log();
 		$this->assertNotSame( '', $alert, "永久性錯誤 {$error_code} 須立即寫告警 log" );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 		$this->assertNull(
 			$this->next_scheduled( DailyBillingCron::RETRY_HOOK ),
 			"永久性錯誤 {$error_code} 重試三次也不會成功，不得進重試流程"
@@ -2009,7 +1912,7 @@ class DailyBillingPushTest extends TestCase {
 		$this->assertStringContainsString( 'Running', $all, 'log 應列出本次出現過的相異 status' );
 		$this->assertStringContainsString( 'restarting', $all );
 		$this->assertNotSame( '', $this->alert_log(), '狀態字典疑似改版須寫告警 log' );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 	}
 
 	/**
@@ -2038,7 +1941,6 @@ class DailyBillingPushTest extends TestCase {
 		DailyBillingCron::run();
 
 		$this->assertSame( '', $this->alert_log(), '有可計費網站時不應寫告警 log' );
-		$this->assertEmpty( $this->mails, '有可計費網站時不應寄告警信' );
 	}
 
 	// ========================================================================
@@ -2089,7 +1991,7 @@ class DailyBillingPushTest extends TestCase {
 		$this->assertSame( $reason, $result['reason'] );
 		$alert = $this->alert_log();
 		$this->assertNotSame( '', $alert, "中止原因 {$reason} 須寫告警 log" );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 
 		$this->assertStringContainsString(
 			$needle,
@@ -2326,7 +2228,7 @@ class DailyBillingPushTest extends TestCase {
 		$this->assert_not_pushed( '沒有 owner 的可計費網站不得靜默納入 payload' );
 		$this->assert_log( 'error' );
 		$this->assertNotSame( '', $this->alert_log(), '權限範圍疑似放大須寫告警 log' );
-		$this->assert_alert_mail_recipient();
+		$this->assertEmpty( $this->mails, '異常一律不寄信（經銷商與服務商信箱皆不寄）' );
 	}
 
 	/**
