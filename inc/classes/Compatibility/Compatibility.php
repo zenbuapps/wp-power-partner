@@ -8,6 +8,8 @@ use J7\PowerPartner\Plugin;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Action;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Status;
 use J7\PowerPartner\Domains\Settings\Core\WatchSettingHooks;
+use J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks;
+use J7\PowerPartner\Product\SiteSync;
 
 /** Class Compatibility 不同版本間的相容性設定 */
 final class Compatibility {
@@ -16,8 +18,35 @@ final class Compatibility {
 	const AS_COMPATIBILITY_ACTION = 'power_partner_compatibility_scheduler';
 	const OPTION_NAME             = 'power_partner_compatibility_scheduled';
 
+	/** Issue #22 一次性補排的守門 option（不可用 $previous_version，見 backfill_issue22_subscription_emails 註解） */
+	const ISSUE22_BACKFILL_OPTION = 'power_partner_issue22_backfilled';
+
+	/** Issue #22 分批補排的 ActionScheduler hook */
+	const ISSUE22_BACKFILL_ACTION = 'power_partner_issue22_backfill_batch';
+
+	/** Issue #22 每批處理的訂閱數 */
+	const ISSUE22_BACKFILL_BATCH_SIZE = 50;
+
+	/**
+	 * Issue #22 分批補排的頁數上限（安全閥）
+	 *
+	 * 分批是「處理滿一批就排下一頁」的自我遞迴，任何讓查詢回傳固定筆數的缺陷
+	 * （例如分頁參數失效）都會變成無限排程鏈。50 × 2000 = 10 萬筆訂閱，
+	 * 遠超過實務規模，撞到就是有問題，寧可停下來留 log。
+	 */
+	const ISSUE22_BACKFILL_MAX_PAGES = 2000;
+
 	/** Constructor */
 	public function __construct() {
+		/**
+		 * Issue #22 分批補排的 handler 必須綁在下面的 early return「之前」。
+		 *
+		 * 補排是跨多個 request 的：第一批排程之後，OPTION_NAME 已等於當前版本，
+		 * 之後每個 request 都會走 early return——若綁在 return 之後，
+		 * 後續批次的 ActionScheduler action 永遠找不到 callback，補排會停在第一批。
+		 */
+		\add_action( self::ISSUE22_BACKFILL_ACTION, [ __CLASS__, 'run_issue22_backfill_batch' ], 10, 1 );
+
 		$scheduled_version = \get_option(self::OPTION_NAME);
 		if (is_string($scheduled_version) && $scheduled_version === Plugin::$version) {
 			return;
@@ -64,6 +93,9 @@ final class Compatibility {
 			self::reschedule_disable_site_scheduler();
 		}
 
+		// issue #22：一次性補排既有訂閱的 next_payment / trial_end 信
+		self::backfill_issue22_subscription_emails();
+
 		/**
 		 * ============== END 相容性代碼 ==============
 		 */
@@ -72,6 +104,219 @@ final class Compatibility {
 		\update_option(self::OPTION_NAME, Plugin::$version);
 		\wp_cache_flush();
 		Plugin::logger(Plugin::$version . ' 已執行兼容性設定', 'info', []);
+	}
+
+	/**
+	 * 一次性補排既有訂閱的 next_payment / trial_end 信（issue #22）
+	 *
+	 * 3.5.1 以前，這幾種信對「新成立的訂閱」從來沒有排進 ActionScheduler——
+	 * 排程的唯一入口是 woocommerce_subscription_date_updated，而它 fire 時
+	 * pp_linked_site_ids 還沒寫入，schedule_email() 的 is_site_sync() 守門直接 return。
+	 * 新的補排機制（監聽 pp_linked_site_ids_updated）只救「未來會綁定或重綁」的訂閱，
+	 * 既有的受害訂閱要靠這裡補。
+	 *
+	 * 復用同一個 hook 而不是自己排程：單一程式路徑、天然 idempotent（下游的
+	 * maybe_unschedule + schedule_single 是淨零成長），且狀態守門與「寄送時點已過就跳過」
+	 * 全部生效。
+	 *
+	 * ⚠️ 不可改用 WatchSettingHooks::reschedule_all_subscription_email()——
+	 *    它第一件事是 as_unschedule_all_actions($hook)，會把催繳信 / 成功信 / 結束信 /
+	 *    customer_cancelled 一起清空，而那些信它不會重建。
+	 *
+	 * ⚠️ 守門用獨立 option key，不可用 $previous_version：constructor 在
+	 *    版本不同時會 delete_option(self::OPTION_NAME)，所以 compatibility() 內讀到的
+	 *    $previous_version 永遠是 '0.0.1'，version_compare 區塊每次升版都會跑。
+	 *
+	 * 📌 與上方 `version_compare('3.1.0')` 區塊的關係（刻意保留的重疊）：
+	 *    因為上述的 $previous_version 缺陷，那個區塊事實上每次升版都會執行，
+	 *    其中的 WatchSettingHooks::reschedule_all_subscription_email() 會對所有
+	 *    `_schedule_next_payment > now` 的 active/on-hold/pending-cancel 訂閱
+	 *    fire WATCH_NEXT_PAYMENT hook，而 constructor 的 $mapper 把 next_payment
+	 *    與 watch_next_payment 都綁在該 hook 上——也就是說它已經涵蓋了這裡的目標集合。
+	 *
+	 *    仍然保留本方法，理由有三：
+	 *      1. reschedule_all_subscription_email() 用 'limit' => -1 一次撈完所有訂閱，
+	 *         而它掛在 upgrader_process_complete（同步的 wp-admin request）上；
+	 *         訂閱數千筆的站台會 OOM 或撞 max_execution_time，此時補排整批失效。
+	 *         這裡的 50 筆分批是那條路徑失敗時的安全網。
+	 *      2. 這裡多了 $skip_if_past 保護（見 schedule_email()），不會把
+	 *         「時點已過」的提醒夾成「現在」而立刻寄出。
+	 *      3. 下游是 maybe_unschedule + schedule_single（unique 信淨零成長），
+	 *         重疊執行不會產生重複信件。
+	 *
+	 *    若哪天修好了 $previous_version 的守門缺陷，這裡就可以整段移除。
+	 *
+	 * @return void
+	 */
+	private static function backfill_issue22_subscription_emails(): void {
+		if (\get_option(self::ISSUE22_BACKFILL_OPTION)) {
+			return;
+		}
+
+		/**
+		 * 已經排進去的就不要再排一次。
+		 *
+		 * compatibility() 綁在 upgrader_process_complete 上，任何外掛/佈景更新都會觸發；
+		 * 旗標改成「排程成功才寫」之後（見下方），這道檢查取代原本
+		 * 「先寫旗標」所提供的防重複排程保護。
+		 */
+		if (\as_has_scheduled_action(self::ISSUE22_BACKFILL_ACTION)) {
+			return;
+		}
+
+		/**
+		 * ⚠️ 必須先確認排程真的排進去了，才寫旗標。
+		 *
+		 * as_enqueue_async_action() 在 ActionScheduler 尚未初始化時直接回 0 而不排任何東西
+		 * （AS 3.9.3 functions.php 的 ActionScheduler::is_initialized() 守門）。
+		 * 而 compatibility() 也綁在 upgrader_process_complete 上——那是同步的 wp-admin 請求，
+		 * 不保證 AS 已就緒。原本的「先寫旗標再排程」在這種情形下會把旗標寫死：
+		 * 旗標沒有任何清除路徑、後台也沒有手動觸發入口，整個 issue #22 的一次性補排
+		 * 就此永久跳過且無從察覺。
+		 *
+		 * 反過來「排程成功才寫旗標」最壞的情況只是兩個 request 競態下各排一條批次鏈，
+		 * 而補排本身是 idempotent（下游 maybe_unschedule + schedule_single 淨零成長），
+		 * 多跑一遍不會產生重複信件——兩種錯誤的代價不對稱。
+		 */
+		$action_id = \as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => 1 ]);
+
+		if (! $action_id) {
+			Plugin::logger(
+				'issue #22 一次性補排排程失敗（ActionScheduler 未就緒），旗標不寫入，下次相容性檢查時重試',
+				'error',
+				[]
+			);
+			return;
+		}
+
+		\update_option(self::ISSUE22_BACKFILL_OPTION, Plugin::$version);
+	}
+
+	/**
+	 * 分批執行 issue #22 的補排
+	 *
+	 * 為什麼要分批：wcs_get_subscriptions() 會為每一列 hydrate 一個完整的 WC_Subscription
+	 * 物件，再對每一筆做 ActionScheduler 寫入。訂閱數千筆的站台一次撈完會 OOM 或撞
+	 * max_execution_time，而 compatibility() 是綁在 upgrader_process_complete 上的——
+	 * 那是同步的 wp-admin 請求，任何外掛更新都會觸發。
+	 *
+	 * 每批處理完就排下一批，讓 ActionScheduler 自己控制節奏。
+	 *
+	 * @param int|string $page 頁碼（從 1 開始）
+	 * @return void
+	 */
+	public static function run_issue22_backfill_batch( int|string $page = 1 ): void {
+		if (! \function_exists('wcs_get_subscriptions')) {
+			return;
+		}
+
+		$page = max(1, (int) $page);
+
+		if ($page > self::ISSUE22_BACKFILL_MAX_PAGES) {
+			Plugin::logger(
+				'issue #22 補排超過頁數上限，中止分批鏈（可能是分頁參數失效導致每批撈到同一批資料）',
+				'error',
+				[
+					'page'      => $page,
+					'max_pages' => self::ISSUE22_BACKFILL_MAX_PAGES,
+				]
+			);
+			return;
+		}
+
+		$subscriptions = \wcs_get_subscriptions(
+			[
+				'subscription_status'    => [ 'active', 'on-hold' ],
+				'subscriptions_per_page' => self::ISSUE22_BACKFILL_BATCH_SIZE,
+				/**
+				 * ⚠️ offset 必須自己算，不能只給 paged。
+				 *
+				 * wcs_get_subscriptions() 的 wp_parse_args 預設帶 'offset' => 0，
+				 * 而且無條件把它塞進 $query_args。HPOS 的 OrdersTableQuery::process_limit()
+				 * 是「offset 未設定時才用 paged 換算」：
+				 *     $offset = ( arg_isset('offset') ? absint(...) : false );
+				 *     if ( false === $offset ... ) { $offset = ($page - 1) * $row_count; }
+				 * 而 arg_isset() 的 SKIPPED_VALUES 是 ['', [], null]（strict 比對），0 不在其中
+				 * → offset 被視為「有設定」且值為 0 → paged 整個被無視，
+				 *   每一批都是 LIMIT 0, 50 撈到同一批人。
+				 *
+				 * 後果有兩層：第 51 筆之後的訂閱永遠補不到（issue #22 對 HPOS 站台等於沒修），
+				 * 而且 $count 恆等於 BATCH_SIZE → 下方「還有下一批」的條件恆真 → 無限排程鏈。
+				 * 非 HPOS 不受影響（WP_Query 的 empty($q['offset']) 對 0 為 true，會走 paged）。
+				 *
+				 * paged 一併保留：非 HPOS 路徑用它，兩邊算出來的區間一致。
+				 */
+				'offset'                 => ( $page - 1 ) * self::ISSUE22_BACKFILL_BATCH_SIZE,
+				'paged'                  => $page,
+				/**
+				 * 明確指定穩定排序。
+				 *
+				 * WCS 的預設是 start_date DESC，而 offset 分頁在
+				 * 排序鍵有重複值時（批次匯入的訂閱常常同一秒建立）不保證跨頁穩定，
+				 * 會出現同一筆被掃兩次、另一筆從未被掃到。ID 是唯一鍵，不會重複。
+				 */
+				'orderby'                => 'ID',
+				'order'                  => 'ASC',
+				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
+					[
+						'key'     => SiteSync::LINKED_SITE_IDS_META_KEY,
+						'compare' => 'EXISTS',
+					],
+				],
+			]
+		);
+
+		if (! $subscriptions) {
+			Plugin::logger('issue #22 一次性補排完成（已無更多訂閱）', 'info', [ 'last_page' => $page ]);
+			return;
+		}
+
+		$email_hooks = SubscriptionEmailHooks::instance();
+
+		$count = 0;
+		foreach ($subscriptions as $subscription) {
+			/**
+			 * WCS 的 wcs_get_subscriptions() 是 `$out[$id] = wcs_get_subscription($id)`，
+			 * 後者取不到物件時會塞 false 進來（訂閱在查詢與 hydrate 之間被刪除）。
+			 * 少了這道守衛，->get_id() 會 fatal，而 fatal 會讓這個 ActionScheduler
+			 * action 標記失敗、後續批次全部不再排——整條補排鏈就斷在這裡。
+			 *
+			 * 標成 mixed 是因為 stub 宣告的回傳型別是 WC_Subscription[]，
+			 * PHPStan 會把下面的 instanceof 判成恆真——但實際資料可能是 false。
+			 *
+			 * @var mixed $subscription
+			 */
+			if (! ( $subscription instanceof \WC_Subscription )) {
+				++$count; // 仍要計數，否則這一頁會被誤判為「最後一頁」而中止分批
+				continue;
+			}
+
+			/**
+			 * 直接呼叫補排方法，不 fire pp_linked_site_ids_updated。
+			 *
+			 * 那個 hook 的公開契約是「pp_linked_site_ids 真的變更後」（見
+			 * ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION 與 .claude/CLAUDE.md），
+			 * 而這裡的綁定根本沒有變動。用 $new === $old 假造一次事件，會讓任何
+			 * 依契約寫成「站台剛被掛上/卸下，同步到下游」的第三方監聽者，
+			 * 在外掛升級時對站上每一筆訂閱各收到一次不存在的變更。
+			 */
+			$email_hooks->backfill_subscription_emails($subscription);
+			++$count;
+		}
+
+		Plugin::logger(
+			"issue #22 補排第 {$page} 批完成，處理 {$count} 筆訂閱",
+			'info',
+			[
+				'page'  => $page,
+				'count' => $count,
+			]
+		);
+
+		// 還有可能有下一批
+		if ($count >= self::ISSUE22_BACKFILL_BATCH_SIZE) {
+			\as_enqueue_async_action(self::ISSUE22_BACKFILL_ACTION, [ 'page' => $page + 1 ]);
+		}
 	}
 
 	/**

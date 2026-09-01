@@ -825,4 +825,936 @@ class SubscriptionEmailHooksTest extends TestCase {
 			"days=1 的成功信 timestamp {$ts} 應不早於 time()+600=" . ( $time_before + 600 )
 		);
 	}
+
+	// ========== issue #21：開站信重複寄送 + 變數未取代 ==========
+
+	/**
+	 * 用任意 email 設定重建 singleton
+	 *
+	 * setup_hooks_with_all_emails() 寫死 success/failed/end 三種信，
+	 * issue #21 的案例需要 site_sync 模板，故另開一個泛用版本。
+	 *
+	 * @param array<int, array<string, mixed>> $email_configs make_email_config() 的結果陣列
+	 * @return SubscriptionEmailHooks
+	 */
+	private function setup_hooks_with( array $email_configs ): SubscriptionEmailHooks {
+		$this->setup_settings_with_emails( $email_configs );
+
+		$reflection = new \ReflectionClass( SubscriptionEmailHooks::class );
+		$property   = $reflection->getProperty( 'instance' );
+		$property->setAccessible( true );
+		$property->setValue( null, null );
+
+		return SubscriptionEmailHooks::instance();
+	}
+
+	/**
+	 * 開站當下不應再排程 site_sync 信（issue #21 路徑 A 已移除）
+	 *
+	 * 刻意使用 create_pp_subscription()——它會寫入 pp_linked_site_ids，
+	 * 也就是 schedule_email() 的 is_site_sync() 守門「會通過」的狀態。
+	 * 這樣才能證明「沒有排程」是因為 hook 綁定被移除，而不是被守門擋掉。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_觸發pp_site_sync_by_subscription_不應排程site_sync信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$email_key = 'test_site_sync_' . uniqid();
+		$hooks     = $this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => $email_key,
+						'action_name' => 'site_sync',
+						'days'        => '0',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$this->assertNotEmpty(
+			$hooks->get_emails( 'site_sync' ),
+			'前置條件失敗：settings 中找不到啟用的 site_sync 模板，測試將失去意義'
+		);
+
+		$subscription = $this->create_pp_subscription( 'active' );
+
+		// 守門確認：此訂閱確實已綁站，is_site_sync() 會通過
+		$this->assertNotEmpty(
+			$subscription->get_meta( SiteSync::LINKED_SITE_IDS_META_KEY, true ),
+			'前置條件失敗：訂閱應已綁定站台，否則無法證明是 hook 移除而非守門擋下'
+		);
+
+		do_action( 'pp_site_sync_by_subscription', $subscription );
+
+		$this->assert_no_pending_action(
+			$subscription->get_id(),
+			'site_sync',
+			'pp_site_sync_by_subscription 不應再排程 site_sync 信（issue #21：該路徑拿不到站台變數）'
+		);
+	}
+
+	/**
+	 * 站台變數齊全時應正常寄出，且信中不留下任何佔位符
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_send_mail_模板需要的站台變數齊全時應寄出且不留下佔位符(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##　後台：##ADMINURL##　帳號：##SITEUSERNAME##　密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$sent_body = null;
+		add_filter(
+			'pre_wp_mail',
+			function ( $return, $atts ) use ( &$sent_body ) {
+				$sent_body = $atts['message'];
+				return true;
+			},
+			10,
+			2
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[
+				'FRONTURL'     => 'https://abc.wpsite.pro',
+				'ADMINURL'     => 'https://abc.wpsite.pro/wp-admin',
+				'SITEUSERNAME' => 'customer@example.com',
+				'SITEPASSWORD' => 'p@ssw0rd',
+			]
+		);
+
+		$this->assertSame( [ 'site_sync' ], $success_emails, '站台變數齊全時應寄送成功' );
+		$this->assertSame( [], $failed_emails, '不應有失敗項目' );
+		$this->assertNotNull( $sent_body, 'wp_mail 應被呼叫' );
+		$this->assertStringNotContainsString( '##', (string) $sent_body, '寄出的信件中不應殘留任何 ## 佔位符' );
+		$this->assertStringContainsString( 'https://abc.wpsite.pro/wp-admin', (string) $sent_body );
+	}
+
+	/**
+	 * 缺少關鍵站台變數時應中止寄送並計入失敗（issue #21 防呆）
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_send_mail_缺少SITEPASSWORD時應中止寄送並計入失敗(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##　後台：##ADMINURL##　帳號：##SITEUSERNAME##　密碼：##SITEPASSWORD##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$recipients = [];
+		add_filter(
+			'pre_wp_mail',
+			function ( $return, $atts ) use ( &$recipients ) {
+				$to           = $atts['to'] ?? '';
+				$recipients[] = is_array( $to ) ? implode( ',', $to ) : (string) $to;
+				return true;
+			},
+			10,
+			2
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[
+				'FRONTURL'     => 'https://abc.wpsite.pro',
+				'ADMINURL'     => 'https://abc.wpsite.pro/wp-admin',
+				'SITEUSERNAME' => 'customer@example.com',
+				// SITEPASSWORD 刻意缺席
+			]
+		);
+
+		$this->assertNotContains( 'customer@example.com', $recipients, '缺少關鍵站台變數時不應把半成品寄給客戶' );
+		$this->assertSame( [], $success_emails, '不應有成功項目' );
+		$this->assertSame( [ 'site_sync' ], $failed_emails, '被防呆擋下的信應計入 failed_emails' );
+		$this->assertContains(
+			(string) get_option( 'admin_email' ),
+			$recipients,
+			'全部模板都被防呆擋下時應寄告警信給經銷商——否則沒有任何人知道客戶收不到帳密'
+		);
+	}
+
+	/**
+	 * 有模板成功寄出時，不應額外寄告警信
+	 *
+	 * 守住告警的「不吵」邊界：只有「一封都沒寄成功」才值得打擾經銷商。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_send_mail_有模板寄出成功時不應寄告警信給經銷商(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '您的網站已開通',
+						'body'        => '<p>前台：##FRONTURL##</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$recipients = [];
+		add_filter(
+			'pre_wp_mail',
+			function ( $return, $atts ) use ( &$recipients ) {
+				$to           = $atts['to'] ?? '';
+				$recipients[] = is_array( $to ) ? implode( ',', $to ) : (string) $to;
+				return true;
+			},
+			10,
+			2
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[ 'FRONTURL' => 'https://abc.wpsite.pro' ]
+		);
+
+		$this->assertSame( [ 'site_sync' ], $success_emails, '模板未用到缺席的 token，應照常寄出' );
+		$this->assertSame( [], $failed_emails );
+		$this->assertSame( [ 'customer@example.com' ], $recipients, '寄成功時只該有客戶那一封，不應多寄告警信' );
+	}
+
+	/**
+	 * 模板沒用到站台變數時，tokens 不全也應照常寄出
+	 *
+	 * 這條守住防呆的「不誤殺」邊界：白名單只在模板真的用到該 token 時才生效。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_send_mail_模板未使用站台變數時_tokens不全也應照常寄出(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'subject'     => '感謝您的訂購',
+						'body'        => '<p>##FIRST_NAME## 您好，感謝訂購。</p>',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$mail_called = false;
+		add_filter(
+			'pre_wp_mail',
+			function ( $return ) use ( &$mail_called ) {
+				$mail_called = true;
+				return true;
+			},
+			10,
+			1
+		);
+
+		[ $success_emails, $failed_emails ] = SubscriptionEmailHooks::send_mail(
+			'customer@example.com',
+			[ 'FIRST_NAME' => '小明' ]
+		);
+
+		$this->assertTrue( $mail_called, '模板未使用站台變數時，不該因 tokens 不全而擋信' );
+		$this->assertSame( [ 'site_sync' ], $success_emails );
+		$this->assertSame( [], $failed_emails );
+	}
+
+	// ========== issue #22：新訂閱的 next_payment 信排不進 ActionScheduler ==========
+
+	/**
+	 * 建立「尚未綁定網站」的訂閱，可選擇帶入 next_payment / trial_end 日期
+	 *
+	 * 與 create_pp_subscription() 的差別：**不寫入 pp_linked_site_ids**，
+	 * 模擬「新訂閱剛建立、站台還沒開好」的狀態，也就是 is_site_sync() 守門會擋下的當口。
+	 *
+	 * 注意日期必須在建立時就寫入——update_dates() 會 fire woocommerce_subscription_date_updated，
+	 * 若在設定 meta 之後才呼叫，就會走到正常排程路徑，測試等於白做。
+	 *
+	 * @param string   $status          初始狀態（無 wc- 前綴）
+	 * @param int|null $next_payment_ts next_payment 的 unix timestamp
+	 * @param int|null $trial_end_ts    trial_end 的 unix timestamp
+	 * @return \WC_Subscription
+	 */
+	private function create_subscription_without_site_binding(
+		string $status = 'active',
+		?int $next_payment_ts = null,
+		?int $trial_end_ts = null
+	): \WC_Subscription {
+		$order = wc_create_order(
+			[
+				'customer_id' => $this->customer_id,
+				'status'      => 'processing',
+			]
+		);
+		$this->assertInstanceOf( \WC_Order::class, $order, '建立父訂單失敗' );
+		$order->set_billing_email( 'test-sub-email-hooks@example.com' );
+		$order->save();
+		$this->parent_order = $order;
+
+		$subscription = wcs_create_subscription(
+			[
+				'order_id'         => $order->get_id(),
+				'status'           => $status,
+				'billing_period'   => 'month',
+				'billing_interval' => 1,
+				'customer_id'      => $this->customer_id,
+			]
+		);
+		$this->assertInstanceOf( \WC_Subscription::class, $subscription, '建立訂閱失敗' );
+
+		$dates = [];
+		if ( null !== $next_payment_ts ) {
+			$dates['next_payment'] = gmdate( 'Y-m-d H:i:s', $next_payment_ts );
+		}
+		if ( null !== $trial_end_ts ) {
+			$dates['trial_end'] = gmdate( 'Y-m-d H:i:s', $trial_end_ts );
+		}
+		if ( $dates ) {
+			$subscription->update_dates( $dates );
+			$subscription->save();
+		}
+
+		// 守門：此訂閱不應被視為開站訂閱
+		$this->assertEmpty(
+			$subscription->get_meta( SiteSync::LINKED_SITE_IDS_META_KEY, true ),
+			'前置條件失敗：此 helper 不應寫入 pp_linked_site_ids'
+		);
+
+		return $subscription;
+	}
+
+	/**
+	 * 斷言某訂閱 + action_name 的 pending 排程恰好 N 筆
+	 *
+	 * @param int    $subscription_id 訂閱 ID
+	 * @param string $action_name     群組名稱
+	 * @param int    $expected        預期筆數
+	 * @return void
+	 */
+	private function assert_pending_action_count( int $subscription_id, string $action_name, int $expected ): void {
+		$matched = 0;
+		foreach ( $this->get_pending_actions( $action_name ) as $action ) {
+			$args = $action->get_args();
+			if ( ( $args[0]['subscription_id'] ?? null ) === $subscription_id ) {
+				++$matched;
+			}
+		}
+
+		$this->assertSame(
+			$expected,
+			$matched,
+			"訂閱 #{$subscription_id} 的 {$action_name} pending 排程應為 {$expected} 筆，實際 {$matched} 筆"
+		);
+	}
+
+	/**
+	 * 建立一封 next_payment 模板並重建 singleton
+	 *
+	 * @param string $days     天數
+	 * @param string $operator after|before
+	 * @return SubscriptionEmailHooks
+	 */
+	private function setup_next_payment_email( string $days = '7', string $operator = 'before' ): SubscriptionEmailHooks {
+		$hooks = $this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_next_payment_' . uniqid(),
+						'action_name' => 'next_payment',
+						'days'        => $days,
+						'operator'    => $operator,
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$this->assertNotEmpty( $hooks->get_emails( 'next_payment' ), '前置條件失敗：找不到 next_payment 模板' );
+
+		return $hooks;
+	}
+
+	/**
+	 * 回歸基線：尚未綁站時，watch_next_payment 觸發不應排程（守門仍在）
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_新訂閱尚未綁定網站時_watch_next_payment不應排程(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email();
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+
+		do_action(
+			\J7\Powerhouse\Domains\Subscription\Shared\Enums\Action::WATCH_NEXT_PAYMENT->get_action_hook(),
+			$subscription,
+			[]
+		);
+
+		$this->assert_no_pending_action(
+			$subscription->get_id(),
+			'next_payment',
+			'尚未綁站時 is_site_sync() 守門應擋下排程——這是 issue #22 的病因，守門本身不改'
+		);
+	}
+
+	/**
+	 * 綁定網站後應補排 next_payment 信，時間為扣款前 7 天
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_綁定網站後應補排next_payment信且時間為扣款前7天(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+		$subscription    = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$sub_id          = $subscription->get_id();
+
+		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：綁定前不應有排程' );
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, '綁定網站後應補排 next_payment 信（issue #22）' );
+
+		$expected = $next_payment_ts - 7 * DAY_IN_SECONDS;
+		$this->assertEqualsWithDelta(
+			$expected,
+			$ts,
+			60,
+			"補排時間應為扣款前 7 天（{$expected}），實際 {$ts}"
+		);
+	}
+
+	/**
+	 * 補排時「扣款前 N 天」已成過去，應跳過不排（而不是排在現在立刻寄）
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_補排時扣款前N天已成過去_應跳過不排程(): void {
+		$this->skip_if_no_subscriptions();
+
+		// 下次扣款只剩 3 天，卻設定「扣款前 7 天」提醒 → 提醒時點已過
+		$this->setup_next_payment_email( '7', 'before' );
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 3 * DAY_IN_SECONDS );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$this->assert_no_pending_action(
+			$sub_id,
+			'next_payment',
+			'提醒時點已過時應跳過，不可被 max() 夾成「現在」而立刻寄出「7 天後將扣款」'
+		);
+	}
+
+	/**
+	 * days=0 的 next_payment 信（扣款當下寄）不應被「過去時間」邏輯誤殺
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_補排days等於0的next_payment信_扣款日仍在未來時應照常排程(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '0', 'after' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+		$subscription    = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$sub_id          = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, 'days=0 是合法設定，扣款日在未來時應照常排程' );
+		$this->assertEqualsWithDelta( $next_payment_ts, $ts, 60, 'days=0 的排程時間應等於 next_payment 本身' );
+	}
+
+	/**
+	 * 訂閱沒有下次扣款日時（get_time() 回 0），補排應跳過
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_訂閱無下次扣款日時_補排應跳過不排程(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		// 刻意不設 next_payment 日期
+		$subscription = $this->create_subscription_without_site_binding( 'active' );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$this->assert_no_pending_action(
+			$sub_id,
+			'next_payment',
+			'無 next_payment 日期時 get_time() 回 0，錨點減 N 天成為過去，應跳過而非立刻寄'
+		);
+	}
+
+	/**
+	 * 已取消的訂閱綁定網站時不應補排 next_payment 信
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_已取消訂閱綁定網站時_不應補排next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email();
+		$subscription = $this->create_subscription_without_site_binding( 'cancelled', time() + 30 * DAY_IN_SECONDS );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$this->assert_no_pending_action(
+			$sub_id,
+			'next_payment',
+			'已取消訂閱不會再扣款，排了必定被 action_callback 複查跳過，不該佔用 AS row'
+		);
+	}
+
+	/**
+	 * 綁定網站後也應補排 trial_end 信
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_綁定網站後應補排trial_end信且時間為試用結束前3天(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_trial_end_' . uniqid(),
+						'action_name' => 'trial_end',
+						'days'        => '3',
+						'operator'    => 'before',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$trial_end_ts = time() + 10 * DAY_IN_SECONDS;
+		$subscription = $this->create_subscription_without_site_binding( 'active', null, $trial_end_ts );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'trial_end' );
+		$this->assertNotNull( $ts, '綁定網站後應補排 trial_end 信' );
+		$this->assertEqualsWithDelta( $trial_end_ts - 3 * DAY_IN_SECONDS, $ts, 60, 'trial_end 補排時間應為試用結束前 3 天' );
+	}
+
+	/**
+	 * 重複變更綁定不應讓排程累積
+	 *
+	 * 用遞增的數字 id 陣列，避開 is_same_site_ids() 對 UUID 的 (int) 正規化缺陷
+	 * （見 plan 的相鄰缺陷 N1，另案處理）。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_重複變更綁定網站_next_payment排程不應重複累積(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email();
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+		$this->assert_pending_action_count( $sub_id, 'next_payment', 1 );
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101', '102' ] );
+		$this->assert_pending_action_count( $sub_id, 'next_payment', 1 );
+	}
+
+	/**
+	 * 移除全部綁定時，應取消尚未寄出的 next_payment 信
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_移除全部綁定網站時_應取消未寄出的next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email();
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+		$this->assert_has_pending_action( $sub_id, 'next_payment', '前置條件：綁定後應有排程' );
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [] );
+
+		$this->assert_no_pending_action(
+			$sub_id,
+			'next_payment',
+			'綁定被清空後應取消未寄出的里程碑信（schedule_email 的守門是 return 在 maybe_unschedule 之前，清不掉）'
+		);
+	}
+
+	// ========== #21 × #22 交會點：補排絕不可排到 site_sync ==========
+
+	/**
+	 * 綁定網站補排時，絕不排程 site_sync 信
+	 *
+	 * 這是本次改動最關鍵的一條測試。pp_linked_site_ids_updated 在 PowerCloud 路徑是
+	 * 在開站流程內同步 fire 的——若補排白名單誤含 site_sync，會原地重現 issue #21，
+	 * 而且因為 fire 當下 meta 已寫入、is_site_sync() 守門已通過，
+	 * 連原本不受影響的 WPCD 也會一起開始重複寄壞信。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_綁定網站補排時_絕不排程site_sync信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$hooks = $this->setup_hooks_with(
+			[
+				$this->make_email_config(
+					[
+						'key'         => 'test_site_sync_' . uniqid(),
+						'action_name' => 'site_sync',
+						'days'        => '0',
+						'enabled'     => '1',
+					]
+				),
+				$this->make_email_config(
+					[
+						'key'         => 'test_next_payment_' . uniqid(),
+						'action_name' => 'next_payment',
+						'days'        => '7',
+						'operator'    => 'before',
+						'enabled'     => '1',
+					]
+				),
+			]
+		);
+
+		$this->assertNotEmpty( $hooks->get_emails( 'site_sync' ), '前置條件：需有啟用的 site_sync 模板，否則測試失去意義' );
+
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+		$sub_id       = $subscription->get_id();
+
+		\J7\PowerPartner\ShopSubscription::update_linked_site_ids( $sub_id, [ '101' ] );
+
+		$this->assert_has_pending_action( $sub_id, 'next_payment', '補排應涵蓋 next_payment' );
+		$this->assert_no_pending_action(
+			$sub_id,
+			'site_sync',
+			'補排白名單絕不可含 site_sync——會原地重現 issue #21 並擴散到 WPCD'
+		);
+	}
+
+	/**
+	 * 一次性補救：既有訂閱（已綁站但沒排程）經由同一個 hook 也應補排
+	 *
+	 * 對應 Compatibility::backfill_issue22_subscription_emails() 的行為——
+	 * 它直接 do_action 這個 hook，這裡驗證那條路徑確實有效。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_既有已綁站訂閱直接觸發hook也應補排next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		// 模擬「既有受害訂閱」：已綁站，但因為時序問題從來沒排程過
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->update_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-site-001' );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：既有訂閱不應已有排程' );
+
+		// 綁定事件的公開路徑（WPCD 回調 / 後台編輯 / change_linked_site_ids 都走這裡）
+		do_action( \J7\PowerPartner\ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, [], [] );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, '既有已綁站訂閱應能經由同一個 hook 補排' );
+		$this->assertEqualsWithDelta( $next_payment_ts - 7 * DAY_IN_SECONDS, $ts, 60 );
+	}
+
+	// ========== Compatibility 的一次性分批補排 ==========
+
+	/**
+	 * 一次性分批補排應排出 next_payment 信
+	 *
+	 * 同時驗證查詢參數（orderby=ID）在 wcs_get_subscriptions 可用——
+	 * 若 orderby 不被接受，這個查詢會回空、補排整批靜默失效。
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_一次性分批補排應排出next_payment信(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		// 直接寫 meta，不走 update_linked_site_ids()——避免綁定事件先把信排掉，
+		// 這樣才測得到「批次補排」本身有沒有作用
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-001', false );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		$this->assert_no_pending_action( $sub_id, 'next_payment', '前置條件：批次跑之前不應有排程' );
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		$ts = $this->get_pending_action_timestamp( $sub_id, 'next_payment' );
+		$this->assertNotNull( $ts, '批次補排應為既有已綁站訂閱排出 next_payment 信' );
+		$this->assertEqualsWithDelta( $next_payment_ts - 7 * DAY_IN_SECONDS, $ts, 60 );
+	}
+
+	/**
+	 * 一次性分批補排不可 fire pp_linked_site_ids_updated
+	 *
+	 * 那個 hook 的公開契約是「綁定真的變更後」。批次補排時綁定沒有變動，
+	 * 假造事件會讓依契約寫的第三方監聽者在升級時對每一筆訂閱各收到一次不存在的變更。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_一次性分批補排不應fire綁定變更hook(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+
+		$subscription = $this->create_subscription_without_site_binding( 'active', time() + 30 * DAY_IN_SECONDS );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-002', false );
+		$subscription->save();
+
+		$fired = 0;
+		add_action(
+			\J7\PowerPartner\ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		$this->assertSame( 0, $fired, '批次補排不可假造綁定變更事件' );
+	}
+
+	/**
+	 * 批次中若有取不到物件的訂閱，不可中斷整條補排鏈
+	 *
+	 * wcs_get_subscriptions() 是 `$out[$id] = wcs_get_subscription($id)`，
+	 * 後者取不到時會塞 false。少了守衛，->get_id() 會 fatal，
+	 * 而 fatal 會讓這個 ActionScheduler action 失敗、後續批次全部不再排。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_批次補排遇到無效訂閱不應中斷(): void {
+		$this->skip_if_no_subscriptions();
+
+		$this->setup_next_payment_email( '7', 'before' );
+		$next_payment_ts = time() + 30 * DAY_IN_SECONDS;
+
+		$subscription = $this->create_subscription_without_site_binding( 'active', $next_payment_ts );
+		$subscription->add_meta_data( SiteSync::LINKED_SITE_IDS_META_KEY, 'legacy-batch-003', false );
+		$subscription->save();
+		$sub_id = $subscription->get_id();
+
+		// 在結果集前面插入一筆 false，模擬「查到 id 但 hydrate 不出物件」
+		$injector = static function ( $subscriptions ) use ( $subscription ) {
+			return [ 0 => false ] + [ $subscription->get_id() => $subscription ];
+		};
+		add_filter( 'woocommerce_got_subscriptions', $injector, 10, 1 );
+
+		\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+
+		remove_filter( 'woocommerce_got_subscriptions', $injector, 10 );
+
+		$this->assertNotNull(
+			$this->get_pending_action_timestamp( $sub_id, 'next_payment' ),
+			'無效項目應被跳過，同批次的有效訂閱仍要補排成功'
+		);
+	}
+
+	// ========== 分批補排的分頁正確性 ==========
+
+	/**
+	 * 攔截 wcs_get_subscriptions() 實際送出的 query args
+	 *
+	 * @param callable $run 要執行的動作
+	 * @return array<int, array<string, mixed>> 每次查詢的 query args
+	 */
+	private function capture_subscription_query_args( callable $run ): array {
+		$captured = [];
+		$spy      = static function ( $query_args, $args ) use ( &$captured ) {
+			$captured[] = $query_args;
+			return $query_args;
+		};
+
+		add_filter( 'woocommerce_get_subscriptions_query_args', $spy, 10, 2 );
+		$run();
+		remove_filter( 'woocommerce_get_subscriptions_query_args', $spy, 10 );
+
+		return $captured;
+	}
+
+	/**
+	 * 分批補排的第 N 頁必須帶正確的 offset
+	 *
+	 * wcs_get_subscriptions() 的 wp_parse_args 預設帶 'offset' => 0 並無條件塞進 query args。
+	 * HPOS 的 OrdersTableQuery::process_limit() 是「offset 未設定時才用 paged 換算」，
+	 * 而它的 SKIPPED_VALUES 是 ['', [], null]（strict 比對）——0 不在其中，
+	 * 於是 offset 被視為「有設定且為 0」，paged 整個被無視，每一批都撈到同一批人。
+	 *
+	 * 後果有兩層：第 BATCH_SIZE 筆之後的訂閱永遠補不到（issue #22 對 HPOS 站台等於沒修），
+	 * 而且每批處理數恆等於 BATCH_SIZE → 「還有下一批」的條件恆真 → 無限排程鏈。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_分批補排第二頁必須帶正確的offset(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 2 );
+			}
+		);
+
+		$this->assertNotEmpty( $captured, '第 2 頁應該真的發出查詢' );
+		$this->assertSame(
+			\J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_BATCH_SIZE,
+			(int) ( $captured[0]['offset'] ?? -1 ),
+			'第 2 頁必須帶 offset = BATCH_SIZE——只給 paged 在 HPOS 下會被 offset=0 蓋掉，每批都撈同一批人'
+		);
+	}
+
+	/**
+	 * 第一頁的 offset 應為 0
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_分批補排第一頁offset為零(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch( 1 );
+			}
+		);
+
+		$this->assertNotEmpty( $captured );
+		$this->assertSame( 0, (int) ( $captured[0]['offset'] ?? -1 ), '第 1 頁的 offset 應為 0' );
+	}
+
+	/**
+	 * 超過頁數上限時應中止，不再發查詢
+	 *
+	 * 分批是「處理滿一批就排下一頁」的自我遞迴，任何讓查詢回傳固定筆數的缺陷
+	 * 都會變成無限排程鏈。這道安全閥是最後一層防線。
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_分批補排超過頁數上限應中止(): void {
+		$this->skip_if_no_subscriptions();
+
+		$captured = $this->capture_subscription_query_args(
+			static function () {
+				\J7\PowerPartner\Compatibility\Compatibility::run_issue22_backfill_batch(
+					\J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_MAX_PAGES + 1
+				);
+			}
+		);
+
+		$this->assertSame( [], $captured, '超過上限應直接 return，連查詢都不該發' );
+	}
+
+	/**
+	 * 一次性補排的旗標必須等排程真的排進去才寫
+	 *
+	 * as_enqueue_async_action() 在 ActionScheduler 尚未初始化時回 0 而不排任何東西，
+	 * 而 compatibility() 也綁在 upgrader_process_complete（同步 wp-admin request）上。
+	 * 「先寫旗標」在那種情形下會把旗標寫死——旗標沒有清除路徑、後台也沒有手動入口，
+	 * 整個補排就此永久跳過且無從察覺。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_一次性補排排程失敗時不可寫入旗標(): void {
+		$this->skip_if_no_subscriptions();
+
+		\delete_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION );
+
+		$reflection = new \ReflectionClass( \J7\PowerPartner\Compatibility\Compatibility::class );
+		$method     = $reflection->getMethod( 'backfill_issue22_subscription_emails' );
+		$method->setAccessible( true );
+
+		// 讓排程「排不進去」（AS 未就緒時 as_enqueue_async_action 回 0 就是這個效果）
+		$blocker = static fn() => 0;
+		add_filter( 'pre_as_enqueue_async_action', $blocker, 10, 1 );
+		$method->invoke( null );
+		remove_filter( 'pre_as_enqueue_async_action', $blocker, 10 );
+
+		$this->assertFalse(
+			\get_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION ),
+			'排程沒排進去就寫旗標，等於讓補排永久跳過且無從察覺'
+		);
+
+		// 排程正常時才寫旗標
+		$method->invoke( null );
+		$this->assertNotFalse(
+			\get_option( \J7\PowerPartner\Compatibility\Compatibility::ISSUE22_BACKFILL_OPTION ),
+			'排程成功後應寫入旗標，避免下次重複排程'
+		);
+	}
 }

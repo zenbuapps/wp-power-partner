@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Api;
 
 use J7\PowerPartner\Plugin;
-use J7\PowerPartner\Utils\Token;
 use J7\PowerPartner\Api\Fetch;
 use J7\PowerPartner\Domains\Email\Core\SubscriptionEmailHooks as EmailService;
 use J7\PowerPartner\Product\SiteSync;
@@ -224,6 +223,20 @@ final class Main
 			$order          = \wc_get_order($order_id);
 			$customer_email = $customer->user_email;
 
+			/**
+			 * Issue #23：站台網址一律先正規化，供「存進 pp_site_url」與「##URL## token」共用。
+			 *
+			 * 回調可能只給裸網域（無 scheme），直接使用會讓 <a href="##URL##"> 渲染成相對連結。
+			 * 兩個用途必須共用同一個值，否則這一封開站信裡的 ##URL## 會與之後每一封
+			 * 生命週期信（讀 pp_site_url）指向不同的字串。
+			 */
+			$callback_site_url = SiteSync::extract_site_url(
+				[
+					'url'    => (string) ( $body_params['FRONTURL'] ?? '' ),
+					'domain' => (string) ( $body_params['DOMAIN'] ?? '' ),
+				]
+			);
+
 			if ($order instanceof \WC_Order) {
 				$customer_email = $order->get_billing_email();
 				$subscriptions  = \wcs_get_subscriptions_for_order($order->get_id());
@@ -231,27 +244,93 @@ final class Main
 
 				$new_site_id = $body_params['NEW_SITE_ID'] ?? null;
 				if ($subscription && $new_site_id) {
+					/**
+					 * Issue #23：把 WPCD 的站台網址落地到訂閱上。
+					 *
+					 * WPCD 開站是非同步的，網域在開站當下不存在，只有這個回調帶得回來。
+					 * 必須在 update_linked_site_ids() 之前寫入——後者會 fire
+					 * pp_linked_site_ids_updated（issue #22 的補排 hook），
+					 * 讓監聽者拿到的訂閱狀態是完整的。
+					 *
+					 * 只在尚未寫入時寫，語義與 PowerCloud 分支一致（第一個站先寫、之後不覆蓋）。
+					 * $callback_site_url 已在函式開頭正規化過（與 ##URL## token 共用同一個值）。
+					 */
+					if ( $callback_site_url && '' === (string) $subscription->get_meta( SiteSync::SITE_URL_META_KEY, true ) ) {
+						$subscription->update_meta_data( SiteSync::SITE_URL_META_KEY, $callback_site_url );
+						$subscription->save();
+					}
+
+					/**
+					 * ⚠️ 必須是「附加」而不是「覆寫」。
+					 *
+					 * update_linked_site_ids() 收到的陣列就是綁定的完整清單——
+					 * 原本這裡傳 [(string) $new_site_id]，等於宣告「這個訂閱只有這一個站」。
+					 * 一張訂單兩個商品各開一站是合法路徑，第二次回調會把第一個站的 id 擠掉：
+					 * 站 1 從此不會被停用/恢復，而 pp_site_url 是「第一個站先寫、之後不覆蓋」，
+					 * 於是 ##URL## 仍指向站 1、綁定卻只剩站 2，兩邊指到不同的站。
+					 * 更糟的是 pp_linked_site_ids_updated 會 fire，把這次「靜默遺失」
+					 * 當成一次正常的綁定變更通知出去。
+					 *
+					 * 另外三個寫入點（PowerCloud 開站、/link-site、後台手動編輯）都是附加語義，
+					 * 這裡對齊它們；in_array 去重讓 CloudServer 重送同一個 site id 不會長出重複列。
+					 */
+					$existing_site_ids = ShopSubscription::get_linked_site_ids((int) $subscription->get_id());
+					$merged_site_ids   = array_values($existing_site_ids);
+					if (! in_array((string) $new_site_id, $merged_site_ids, true)) {
+						$merged_site_ids[] = (string) $new_site_id;
+					}
+
 					ShopSubscription::update_linked_site_ids(
 						(int) $subscription->get_id(),
-						[
-							(string) $new_site_id,
-						]
+						$merged_site_ids
 					);
 				}
 			}
 
+			/**
+			 * 這些欄位原本是直接 $body_params['X'] 取值，沒有任何預設（issue #21）。
+			 * CloudServer 少送任一欄就是 PHP 8 undefined array key warning + null，
+			 * 而 SubscriptionEmailHooks::send_mail() 的關鍵變數防呆會因此中止寄送——
+			 * 客戶會從「收到一封有佔位符的信」變成「一封都收不到」。
+			 * 補 ?? '' 讓型別穩定，並在下方對缺漏留 error log（問題在 CloudServer 端，不是外掛壞掉）。
+			 */
 			$tokens                                   = [];
 			$tokens['FIRST_NAME']                     = $customer->first_name;
 			$tokens['LAST_NAME']                      = $customer->last_name;
 			$tokens['NICE_NAME']                      = $customer->user_nicename;
 			$tokens['EMAIL']                          = $customer_email;
-			$tokens['WORDPRESSAPPWCSITESACCOUNTPAGE'] = $body_params['WORDPRESSAPPWCSITESACCOUNTPAGE'];
-			$tokens['IPV4']                           = $body_params['IPV4'];
-			$tokens['DOMAIN']                         = $body_params['DOMAIN'];
-			$tokens['FRONTURL']                       = $body_params['FRONTURL'];
-			$tokens['ADMINURL']                       = $body_params['ADMINURL'];
-			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'];
-			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'];
+			$tokens['WORDPRESSAPPWCSITESACCOUNTPAGE'] = $body_params['WORDPRESSAPPWCSITESACCOUNTPAGE'] ?? '';
+			$tokens['IPV4']                           = $body_params['IPV4'] ?? '';
+			$tokens['DOMAIN']                         = $body_params['DOMAIN'] ?? '';
+			$tokens['FRONTURL']                       = $body_params['FRONTURL'] ?? '';
+			$tokens['ADMINURL']                       = $body_params['ADMINURL'] ?? '';
+			$tokens['SITEUSERNAME']                   = $body_params['SITEUSERNAME'] ?? '';
+			$tokens['SITEPASSWORD']                   = $body_params['SITEPASSWORD'] ?? '';
+			// issue #23：與 pp_site_url 共用同一個已補 scheme 的值，兩者不可分歧
+			$tokens['URL']                            = $callback_site_url ?: ( $tokens['FRONTURL'] ?: $tokens['DOMAIN'] );
+
+			// 回調 payload 不全時留痕：這是 CloudServer 端的問題，但後果會落在終端客戶身上（收不到開通信）
+			$missing_params = [];
+			foreach ( [ 'DOMAIN', 'FRONTURL', 'ADMINURL', 'SITEUSERNAME', 'SITEPASSWORD' ] as $required_param ) {
+				if ( '' === trim( (string) $tokens[ $required_param ] ) ) {
+					$missing_params[] = $required_param;
+				}
+			}
+			if ( $missing_params ) {
+				Plugin::logger(
+					'/customer-notification 回調 payload 缺少站台欄位：' . implode( ', ', $missing_params ),
+					'error',
+					[
+						'order_id'        => $order_id,
+						'customer_id'     => $customer_id,
+						// 不用區塊內的 $new_site_id——它只在 $order instanceof WC_Order 時才定義
+						'new_site_id'     => $body_params['NEW_SITE_ID'] ?? null,
+						'missing_params'  => $missing_params,
+						'received_params' => array_keys( $body_params ),
+					],
+					5
+				);
+			}
 
 			[$success_emails, $failed_emails] = EmailService::send_mail($customer_email, $tokens);
 
@@ -648,6 +727,7 @@ final class Main
 			$tokens['SITEUSERNAME'] = $username;
 			$tokens['SITEPASSWORD'] = $password;
 			$tokens['IPV4']         = $ip;
+			$tokens['URL']          = $front_url; // issue #23：與前端 siteSyncTokens 的合約一致
 
 			// 取得 site_sync 的 email 模板
 			$email_service = EmailService::instance();
@@ -663,37 +743,14 @@ final class Main
 				);
 			}
 
-			$success_emails = [];
-			$failed_emails  = [];
-
-			foreach ($emails as $email) {
-				// 取得 subject
-				$subject = $email->subject;
-				$subject = empty($subject) ? $email_service->default->subject : $subject;
-
-				// 取得 message
-				$body = $email->body;
-				$body = empty($body) ? $email_service->default->body : $body;
-
-				// Replace tokens in email
-				$subject = Token::replace($subject, $tokens);
-				$body    = Token::replace($body, $tokens);
-
-				$email_headers = ['Content-Type: text/html; charset=UTF-8'];
-
-				$result = \wp_mail(
-					$admin_email,
-					$subject,
-					\wpautop($body),
-					$email_headers
-				);
-
-				if ($result) {
-					$success_emails[] = $email->action_name;
-				} else {
-					$failed_emails[] = $email->action_name;
-				}
-			}
+			/**
+			 * 一律走 EmailService::send_mail()，不要在這裡自己 replace + wp_mail。
+			 *
+			 * 原本這裡是 send_mail() 的複製品，導致兩個實際後果：
+			 *   1. 缺少 ##URL##（前端 siteSyncTokens 有列，此路徑卻不提供）
+			 *   2. 繞過 issue #21 的關鍵站台變數防呆，可能把 ##XXX## 寄給客戶
+			 */
+			[ $success_emails, $failed_emails ] = EmailService::send_mail($admin_email, $tokens);
 
 			return new \WP_REST_Response(
 				[

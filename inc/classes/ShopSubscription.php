@@ -28,6 +28,21 @@ final class ShopSubscription {
 	const IS_POWER_PARTNER_SUBSCRIPTION = 'is_power_partner_site_sync';
 	const POST_TYPE                     = 'shop_subscription';
 
+	/**
+	 * 訂閱綁定的網站 id 真的變更後觸發（issue #22）
+	 *
+	 * 這是 pp_linked_site_ids 的唯一收斂點——四個寫入路徑全部經過 update_linked_site_ids()：
+	 *   1. PowerCloud 開站成功 201（Product\SiteSync::site_sync_powercloud()，同步）
+	 *   2. WPCD 回調 /customer-notification（Api\Main::post_customer_notification_callback()）
+	 *   3. WPCD 回調 /link-site（Api\Main::post_link_site_callback()）
+	 *   4. 管理員後台手動編輯（ShopSubscription::save()）
+	 *
+	 * ⚠️ 監聽者請務必自行吞掉例外——路徑 1 是在 SiteSync::site_sync_by_subscription() 的
+	 *    try/catch(\Throwable) 內同步呼叫，且在 email_payloads_tmp 寫入與 240 秒延遲排程「之前」，
+	 *    往上拋的例外會被誤記成「網站建立失敗」訂單備註，並連帶殺掉正確的那封開站通知信。
+	 */
+	const LINKED_SITE_IDS_UPDATED_ACTION = 'pp_linked_site_ids_updated';
+
 
 	/** Constructor */
 	public function __construct() {
@@ -163,6 +178,18 @@ final class ShopSubscription {
 
 		$subscription->save();
 
+		/**
+		 * 訂閱綁定的網站 id 變更後（issue #22）
+		 *
+		 * 只在真的有變更時 fire——上方的 is_same_site_ids() 提前 return 已天然去重。
+		 * 此時 meta 已寫入且已持久化，監聽者呼叫 is_site_sync() 必為 true。
+		 *
+		 * @param \WC_Subscription         $subscription        訂閱（meta 已寫入並已 save）
+		 * @param array<int|string, mixed> $linked_site_ids     新的 site ids
+		 * @param array<int|string, mixed> $old_linked_site_ids 舊的 site ids
+		 */
+		\do_action( self::LINKED_SITE_IDS_UPDATED_ACTION, $subscription, $linked_site_ids, $old_linked_site_ids );
+
 		return true;
 	}
 
@@ -170,16 +197,27 @@ final class ShopSubscription {
 	 * Check if two site id arrays are the same
 	 * 檢查兩個 site id 陣列是否相同
 	 *
+	 * ⚠️ 必須以「字串」比較，不可 (int) 正規化。
+	 *
+	 * PowerCloud 的 websiteId 是 UUID（例：`a1b2c3d4-...`），`(int)` 之後全部變成 `0`——
+	 * 於是「從 UUID-A 換綁到 UUID-B」會被判成無變更，update_linked_site_ids() 直接
+	 * return false：meta 不寫入（綁定靜默遺失）、pp_linked_site_ids_updated 也不 fire
+	 * （issue #22 的補排、以及任何第三方監聽者全部收不到事件）。
+	 *
+	 * 換成字串比較後，WPCD 的數字 id 行為不變：'101' 與 101 經 strval 後同樣是 '101'。
+	 * 排序指定 SORT_STRING——預設的 SORT_REGULAR 會把純數字字串當數值比，
+	 * UUID 與數字 id 混在同一筆訂閱時排序結果不穩定，會讓相同集合被判成不同。
+	 *
 	 * @param array<int|string, mixed> $old_ids Old site ids
 	 * @param array<int|string, mixed> $new_ids New site ids
 	 * @return bool
 	 */
 	private static function is_same_site_ids( array $old_ids, array $new_ids ): bool {
-		$normalized_old_ids = array_values( array_map( static fn( $v ): int => (int) $v, $old_ids ) );
-		sort( $normalized_old_ids );
+		$normalized_old_ids = array_values( array_map( static fn( $v ): string => (string) $v, $old_ids ) );
+		sort( $normalized_old_ids, SORT_STRING );
 
-		$normalized_new_ids = array_values( array_map( static fn( $v ): int => (int) $v, $new_ids ) );
-		sort( $normalized_new_ids );
+		$normalized_new_ids = array_values( array_map( static fn( $v ): string => (string) $v, $new_ids ) );
+		sort( $normalized_new_ids, SORT_STRING );
 
 		return $normalized_old_ids === $normalized_new_ids;
 	}

@@ -265,4 +265,172 @@ class ShopSubscriptionTest extends TestCase {
 		$values = get_post_meta( $post_id, 'pp_linked_site_ids' );
 		$this->assertContains( $unicode_id, $values );
 	}
+
+	// ========== issue #22：pp_linked_site_ids_updated hook ==========
+
+	/**
+	 * 建立真實 WC_Subscription（hook 測試需要，裸 post 過不了 wcs_get_subscription()）
+	 *
+	 * @return \WC_Subscription
+	 */
+	private function create_real_subscription(): \WC_Subscription {
+		// wcs_create_subscription() 沒有 customer_id 會回 WP_Error
+		$customer_id = $this->factory()->user->create( [ 'role' => 'customer' ] );
+
+		$order = wc_create_order(
+			[
+				'customer_id' => $customer_id,
+				'status'      => 'processing',
+			]
+		);
+		$this->assertInstanceOf( \WC_Order::class, $order );
+
+		$subscription = wcs_create_subscription(
+			[
+				'order_id'         => $order->get_id(),
+				'status'           => 'active',
+				'billing_period'   => 'month',
+				'billing_interval' => 1,
+				'customer_id'      => $customer_id,
+			]
+		);
+		$this->assertInstanceOf( \WC_Subscription::class, $subscription );
+
+		return $subscription;
+	}
+
+	/**
+	 * 綁定真的變更時應觸發 pp_linked_site_ids_updated，且 callback 收到的訂閱 meta 已寫入
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_update_linked_site_ids_有變更時應觸發pp_linked_site_ids_updated(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		$received = null;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function ( $sub ) use ( &$received ) {
+				$received = $sub;
+			},
+			10,
+			1
+		);
+
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ '777' ] );
+
+		$this->assertTrue( $result, 'update_linked_site_ids 應回傳 true' );
+		$this->assertInstanceOf( \WC_Subscription::class, $received, 'hook 應被觸發並帶入 WC_Subscription' );
+		$this->assertSame(
+			$sub_id,
+			$received->get_id(),
+			'callback 收到的應是同一筆訂閱'
+		);
+		$this->assertNotEmpty(
+			$received->get_meta( SiteSync::LINKED_SITE_IDS_META_KEY, true ),
+			'fire 時 meta 應已寫入並持久化，否則監聽者的 is_site_sync() 會是 false'
+		);
+	}
+
+	/**
+	 * 綁定沒有變更時不應觸發 hook（避免管理員按了儲存但沒改東西也重排程）
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_update_linked_site_ids_無變更時不應觸發pp_linked_site_ids_updated(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ '888' ] );
+
+		$fired = 0;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		// 綁同一組 id，is_same_site_ids() 會提前 return false
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ '888' ] );
+
+		$this->assertFalse( $result, '內容未變更時 update_linked_site_ids 應回傳 false' );
+		$this->assertSame( 0, $fired, '內容未變更時不應 fire hook' );
+	}
+
+	/**
+	 * PowerCloud UUID 換綁時必須被認出是「變更」
+	 *
+	 * is_same_site_ids() 若以 (int) 正規化，所有 UUID 都會變成 0，
+	 * 於是 UUID-A → UUID-B 會被判成無變更：meta 不寫入（綁定靜默遺失）、
+	 * pp_linked_site_ids_updated 也不 fire（issue #22 的補排收不到事件）。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_update_linked_site_ids_UUID換綁應被視為變更(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		$uuid_a = 'a1b2c3d4-1111-4aaa-8bbb-000000000001';
+		$uuid_b = 'a1b2c3d4-2222-4aaa-8bbb-000000000002';
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ $uuid_a ] );
+
+		$fired = 0;
+		add_action(
+			ShopSubscription::LINKED_SITE_IDS_UPDATED_ACTION,
+			function () use ( &$fired ) {
+				++$fired;
+			},
+			10,
+			1
+		);
+
+		$result = ShopSubscription::update_linked_site_ids( $sub_id, [ $uuid_b ] );
+
+		$this->assertTrue( $result, 'UUID 換綁應被視為變更（(int) 正規化會把兩個 UUID 都變成 0）' );
+		$this->assertSame( 1, $fired, 'UUID 換綁應 fire 一次 hook' );
+
+		$ids = array_values( ShopSubscription::get_linked_site_ids( $sub_id ) );
+		$this->assertSame( [ $uuid_b ], $ids, '換綁後應真的寫入新的 UUID' );
+	}
+
+	/**
+	 * 數字 site id 的既有行為不可因為改字串比較而改變
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_update_linked_site_ids_數字id的相同判定行為不變(): void {
+		$this->skip_if_no_subscriptions();
+
+		$subscription = $this->create_real_subscription();
+		$sub_id       = $subscription->get_id();
+
+		ShopSubscription::update_linked_site_ids( $sub_id, [ '101', '202' ] );
+
+		// 同一組 id、順序不同、型別不同（int vs string）→ 仍應判定為無變更
+		$this->assertFalse(
+			ShopSubscription::update_linked_site_ids( $sub_id, [ 202, 101 ] ),
+			'數字 id 的順序與型別差異不應被當成變更'
+		);
+
+		// 真的多一個站 → 應判定為變更
+		$this->assertTrue(
+			ShopSubscription::update_linked_site_ids( $sub_id, [ '101', '202', '303' ] ),
+			'新增一個站應被視為變更'
+		);
+	}
 }
