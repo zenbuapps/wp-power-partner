@@ -17,6 +17,16 @@ interface WebsiteActionButtonsProps {
 	onStop: (id: string) => void
 	onDelete: (id: string) => void
 	onChangeDomain: (website: IWebsite) => void
+
+	/**
+	 * 是否顯示「刪除網站」選項（來自設定 power_partner_allow_delete_site）
+	 *
+	 * ⚠️ 這是 UI 層防呆，與 Popconfirm / Modal.confirm 同層級，不是安全邊界。
+	 * 刪除請求由前端 powerCloudInstance.delete('/wordpress/{id}') 直接打 PowerCloud API，
+	 * 不經過 WP 後端，因此真正的權限控制必須由 PowerCloud API 端依 API key 實施，
+	 * 前端無法保證。請勿把這個 prop 當成伺服器端授權檢查。
+	 */
+	allowDelete: boolean
 }
 
 const getDomain = (website: IWebsite): string => {
@@ -35,6 +45,7 @@ const WebsiteActionButtons = ({
 	onStop,
 	onDelete,
 	onChangeDomain,
+	allowDelete,
 }: WebsiteActionButtonsProps) => {
 	const domain = getDomain(record)
 	const isRunning = record.status === 'running'
@@ -53,40 +64,48 @@ const WebsiteActionButtons = ({
 			},
 		]
 
-		const dangerItems: MenuProps['items'] = [
-			{
-				key: 'delete',
-				icon: <DeleteOutlined />,
-				label: '刪除網站',
-				danger: true,
-				onClick: () => {
-					Modal.confirm({
-						title: '刪除網站',
-						content: `確定要刪除站台 ${domain} 嗎？此操作無法復原。`,
-						okText: '確認刪除',
-						cancelText: '取消',
-						okButtonProps: { danger: true },
-						onOk: () => onDelete(record.id),
-					})
-				},
-			},
-		]
-
-		return [
+		const items: MenuProps['items'] = [
 			{
 				key: 'service-group',
 				type: 'group' as const,
 				label: '服務管理',
 				children: serviceItems,
 			},
-			{ type: 'divider' as const },
-			{
-				key: 'danger-group',
-				type: 'group' as const,
-				label: '危險操作',
-				children: dangerItems,
-			},
 		]
+
+		// 未開啟「允許刪除站台」時，連同 divider 與群組標題一起不渲染，避免留下空群組
+		if (allowDelete) {
+			const dangerItems: MenuProps['items'] = [
+				{
+					key: 'delete',
+					icon: <DeleteOutlined />,
+					label: '刪除網站',
+					danger: true,
+					onClick: () => {
+						Modal.confirm({
+							title: '刪除網站',
+							content: `確定要刪除站台 ${domain} 嗎？此操作無法復原。`,
+							okText: '確認刪除',
+							cancelText: '取消',
+							okButtonProps: { danger: true },
+							onOk: () => onDelete(record.id),
+						})
+					},
+				},
+			]
+
+			items.push(
+				{ type: 'divider' as const },
+				{
+					key: 'danger-group',
+					type: 'group' as const,
+					label: '危險操作',
+					children: dangerItems,
+				}
+			)
+		}
+
+		return items
 	}
 
 	return (

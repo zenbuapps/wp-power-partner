@@ -34,6 +34,7 @@ import {
 	EPowercloudIdentityStatusEnum,
 	powercloudIdentityAtom,
 } from '../../Atom/powercloud.atom'
+import { allowDeleteSiteAtom } from '../../Atom/settings.atom'
 import { setTabAtom, TabKeyEnum } from '../../Atom/tab.atom'
 
 import { powerCloudAxios, usePowerCloudAxiosWithApiKey } from '@/api'
@@ -158,6 +159,9 @@ const getDomain = (website: IWebsite): string => {
 
 const PowercloudContent = () => {
 	const setTab = useSetAtom(setTabAtom)
+
+	// UI 層防呆：僅在「設定」開啟「允許刪除站台」後才顯示刪除選項
+	const allowDelete = useAtomValue(allowDeleteSiteAtom)
 	const powerCloudInstance = usePowerCloudAxiosWithApiKey(powerCloudAxios)
 	const [pagination, setPagination] = useState({ page: 1, limit: 10 })
 	const [searchFilters, setSearchFilters] =
@@ -503,6 +507,7 @@ const PowercloudContent = () => {
 					onStop={handleStop}
 					onDelete={handleDelete}
 					onChangeDomain={handleShowChangeDomainModal}
+					allowDelete={allowDelete}
 				/>
 			),
 		},

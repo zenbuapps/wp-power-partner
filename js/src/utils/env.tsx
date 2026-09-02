@@ -38,6 +38,10 @@ export const partner_id: string = window?.[APP_DOMAIN]?.env?.partner_id || ''
 export const disable_site_after_n_days: number =
     window?.[APP_DOMAIN]?.env?.disable_site_after_n_days ?? 7
 
+// 是否允許在「所有站台」列表顯示「刪除網站」按鈕（UI 層防呆，非伺服器端權限）
+export const allow_delete_site: boolean =
+	window?.[APP_DOMAIN]?.env?.allow_delete_site ?? false
+
 export const POWERCLOUD_API = window?.[APP_DOMAIN]?.env?.POWERCLOUD_API || ''
 export const powercloud_api_key: string =
     window?.[APP_DOMAIN]?.env?.powercloud_api_key || ''

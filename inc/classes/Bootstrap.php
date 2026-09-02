@@ -127,6 +127,7 @@ final class Bootstrap {
 					'allowed_template_options'  => $allowed_template_options,
 					'partner_id'                => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
 					'disable_site_after_n_days' => (int) ( $power_partner_settings['power_partner_disable_site_after_n_days'] ?? '7' ),
+					'allow_delete_site'         => !empty( $power_partner_settings['power_partner_allow_delete_site'] ),
 					't'                         => $this->t,
 					'cloudBaseUrl'              => $this->base_url,
 					'POWERCLOUD_API'            => $this->powercloud_api,
