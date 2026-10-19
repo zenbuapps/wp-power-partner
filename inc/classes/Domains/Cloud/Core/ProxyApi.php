@@ -80,10 +80,10 @@ final class ProxyApi {
 	const CUSTOMER_SCOPED_ROUTES = [ 'apps', 'license-codes', 'license-codes/release', 'change-domain', 'toggle-ssl' ];
 
 	/**
-	 * @var array<int, string> body 帶經銷商真實密碼的端點：與登入共用本站的失敗次數上限
+	 * @var array<int, string> body 帶經銷商真實密碼的端點：一律經過本站的真實密碼閘門
 	 *
 	 * CloudServer 以 wp_authenticate() 驗證真實密碼，失敗次數會被 cloud.luke.cafe 的 Fluent Security
-	 * 記在本站主機的 IP 上（見 ConnectionService::LOGIN_FAILURES_OPTION）
+	 * 記在本站主機的 IP 上（見 ConnectionService::REAL_PASSWORD_GATE_OPTION）
 	 */
 	const REAL_PASSWORD_ROUTES = [ 'identity' ];
 
@@ -161,31 +161,41 @@ final class ProxyApi {
 			}
 		}
 
-		$sends_password = in_array( $path, self::REAL_PASSWORD_ROUTES, true );
-		if ( $sends_password && ConnectionService::login_throttled() ) {
-			return new \WP_REST_Response(
-				[
-					'status'  => 429,
-					'code'    => 'pp_login_throttled',
-					'message' => '嘗試次數過多，請 15 分鐘後再試',
-				],
-				429
-			);
-		}
-
 		if ( $upstream !== $path ) {
 			$response = $this->forward_log_detail( $upstream, $params );
 			if ( $response instanceof \WP_REST_Response ) {
 				return $response;
 			}
+		} elseif ( in_array( $path, self::REAL_PASSWORD_ROUTES, true ) ) {
+			// 不走 request() 的自動 fallback：dealer 被拒時會把同一組真實密碼再送一次
+			$response = ConnectionService::send_with_real_password(
+				static fn() => CloudClient::instance()->request_with_mode( CloudClient::preferred_mode(), $method, $upstream, $params, [ 'timeout' => 120 ] ),
+				ConnectionService::SEND_IDENTITY
+			);
+			if ( ConnectionService::is_gated( $response ) ) {
+				return self::gate_blocked();
+			}
 		} else {
 			$response = CloudClient::instance()->request( $method, $upstream, $params, [ 'timeout' => 120 ] );
-			if ( $sends_password && ConnectionService::is_password_rejected( $response ) ) {
-				ConnectionService::record_login_failure();
-			}
 		}
 
 		return self::to_rest_response( $response );
+	}
+
+	/**
+	 * 被本站真實密碼閘門擋下（沒有送出）
+	 *
+	 * @return \WP_REST_Response
+	 */
+	private static function gate_blocked(): \WP_REST_Response {
+		return new \WP_REST_Response(
+			[
+				'status'  => 429,
+				'code'    => ConnectionService::GATE_ERROR_CODE,
+				'message' => ConnectionService::GATE_MESSAGE,
+			],
+			429
+		);
 	}
 
 	/**
@@ -226,13 +236,22 @@ final class ProxyApi {
 			}
 			$params['email']    = $account['email'];
 			$params['password'] = $account['password'];
+
+			$response = ConnectionService::send_with_real_password(
+				static fn() => $client->request_with_mode( CloudClient::MODE_LEGACY, 'POST', $upstream, $params, $args ),
+				ConnectionService::SEND_DETAIL
+			);
+			if ( ConnectionService::is_gated( $response ) ) {
+				return self::gate_blocked();
+			}
+			if ( ConnectionService::is_password_rejected( $response ) ) {
+				CredentialStore::mark_legacy_account_rejected( ConnectionService::EXCHANGE_BAD_PASSWORD );
+			}
+			return $response;
 		}
 
-		$response = $client->request_with_mode( CloudClient::MODE_LEGACY, 'POST', $upstream, $params, $args );
-		if ( null !== $account && ConnectionService::is_password_rejected( $response ) ) {
-			CredentialStore::mark_legacy_account_rejected( ConnectionService::EXCHANGE_BAD_PASSWORD );
-		}
-		return $response;
+		// 沒有帳密可補：不帶真實密碼，照舊轉送（CloudServer 會回缺少帳密）
+		return $client->request_with_mode( CloudClient::MODE_LEGACY, 'POST', $upstream, $params, $args );
 	}
 
 	/**

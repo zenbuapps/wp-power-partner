@@ -43,24 +43,34 @@ abstract class CredentialStore {
 	const DEALER_INVALID_OPTION = 'power_partner_cloud_dealer_invalid';
 
 	/**
-	 * @var string 經銷商登入帳密（legacy account）已被 CloudServer 拒絕的標記
+	 * @var string 經銷商登入帳密（legacy account）已被 CloudServer 拒絕的標記 `{reason, at}`
 	 *
-	 * 有標記時本站不再送出這組帳密，直到經銷商重新登入成功。原因：CloudServer 驗證真實密碼走
-	 * `wp_authenticate()`，cloud.luke.cafe 上的 Fluent Security 依「來源 IP」累計失敗次數並封鎖整個 IP；
-	 * 這些請求的來源是本站主機，同一台主機上其他經銷商站的雲端功能會一起被封鎖。
+	 * 標記有效期間本站不再送出這組帳密。原因：CloudServer 驗證真實密碼走 `wp_authenticate()`，
+	 * cloud.luke.cafe 上的 Fluent Security 依「來源 IP」累計失敗次數並封鎖整個 IP；這些請求的來源是本站主機，
+	 * 同一台主機上其他經銷商站的雲端功能會一起被封鎖。
+	 * 24 小時（LEGACY_REJECTED_TTL）後自動過期，允許再試一次（失敗就再標記 24 小時）：
+	 * 舊版 CloudServer 在 IP 被封鎖時回的訊息與「密碼錯誤」相同，誤判要能自己恢復。重新登入成功時清除。
 	 */
 	const LEGACY_REJECTED_OPTION = 'power_partner_cloud_legacy_account_rejected';
 
-	/**
-	 * @var string 共用帳號（legacy）已被 CloudServer 停用或撤銷 `{reason, at}`
-	 *
-	 * CloudServer 試關或根除共用帳號之後，改走 legacy 沒有意義：CloudClient 看到這個標記就一律先用
-	 * 專屬密碼，notice 也改說「雲端連線已中斷」。共用帳號請求再次成功時清除（試關後又切回）。
-	 */
-	const LEGACY_DISABLED_OPTION = 'power_partner_cloud_legacy_disabled';
+	/** @var int 「帳密已被拒」標記的有效期（24 小時） */
+	const LEGACY_REJECTED_TTL = 86400;
 
-	/** @var int 「共用帳號已停用」標記多久更新一次 / 多久內不再以共用帳號重試（1 小時） */
+	/**
+	 * @var string 共用帳號（legacy）的健康狀態 `{disabled_at, reason, ok_at}`
+	 *
+	 * - disabled_at：CloudServer 停用或撤銷共用帳號（試關回 legacy_auth_disabled；根除後 core 回
+	 *   incorrect_password）。之後改走 legacy 沒有意義，CloudClient 一律先用專屬密碼，notice 改說「雲端連線已中斷」。
+	 *   共用帳號請求再次成功時清除（試關後又切回）
+	 * - ok_at：最近一次共用帳號請求成功的時間。只有 24 小時內真的成功過，notice 才可以說「目前功能不受影響」
+	 */
+	const LEGACY_STATE_OPTION = 'power_partner_cloud_legacy_state';
+
+	/** @var int 「共用帳號已停用」多久內不再以共用帳號重試、ok_at 多久更新一次（1 小時） */
 	const LEGACY_DISABLED_RECHECK = 3600;
+
+	/** @var int ok_at 在多久內算「共用帳號目前可用」（24 小時） */
+	const LEGACY_OK_FRESH = 86400;
 
 	/** @var string 衍生金鑰時的 context，避免與其他用到同一組 salt 的用途撞 key */
 	const KEY_CONTEXT = '|power-partner/cloud-credentials/v1';
@@ -163,7 +173,7 @@ abstract class CredentialStore {
 	}
 
 	/**
-	 * 標記共用帳號已被 CloudServer 停用（見 LEGACY_DISABLED_OPTION）
+	 * 標記共用帳號已被 CloudServer 停用（見 LEGACY_STATE_OPTION）
 	 *
 	 * 每個請求都可能走到這裡，1 小時內只寫一次。
 	 *
@@ -174,44 +184,79 @@ abstract class CredentialStore {
 		if ( self::legacy_disabled_recently() ) {
 			return;
 		}
-		$first = ! self::is_legacy_disabled();
-		\update_option(
-			self::LEGACY_DISABLED_OPTION,
-			[
-				'reason' => $reason,
-				'at'     => time(),
-			],
-			false
-		);
+		$state = self::legacy_state();
+		$first = 0 === $state['disabled_at'];
+		self::save_legacy_state( time(), $reason, $state['ok_at'] );
 		if ( $first ) {
 			Plugin::logger( 'CloudServer 已停用共用帳號，之後一律以經銷商專屬密碼連線', 'warning', [ 'reason' => $reason ] );
 		}
 	}
 
 	/**
-	 * 共用帳號請求成功時清除停用標記
+	 * 共用帳號請求成功：清除停用標記、更新 ok_at（1 小時內只寫一次）
 	 *
 	 * @return void
 	 */
-	public static function clear_legacy_disabled(): void {
-		if ( self::is_legacy_disabled() ) {
-			\delete_option( self::LEGACY_DISABLED_OPTION );
+	public static function note_legacy_ok(): void {
+		$state = self::legacy_state();
+		if ( 0 === $state['disabled_at'] && ( time() - $state['ok_at'] ) < self::LEGACY_DISABLED_RECHECK ) {
+			return;
 		}
+		self::save_legacy_state( 0, '', time() );
 	}
 
 	/**
 	 * @return bool 是否看過共用帳號被停用（沒有再次成功過）
 	 */
 	public static function is_legacy_disabled(): bool {
-		return false !== \get_option( self::LEGACY_DISABLED_OPTION, false );
+		return self::legacy_state()['disabled_at'] > 0;
 	}
 
 	/**
 	 * @return bool 最近 1 小時內是否確認過共用帳號已停用
 	 */
 	public static function legacy_disabled_recently(): bool {
-		$stored = \get_option( self::LEGACY_DISABLED_OPTION, false );
-		return is_array( $stored ) && ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_DISABLED_RECHECK;
+		$disabled_at = self::legacy_state()['disabled_at'];
+		return $disabled_at > 0 && ( time() - $disabled_at ) < self::LEGACY_DISABLED_RECHECK;
+	}
+
+	/**
+	 * @return bool 最近 24 小時內是否真的看過共用帳號請求成功（才可以說「目前功能不受影響」）
+	 */
+	public static function legacy_ok_recently(): bool {
+		$state = self::legacy_state();
+		return 0 === $state['disabled_at'] && $state['ok_at'] > 0 && ( time() - $state['ok_at'] ) < self::LEGACY_OK_FRESH;
+	}
+
+	/**
+	 * @return array{disabled_at: int, reason: string, ok_at: int}
+	 */
+	private static function legacy_state(): array {
+		$stored = \get_option( self::LEGACY_STATE_OPTION, [] );
+		$stored = is_array( $stored ) ? $stored : [];
+		return [
+			'disabled_at' => (int) ( $stored['disabled_at'] ?? 0 ),
+			'reason'      => (string) ( $stored['reason'] ?? '' ),
+			'ok_at'       => (int) ( $stored['ok_at'] ?? 0 ),
+		];
+	}
+
+	/**
+	 * @param int    $disabled_at 停用時間（0 = 未停用）
+	 * @param string $reason      停用原因
+	 * @param int    $ok_at       最近一次成功時間
+	 * @return void
+	 */
+	private static function save_legacy_state( int $disabled_at, string $reason, int $ok_at ): void {
+		\update_option(
+			self::LEGACY_STATE_OPTION,
+			[
+				'disabled_at' => $disabled_at,
+				'reason'      => $reason,
+				'ok_at'       => $ok_at,
+			],
+			false
+		);
 	}
 
 	/**
@@ -276,7 +321,9 @@ abstract class CredentialStore {
 	}
 
 	/**
-	 * 標記經銷商登入帳密已被 CloudServer 拒絕（之後不再送出，見 LEGACY_REJECTED_OPTION）
+	 * 標記經銷商登入帳密已被 CloudServer 拒絕（24 小時內不再送出，見 LEGACY_REJECTED_OPTION）
+	 *
+	 * 只能在 CloudServer 明確回覆「帳密錯誤」時呼叫；429（限流、IP 被封鎖、驗證碼、2FA）是暫時性錯誤，不可標記。
 	 *
 	 * @param string $reason 原因
 	 * @return void
@@ -293,16 +340,28 @@ abstract class CredentialStore {
 			],
 			false
 		);
-		Plugin::logger( 'CloudServer 拒絕本站保存的經銷商登入帳密，停止送出直到重新登入', 'warning', [ 'reason' => $reason ] );
+		Plugin::logger( 'CloudServer 拒絕本站保存的經銷商登入帳密，24 小時內不再送出（重新登入成功即恢復）', 'warning', [ 'reason' => $reason ] );
 	}
 
 	/**
-	 * 經銷商登入帳密是否已被標記為被拒
+	 * 經銷商登入帳密是否在「已被拒」的有效期內（24 小時後自動過期，允許再試一次）
 	 *
 	 * @return bool
 	 */
 	public static function is_legacy_account_rejected(): bool {
-		return false !== \get_option( self::LEGACY_REJECTED_OPTION, false );
+		$stored = \get_option( self::LEGACY_REJECTED_OPTION, false );
+		return is_array( $stored ) && ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_REJECTED_TTL;
+	}
+
+	/**
+	 * CloudServer 再次接受這組帳密時清除（過期後重試成功 = 之前是誤判）
+	 *
+	 * @return void
+	 */
+	public static function clear_legacy_account_rejected(): void {
+		if ( false !== \get_option( self::LEGACY_REJECTED_OPTION, false ) ) {
+			\delete_option( self::LEGACY_REJECTED_OPTION );
+		}
 	}
 
 	/**

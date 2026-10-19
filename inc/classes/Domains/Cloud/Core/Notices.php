@@ -28,7 +28,7 @@ final class Notices {
 			return;
 		}
 		$attention = ConnectionService::attention();
-		if ( null === $attention ) {
+		if ( null === $attention || ! self::in_scope( $attention['scope'] ) ) {
 			return;
 		}
 
@@ -45,5 +45,25 @@ final class Notices {
 	 */
 	public static function should_prompt_relogin(): bool {
 		return null !== ConnectionService::attention();
+	}
+
+	/**
+	 * 目前的 wp-admin 頁面是否在提示的顯示範圍內
+	 *
+	 * SCOPE_POWER_PARTNER 只在 Power Partner 自己的頁面與 wp-admin 首頁顯示：模板站或 clone 站可能帶著
+	 * partner_id，「沒有可讀的憑證」這種提示會出現在終端客戶的後台，對方看不懂。
+	 *
+	 * @param string $scope ConnectionService::SCOPE_*
+	 * @return bool
+	 */
+	public static function in_scope( string $scope ): bool {
+		if ( ConnectionService::SCOPE_POWER_PARTNER !== $scope ) {
+			return true;
+		}
+		$screen = \function_exists( 'get_current_screen' ) ? \get_current_screen() : null;
+		if ( null === $screen ) {
+			return false;
+		}
+		return 'dashboard' === $screen->id || str_contains( (string) $screen->id, 'power-partner' );
 	}
 }

@@ -117,10 +117,10 @@ class CloudConnectionTest extends TestCase {
 			CredentialStore::OLD_ACCOUNT_INFO_OPTION,
 			CredentialStore::DEALER_INVALID_OPTION,
 			CredentialStore::LEGACY_REJECTED_OPTION,
-			CredentialStore::LEGACY_DISABLED_OPTION,
+			CredentialStore::LEGACY_STATE_OPTION,
 			ConnectionService::MIGRATION_OPTION,
 			ConnectionService::INSTALLATION_OPTION,
-			ConnectionService::LOGIN_FAILURES_OPTION,
+			ConnectionService::REAL_PASSWORD_GATE_OPTION,
 			Connect::PARTNER_ID_OPTION_NAME,
 		] as $option ) {
 			\delete_option( $option );
@@ -168,6 +168,20 @@ class CloudConnectionTest extends TestCase {
 	 */
 	private function sent( string $method, string $path ): array {
 		return array_values( array_filter( $this->requests, static fn( $r ) => $r['method'] === $method && $r['path'] === $path ) );
+	}
+
+	/**
+	 * 切換 wp-admin 目前頁面（Notices 的顯示範圍依它判斷）
+	 *
+	 * @param string $id screen id
+	 * @return void
+	 */
+	private function screen( string $id ): void {
+		if ( ! \function_exists( 'set_current_screen' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/class-wp-screen.php';
+			require_once ABSPATH . 'wp-admin/includes/screen.php';
+		}
+		\set_current_screen( $id );
 	}
 
 	// ========== CredentialStore ==========
@@ -405,6 +419,8 @@ class CloudConnectionTest extends TestCase {
 		$this->routes['POST v3/connect'] = [ 429, '{"code":"rate_limited","message":"too many","data":{"status":429,"error_code":"rate_limited"}}' ];
 		$this->assertSame( ConnectionService::EXCHANGE_RATE_LIMITED, ConnectionService::exchange( 'a', 'b' )['result'] );
 
+		// 429 會讓真實密碼閘門冷卻 30 分鐘（另有測試）；這裡只驗證回應格式的解析，先重置閘門
+		\delete_option( ConnectionService::REAL_PASSWORD_GATE_OPTION );
 		$this->routes['POST v3/connect'] = [ 500, '{"code":"connect_failed","message":"x","data":{"status":500}}' ];
 		$this->assertSame( ConnectionService::EXCHANGE_TEMPORARY, ConnectionService::exchange( 'a', 'b' )['result'] );
 	}
@@ -776,27 +792,27 @@ class CloudConnectionTest extends TestCase {
 	}
 
 	/** @group security */
-	public function test_登入失敗第4次由本站擋下不送出(): void {
+	public function test_30分鐘內第2次帳密失敗後由本站擋下不送出(): void {
 		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => 'x', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
 
-		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+		for ( $i = 0; $i < ConnectionService::REAL_PASSWORD_MAX_FAILURES; $i++ ) {
 			$this->assertSame( 401, ConnectionService::connect( self::OLD_EMAIL, 'wrong' )['status'] );
 		}
 		$blocked = ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
 
 		$this->assertSame( 429, $blocked['status'] );
-		$this->assertSame( '嘗試次數過多，請 15 分鐘後再試', $blocked['message'] );
-		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'v3/connect' ), '超過上限後不可再送出真實密碼' );
+		$this->assertSame( '登入嘗試過於頻繁，請 30 分鐘後再試', $blocked['message'] );
+		$this->assertCount( ConnectionService::REAL_PASSWORD_MAX_FAILURES, $this->sent( 'POST', 'v3/connect' ), '超過上限後不可再送出真實密碼' );
 
 		\update_option(
-			ConnectionService::LOGIN_FAILURES_OPTION,
+			ConnectionService::REAL_PASSWORD_GATE_OPTION,
 			[
-				'count' => ConnectionService::LOGIN_MAX_FAILURES,
-				'since' => time() - ConnectionService::LOGIN_FAILURE_WINDOW - 1,
+				'failures'       => [ time() - ConnectionService::REAL_PASSWORD_WINDOW - 1, time() - ConnectionService::REAL_PASSWORD_WINDOW - 1 ],
+				'cooldown_until' => 0,
 			],
 			false
 		);
-		$this->assertFalse( ConnectionService::login_throttled(), '15 分鐘後恢復' );
+		$this->assertTrue( ConnectionService::may_send_real_password(), '滑出 30 分鐘視窗的失敗不再計入' );
 	}
 
 	/**
@@ -807,28 +823,31 @@ class CloudConnectionTest extends TestCase {
 	public function test_舊流程identity帳密錯誤也計入失敗次數(): void {
 		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
 
-		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+		for ( $i = 0; $i < ConnectionService::REAL_PASSWORD_MAX_FAILURES; $i++ ) {
 			ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
 		}
 
 		$this->assertSame( 429, ConnectionService::connect( self::OLD_EMAIL, 'wrong' )['status'] );
-		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
+		$this->assertCount( ConnectionService::REAL_PASSWORD_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
 	}
 
-	/** @group happy */
-	public function test_登入成功清除失敗次數與帳密被拒標記(): void {
+	/**
+	 * 成功只清除「帳密已被拒」標記，不清除失敗次數：Fluent Security 也不會因為一次成功就忘掉之前的失敗
+	 *
+	 * @group happy
+	 */
+	public function test_登入成功清除帳密被拒標記_失敗次數照滑動視窗計算(): void {
 		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'old' );
 		CredentialStore::mark_legacy_account_rejected( 'bad_credentials' );
 		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
-		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
 		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
 
 		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
 		$this->assertSame( 200, ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD )['status'] );
 
 		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
-		$this->assertFalse( ConnectionService::login_throttled() );
-		$this->assertFalse( \get_option( ConnectionService::LOGIN_FAILURES_OPTION, false ) );
+		$this->assertCount( 1, (array) ( \get_option( ConnectionService::REAL_PASSWORD_GATE_OPTION )['failures'] ?? [] ), '成功不抹掉先前的失敗' );
+		$this->assertTrue( ConnectionService::may_send_real_password() );
 		$this->assertSame( 200, ConnectionService::status()['status'], '重新登入後恢復送出（新帳密）' );
 	}
 
@@ -841,13 +860,13 @@ class CloudConnectionTest extends TestCase {
 		\wp_set_current_user( $this->admin_id );
 		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
 
-		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+		for ( $i = 0; $i < ConnectionService::REAL_PASSWORD_MAX_FAILURES; $i++ ) {
 			$this->proxy( 'POST', 'identity', [ 'email' => 'a@b.c', 'password' => 'wrong' ] );
 		}
 		$blocked = $this->proxy( 'POST', 'identity', [ 'email' => 'a@b.c', 'password' => 'wrong' ] );
 
 		$this->assertSame( 429, $blocked->get_status() );
-		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
+		$this->assertCount( ConnectionService::REAL_PASSWORD_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
 	}
 
 	// ========== CloudServer 停用 / 根除共用帳號之後不可無聲斷線 ==========
@@ -959,12 +978,17 @@ class CloudConnectionTest extends TestCase {
 		$attention = ConnectionService::attention();
 
 		$this->assertSame( 'shared_only', $attention['code'] ?? null );
-		$this->assertSame( '目前以共用帳號連線，共用帳號即將停用，請重新登入一次以換成專屬密碼（目前功能不受影響）。', $attention['message'] ?? null );
+		$this->assertSame( '目前以共用帳號連線，共用帳號即將停用，請重新登入一次以換成專屬密碼。', $attention['message'] ?? null, '沒看過共用帳號成功，不可說功能不受影響' );
+
+		CredentialStore::note_legacy_ok();
+		$this->assertSame( '目前以共用帳號連線，共用帳號即將停用，請重新登入一次以換成專屬密碼（目前功能不受影響）。', ConnectionService::attention()['message'] ?? null );
 
 		\wp_set_current_user( $this->admin_id );
+		$this->screen( 'dashboard' );
 		ob_start();
 		\J7\PowerPartner\Domains\Cloud\Core\Notices::instance()->render();
 		$this->assertStringContainsString( '共用帳號即將停用', (string) ob_get_clean() );
+		$GLOBALS['current_screen'] = null;
 	}
 
 	/** @group happy */
@@ -974,7 +998,7 @@ class CloudConnectionTest extends TestCase {
 
 		$attention = ConnectionService::attention();
 
-		$this->assertSame( '此帳號目前不符合經銷商資格，請聯繫站長路可。', $attention['message'] ?? null );
+		$this->assertSame( '此帳號目前不符合經銷商資格，共用帳號停用後將無法使用雲端功能，請聯繫站長路可。', $attention['message'] ?? null, '相容期與根除後都正確' );
 		$this->assertFalse( $attention['relogin'] ?? true, '重新登入解決不了，AdminApp 不顯示「重新登入」' );
 		$this->assertTrue( \J7\PowerPartner\Domains\Cloud\Core\Notices::should_prompt_relogin(), 'wp-admin 仍要提示' );
 	}
@@ -983,6 +1007,7 @@ class CloudConnectionTest extends TestCase {
 	public function test_提示_帳密失效的文案依共用帳號是否還能用而不同(): void {
 		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'old' );
 		CredentialStore::mark_legacy_account_rejected( 'bad_credentials' );
+		CredentialStore::note_legacy_ok();
 		$this->assertSame( '雲端帳密已失效，請重新登入一次。目前功能不受影響。', ConnectionService::attention()['message'] ?? null );
 
 		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
@@ -1131,5 +1156,245 @@ class CloudConnectionTest extends TestCase {
 
 		$this->assertSame( 200, $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 99 ] ] )->get_status() );
 		$this->assertSame( [], $this->sent( 'GET', 'license-codes' ) );
+	}
+
+	// ========== 第四輪：只有明確的帳密錯誤才標記、共用的真實密碼閘門、提示範圍、根除後 not_owner ==========
+
+	/** CloudServer 新契約：wp_authenticate 失敗但不是帳密錯誤（Fluent 封鎖 IP、驗證碼、2FA）時，回 CredentialThrottle 的 429 */
+	private const RATE_LIMITED = [ 429, '{"code":"rate_limited","message":"too many attempts","data":{"status":429,"error_code":"rate_limited"}}' ];
+
+	/** @group error */
+	public function test_identity回429不寫帳密被拒標記並冷卻30分鐘(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['POST identity'] = self::RATE_LIMITED;
+
+		$first = ConnectionService::status();
+
+		$this->assertSame( 429, $first['status'] );
+		$this->assertStringContainsString( '30 分鐘後再試', (string) $first['message'] );
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected(), 'IP 被封鎖不是帳密錯誤' );
+		$this->assertFalse( ConnectionService::may_send_real_password() );
+
+		ConnectionService::status();
+		$this->assertCount( 1, $this->sent( 'POST', 'identity' ), '冷卻期間每一次嘗試都會延長 Fluent 的封鎖，完全不送' );
+	}
+
+	/** @group error */
+	public function test_identity的body_status429也算暫時性(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['POST identity'] = [ 200, [ 'status' => 429, 'message' => 'email or password invalid' ] ];
+
+		ConnectionService::status();
+
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
+		$this->assertFalse( ConnectionService::may_send_real_password() );
+	}
+
+	/** @group error */
+	public function test_遷移遇到429維持pending不標failed(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = self::RATE_LIMITED;
+
+		Migration::run();
+
+		$this->assertSame( ConnectionService::MIGRATION_PENDING, ConnectionService::migration()['status'] );
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
+		$this->assertTrue( Migration::needs_migration(), '明天再試' );
+		$this->assertFalse( ConnectionService::may_send_real_password() );
+	}
+
+	/** @group happy */
+	public function test_帳密被拒標記24小時後允許重試一次(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		\update_option(
+			CredentialStore::LEGACY_REJECTED_OPTION,
+			[
+				'reason' => 'bad_credentials',
+				'at'     => time() - CredentialStore::LEGACY_REJECTED_TTL - 1,
+			],
+			false
+		);
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected(), '24 小時後過期' );
+		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
+
+		ConnectionService::status();
+		ConnectionService::status();
+
+		$this->assertCount( 1, $this->sent( 'POST', 'identity' ), '過期後只重試一次，失敗就再標記' );
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+	}
+
+	/** @group happy */
+	public function test_帳密被拒標記過期後重試成功就清除(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		\update_option(
+			CredentialStore::LEGACY_REJECTED_OPTION,
+			[
+				'reason' => 'bad_credentials',
+				'at'     => time() - CredentialStore::LEGACY_REJECTED_TTL - 1,
+			],
+			false
+		);
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$this->assertSame( 200, ConnectionService::status()['status'] );
+		$this->assertFalse( \get_option( CredentialStore::LEGACY_REJECTED_OPTION, false ), '之前是誤判（例如舊版 CloudServer 在 IP 被封鎖時也回帳密錯誤）' );
+	}
+
+	/** @group security */
+	public function test_429後30分鐘內任何路徑都不送真實密碼(): void {
+		\wp_set_current_user( $this->admin_id );
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		ConnectionService::record_real_password_outcome( [ 'response' => [ 'code' => 429 ], 'body' => '{}' ], ConnectionService::SEND_IDENTITY );
+
+		$this->assertSame( '登入嘗試過於頻繁，請 30 分鐘後再試', ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD )['message'] );
+		ConnectionService::status();
+		Migration::run();
+		$detail   = $this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+		$identity = $this->proxy( 'POST', 'identity', [ 'email' => 'a@b.c', 'password' => 'x' ] );
+
+		$this->assertSame( 429, $detail->get_status() );
+		$this->assertSame( 429, $identity->get_status() );
+		$this->assertSame( [], $this->requests, '登入、查身分、遷移、點數明細、proxy identity 全都不可送出' );
+		$this->assertSame( ConnectionService::MIGRATION_PENDING, ConnectionService::migration()['status'], '遷移明天再試，不是 failed' );
+	}
+
+	/**
+	 * v3/connect 暫時錯誤時會再打一次 identity：兩次各自計數
+	 *
+	 * @group security
+	 */
+	public function test_temporary退回舊流程的兩次請求各算一次(): void {
+		$this->routes['POST v3/connect'] = [ 500, [ 'code' => 'x', 'message' => 'x' ] ];
+		$this->routes['POST identity']   = self::IDENTITY_BAD_PASSWORD;
+
+		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+		$blocked = ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+
+		$this->assertSame( 429, $blocked['status'], '一次 connect 已經送出兩次真實密碼' );
+		$this->assertCount( 1, $this->sent( 'POST', 'v3/connect' ) );
+		$this->assertCount( 1, $this->sent( 'POST', 'identity' ) );
+	}
+
+	/**
+	 * v3/connect 那一次失敗剛好讓閘門關上：退回舊流程的 identity 不可再送，回明確訊息
+	 *
+	 * @group security
+	 */
+	public function test_connect退回舊流程時identity被閘門擋下也回明確訊息(): void {
+		ConnectionService::record_real_password_outcome( [ 'response' => [ 'code' => 401 ], 'body' => '{"code":"auth_required"}' ], ConnectionService::SEND_CONNECT );
+		$this->routes['POST v3/connect'] = [ 500, [ 'code' => 'x', 'message' => 'x' ] ];
+		$this->routes['POST identity']   = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$result = ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertSame( 429, $result['status'] );
+		$this->assertSame( '登入嘗試過於頻繁，請 30 分鐘後再試', $result['message'] );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ) );
+	}
+
+	/** @group security */
+	public function test_遷移的帳密失敗也計入同一個閘門(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => 'x', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
+
+		Migration::run();
+		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+
+		$this->assertSame( 429, ConnectionService::connect( self::OLD_EMAIL, 'wrong' )['status'] );
+		$this->assertCount( 2, $this->sent( 'POST', 'v3/connect' ) );
+	}
+
+	/** @group happy */
+	public function test_提示_不受影響只在24小時內看過共用帳號成功(): void {
+		$this->given_dealer();
+		CredentialStore::mark_dealer_invalid( 'incorrect_password' );
+		$this->assertSame( '站長路可拒絕了本站的專屬金鑰，請重新登入一次。', ConnectionService::attention()['message'] ?? null, '根除後專屬密碼被撤銷時，不能靠「沒看過共用帳號失敗」推論它還能用' );
+
+		CredentialStore::note_legacy_ok();
+		$this->assertSame( '站長路可拒絕了本站的專屬金鑰，請重新登入一次。目前功能不受影響。', ConnectionService::attention()['message'] ?? null );
+
+		\update_option(
+			CredentialStore::LEGACY_STATE_OPTION,
+			[
+				'disabled_at' => 0,
+				'reason'      => '',
+				'ok_at'       => time() - CredentialStore::LEGACY_OK_FRESH - 1,
+			],
+			false
+		);
+		$this->assertSame( '站長路可拒絕了本站的專屬金鑰，請重新登入一次。', ConnectionService::attention()['message'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_提示_試關結束共用帳號恢復後中斷提示立即消失(): void {
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+		$this->assertSame( 'disconnected', ConnectionService::attention()['code'] ?? null );
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200 ] ];
+
+		CloudClient::instance()->remote_get( 'apps' );
+
+		$this->assertNotSame( 'disconnected', ConnectionService::attention()['code'] ?? null );
+		$this->assertTrue( CredentialStore::legacy_ok_recently() );
+	}
+
+	/**
+	 * 模板站 / clone 站帶著 partner_id 時，終端客戶的後台不可出現看不懂的提示
+	 *
+	 * @group happy
+	 */
+	public function test_提示_沒有憑證只在PowerPartner頁面與首頁顯示(): void {
+		\wp_set_current_user( $this->admin_id );
+		$notices = \J7\PowerPartner\Domains\Cloud\Core\Notices::instance();
+		$render  = static function () use ( $notices ): string {
+			ob_start();
+			$notices->render();
+			return (string) ob_get_clean();
+		};
+
+		$this->screen( 'edit-post' );
+		$this->assertSame( '', $render(), '一般 wp-admin 頁面不顯示' );
+		$this->screen( 'dashboard' );
+		$this->assertStringContainsString( '共用帳號即將停用', $render() );
+		$this->screen( 'powerhouse_page_power-partner' );
+		$this->assertStringContainsString( '共用帳號即將停用', $render() );
+
+		// 真的斷線的提示維持全域顯示
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+		$this->screen( 'edit-post' );
+		$this->assertStringContainsString( '雲端連線已中斷', $render() );
+		$GLOBALS['current_screen'] = null;
+	}
+
+	/**
+	 * 根除後 recover / expire 收到 not_owner：重送 legacy 只會拿到 401，蓋掉真正原因
+	 *
+	 * @group error
+	 */
+	public function test_共用帳號已停用時not_owner回原始403不重送(): void {
+		$this->given_dealer();
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+		$this->routes['POST license-codes/recover'] = [ 403, [ 'code' => 'not_owner', 'message' => '授權碼作者不是本人', 'data' => [ 'status' => 403, 'error_code' => 'not_owner' ] ] ];
+
+		$response = CloudClient::instance()->remote_post( 'license-codes/recover', [ 'ids' => [ 1 ] ], [ 'legacy_on_not_owner' => true ] );
+
+		$this->assertSame( 403, \wp_remote_retrieve_response_code( $response ) );
+		$this->assertSame( 'not_owner', CloudClient::error_code( $response ) );
+		$this->assertCount( 1, $this->sent( 'POST', 'license-codes/recover' ) );
+	}
+
+	/** @group error */
+	public function test_not_owner重送時才發現共用帳號已停用也回原始403(): void {
+		$this->given_dealer();
+		$this->routes['POST license-codes/recover'] = function ( $request ) {
+			return $request['headers']['Authorization'] === $this->dealer_basic()
+				? [ 403, [ 'code' => 'not_owner', 'message' => '授權碼作者不是本人', 'data' => [ 'status' => 403, 'error_code' => 'not_owner' ] ] ]
+				: self::LEGACY_OFF;
+		};
+
+		$response = CloudClient::instance()->remote_post( 'license-codes/recover', [ 'ids' => [ 1 ] ], [ 'legacy_on_not_owner' => true ] );
+
+		$this->assertSame( 'not_owner', CloudClient::error_code( $response ), '訂單備註要看得到真正原因' );
+		$this->assertTrue( CredentialStore::is_legacy_disabled() );
 	}
 }

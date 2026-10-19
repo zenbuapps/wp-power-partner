@@ -356,7 +356,8 @@ class LcCloudResponseTest extends TestCase {
 		( new LifeCycle() )->subscription_success( $subscription, [] );
 
 		$notes = $this->notes( $subscription->get_id() );
-		$this->assertNotEmpty( $this->grep( $notes, '/《重啟》授權碼 ❌失敗.*HTTP 401 legacy_auth_disabled/s' ), print_r( $notes, true ) ); // phpcs:ignore
+		// 共用帳號已停用時保留專屬密碼的原始 403，備註才看得到真正原因（作者不符），不是被共用帳號的 401 蓋掉
+		$this->assertNotEmpty( $this->grep( $notes, '/《重啟》授權碼 ❌失敗.*HTTP 403 not_owner/s' ), print_r( $notes, true ) ); // phpcs:ignore
 		$this->assertEmpty( $this->grep( $notes, '/✅/' ) );
 		$this->assertNotEmpty( $this->error_logs() );
 	}

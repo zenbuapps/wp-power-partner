@@ -21,7 +21,7 @@ use J7\PowerPartner\Plugin;
  * 向後相容原則：在 legacy 關閉前，任何一步遷移出錯都不能讓開站、停用、扣點、授權碼中斷。
  *
  * CloudServer 停用或根除共用帳號之後（legacy 回 legacy_auth_disabled / incorrect_password），
- * 改走 legacy 沒有意義：記下 CredentialStore::LEGACY_DISABLED_OPTION，之後一律先用專屬密碼，
+ * 改走 legacy 沒有意義：記在 CredentialStore::LEGACY_STATE_OPTION，之後一律先用專屬密碼，
  * 專屬密碼被拒時也不會因此「1 小時內全走 legacy」而整站斷線。應用程式密碼錯誤不會被
  * cloud.luke.cafe 的 Fluent Security 計數（見 CLAUDE.md 常見陷阱 38），每個請求重試 dealer 是安全的。
  *
@@ -235,8 +235,12 @@ final class CloudClient {
 					'partner_id' => (string) \get_option( Connect::PARTNER_ID_OPTION_NAME, '' ),
 				]
 			);
-			$response = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
-			self::note_legacy_outcome( $response );
+			$legacy = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
+			self::note_legacy_outcome( $legacy );
+			// 共用帳號剛被發現已停用：保留專屬密碼的原始 403，訂單備註才看得到真正原因（作者不符）
+			if ( ! self::is_legacy_unusable( $legacy ) ) {
+				$response = $legacy;
+			}
 		} elseif ( self::is_success( $response ) ) {
 			// 專屬密碼又被接受了：之前的失效標記是暫時性誤判，清掉讓 notice 消失
 			CredentialStore::clear_dealer_invalid();
@@ -281,7 +285,7 @@ final class CloudClient {
 		if ( self::is_legacy_unusable( $response ) ) {
 			CredentialStore::mark_legacy_disabled( self::error_code( $response ) );
 		} elseif ( self::is_success( $response ) ) {
-			CredentialStore::clear_legacy_disabled();
+			CredentialStore::note_legacy_ok();
 		}
 	}
 
@@ -312,6 +316,10 @@ final class CloudClient {
 	 */
 	private static function should_retry_not_owner_as_legacy( string $endpoint, array|\WP_Error $response, array $args ): bool {
 		if ( true !== ( $args['legacy_on_not_owner'] ?? false ) ) {
+			return false;
+		}
+		// 共用帳號已停用：重送只會拿到 401，反而蓋掉 not_owner 這個真正原因
+		if ( CredentialStore::legacy_disabled_recently() ) {
 			return false;
 		}
 		if ( ! in_array( ltrim( $endpoint, '/' ), self::LEGACY_ON_NOT_OWNER_ENDPOINTS, true ) ) {

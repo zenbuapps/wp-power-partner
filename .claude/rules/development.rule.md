@@ -220,9 +220,10 @@ inc/classes/Domains/
 3. `403 rest_cookie_invalid_nonce` — nonce 過期，`api/nonce.tsx` 會換新並重送一次；仍失敗代表已登出或 admin-ajax `rest-nonce` 被擋
 4. `403 not_owner` — customer 操作的站台或授權碼不屬於自己（`change-domain` / `toggle-ssl` / `license-codes/release`）
 5. `502 pp_upstream_unavailable` — 本站連不上 CloudServer，或 customer 的歸屬確認請求失敗
-6. 上游 401/403 — 看 `Plugin::logger` 是否有「CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送」；`power_partner_cloud_dealer_invalid` 有值代表專屬密碼已被標記失效（1 小時內走 legacy，除非 `power_partner_cloud_legacy_disabled` 有值），請經銷商重新登入；`power_partner_cloud_legacy_account_rejected` 有值代表保存的登入帳密被拒、本站已停止送出
-7. 要確認目前走哪種模式：`CloudClient::preferred_mode()`，或 `GET /power-partner/connection` 回應的 `connection.mode`
-8. 解不開憑證（`CredentialStore` log「解密失敗」/「host 不符」）— salts 被重產或站被 clone，視為未連線，重新登入即可
+6. 上游 401/403 — 看 `Plugin::logger` 是否有「CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送」；`power_partner_cloud_dealer_invalid` 有值代表專屬密碼已被標記失效（1 小時內走 legacy，除非 `power_partner_cloud_legacy_state` 的 `disabled_at` 有值），請經銷商重新登入；`power_partner_cloud_legacy_account_rejected` 有值代表保存的登入帳密被拒、24 小時內本站不再送出
+7. 登入回「登入嘗試過於頻繁，請 30 分鐘後再試」、點數明細 / proxy identity 回 429 `pp_real_password_gate` — 本站真實密碼閘門（`power_partner_cloud_real_password_gate`）擋下：30 分鐘內帳密失敗 2 次，或剛收到 CloudServer 的 429。這是為了不讓 Fluent Security 封鎖整台主機的 IP，請等它過期，不要刪 option 硬試
+8. 要確認目前走哪種模式：`CloudClient::preferred_mode()`，或 `GET /power-partner/connection` 回應的 `connection.mode`
+9. 解不開憑證（`CredentialStore` log「解密失敗」/「host 不符」）— salts 被重產或站被 clone，視為未連線，重新登入即可
 
 ### PowerCloud 開站失敗?
 1. 確認 `power_partner_powercloud_api_key` transient 存在
