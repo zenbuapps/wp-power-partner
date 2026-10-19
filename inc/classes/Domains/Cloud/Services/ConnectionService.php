@@ -75,6 +75,7 @@ abstract class ConnectionService {
 			} else {
 				$body = self::decode( $response );
 				if ( 200 === (int) ( $body['status'] ?? \wp_remote_retrieve_response_code( $response ) ) && is_array( $body['data'] ?? null ) ) {
+					CredentialStore::clear_dealer_invalid();
 					return self::with_connection( $body, CloudClient::MODE_DEALER );
 				}
 			}
@@ -85,13 +86,15 @@ abstract class ConnectionService {
 			return self::not_connected();
 		}
 
-		// 帳密被拒過就不再送出：每次打開 AdminApp 都重送一次，失敗次數會累積在本站主機的 IP 上
-		if ( CredentialStore::is_legacy_account_rejected() ) {
+		// 帳密被拒過就不再送出：每次打開 AdminApp 都重送一次，失敗次數會累積在本站主機的 IP 上。
+		// 共用帳號已停用時 `POST identity` 也打不進去，同樣不送
+		if ( CredentialStore::is_legacy_account_rejected() || CredentialStore::legacy_disabled_recently() ) {
 			return self::relogin_required();
 		}
 
 		$response = self::send_legacy_identity( $account['email'], $account['password'] );
-		$body     = self::identity_body( $response );
+		CloudClient::note_legacy_outcome( $response );
+		$body = self::identity_body( $response );
 		if ( 200 !== (int) ( $body['status'] ?? 0 ) ) {
 			// 帳密已失效（經銷商改過密碼）→ 記下來不再重送，請他重新登入
 			if ( self::is_password_rejected( $response ) ) {
@@ -449,12 +452,33 @@ abstract class ConnectionService {
 	}
 
 	/**
-	 * 需要經銷商重新登入才能解決的連線問題；wp-admin notice 與 AdminApp 共用這個判斷
+	 * 需要經銷商處理的連線問題；wp-admin notice 與 AdminApp 共用這個判斷
 	 *
-	 * @return array{code: string, message: string}|null
+	 * 「目前功能不受影響」只在共用帳號還能用時才說：CloudServer 停用或根除共用帳號之後，
+	 * 沒有可用專屬密碼的站是真的斷線了，文案改成「雲端連線已中斷」。
+	 *
+	 * @return array{code: string, message: string, relogin: bool}|null relogin = 重新登入能解決
 	 */
 	public static function attention(): ?array {
-		$migration = self::migration();
+		$migration     = self::migration();
+		$legacy_down   = CredentialStore::is_legacy_disabled();
+		$dealer_usable = null !== CredentialStore::get_dealer() && ! CredentialStore::is_dealer_invalid();
+
+		if ( ! $dealer_usable && self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_NOT_ELIGIBLE === $migration['reason'] ) {
+			return [
+				'code'    => 'not_eligible',
+				'message' => '此帳號目前不符合經銷商資格，請聯繫站長路可。',
+				'relogin' => false,
+			];
+		}
+		if ( $legacy_down && ! $dealer_usable ) {
+			return [
+				'code'    => 'disconnected',
+				'message' => '雲端連線已中斷，請重新登入。',
+				'relogin' => true,
+			];
+		}
+		// 走到這裡時，不是共用帳號還能用、就是專屬密碼還能用，所以「目前功能不受影響」成立
 		if (
 			CredentialStore::is_legacy_account_rejected()
 			|| ( self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_BAD_PASSWORD === $migration['reason'] )
@@ -462,12 +486,26 @@ abstract class ConnectionService {
 			return [
 				'code'    => 'credentials_rejected',
 				'message' => '雲端帳密已失效，請重新登入一次。目前功能不受影響。',
+				'relogin' => true,
 			];
 		}
 		if ( CredentialStore::is_dealer_invalid() ) {
 			return [
 				'code'    => 'dealer_rejected',
-				'message' => '尚未完成新版安全連線，請重新登入一次以啟用專屬金鑰；目前功能不受影響。',
+				'message' => '站長路可拒絕了本站的專屬金鑰，請重新登入一次。目前功能不受影響。',
+				'relogin' => true,
+			];
+		}
+		// 有 partner_id 卻讀不到任何憑證（salts 重產、站台 host 改變、帳密只存在瀏覽器的很早期站）：只靠寫死的共用帳號在運作
+		if (
+			'' !== (string) \get_option( Connect::PARTNER_ID_OPTION_NAME, '' )
+			&& null === CredentialStore::get_dealer()
+			&& null === CredentialStore::get_legacy_account()
+		) {
+			return [
+				'code'    => 'shared_only',
+				'message' => '目前以共用帳號連線，共用帳號即將停用，請重新登入一次以換成專屬密碼（目前功能不受影響）。',
+				'relogin' => true,
 			];
 		}
 		return null;
@@ -479,7 +517,7 @@ abstract class ConnectionService {
 	 * @return array<string, mixed>
 	 */
 	private static function relogin_required(): array {
-		$message = self::attention()['message'] ?? '雲端帳密已失效，請重新登入一次。';
+		$message = self::attention()['message'] ?? '雲端連線需要重新登入。';
 		return [
 			'status'     => 401,
 			'message'    => $message,
@@ -517,8 +555,8 @@ abstract class ConnectionService {
 		$attention          = self::attention();
 		$body['connection'] = [
 			'mode'      => $mode,
-			// 前端只在 failed 時顯示提示；不需要經銷商處理的 failed 回報為 none
-			'migration' => null !== $attention ? self::MIGRATION_FAILED : ( self::MIGRATION_FAILED === $migration['status'] ? self::MIGRATION_NONE : $migration['status'] ),
+			// 前端只在 failed 時顯示「重新登入」；重新登入解決不了的（不符資格）回報為 none
+			'migration' => ( $attention['relogin'] ?? false ) ? self::MIGRATION_FAILED : ( self::MIGRATION_FAILED === $migration['status'] ? self::MIGRATION_NONE : $migration['status'] ),
 			'message'   => $attention['message'] ?? '',
 		];
 		return $body;

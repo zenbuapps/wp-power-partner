@@ -51,6 +51,17 @@ abstract class CredentialStore {
 	 */
 	const LEGACY_REJECTED_OPTION = 'power_partner_cloud_legacy_account_rejected';
 
+	/**
+	 * @var string 共用帳號（legacy）已被 CloudServer 停用或撤銷 `{reason, at}`
+	 *
+	 * CloudServer 試關或根除共用帳號之後，改走 legacy 沒有意義：CloudClient 看到這個標記就一律先用
+	 * 專屬密碼，notice 也改說「雲端連線已中斷」。共用帳號請求再次成功時清除（試關後又切回）。
+	 */
+	const LEGACY_DISABLED_OPTION = 'power_partner_cloud_legacy_disabled';
+
+	/** @var int 「共用帳號已停用」標記多久更新一次 / 多久內不再以共用帳號重試（1 小時） */
+	const LEGACY_DISABLED_RECHECK = 3600;
+
 	/** @var string 衍生金鑰時的 context，避免與其他用到同一組 salt 的用途撞 key */
 	const KEY_CONTEXT = '|power-partner/cloud-credentials/v1';
 
@@ -138,6 +149,69 @@ abstract class CredentialStore {
 	 */
 	public static function is_dealer_invalid(): bool {
 		return false !== \get_option( self::DEALER_INVALID_OPTION, false );
+	}
+
+	/**
+	 * 專屬密碼再次被 CloudServer 接受時清除失效標記（暫時性的誤判自己恢復，notice 跟著消失）
+	 *
+	 * @return void
+	 */
+	public static function clear_dealer_invalid(): void {
+		if ( self::is_dealer_invalid() ) {
+			\delete_option( self::DEALER_INVALID_OPTION );
+		}
+	}
+
+	/**
+	 * 標記共用帳號已被 CloudServer 停用（見 LEGACY_DISABLED_OPTION）
+	 *
+	 * 每個請求都可能走到這裡，1 小時內只寫一次。
+	 *
+	 * @param string $reason CloudServer 的錯誤代碼
+	 * @return void
+	 */
+	public static function mark_legacy_disabled( string $reason ): void {
+		if ( self::legacy_disabled_recently() ) {
+			return;
+		}
+		$first = ! self::is_legacy_disabled();
+		\update_option(
+			self::LEGACY_DISABLED_OPTION,
+			[
+				'reason' => $reason,
+				'at'     => time(),
+			],
+			false
+		);
+		if ( $first ) {
+			Plugin::logger( 'CloudServer 已停用共用帳號，之後一律以經銷商專屬密碼連線', 'warning', [ 'reason' => $reason ] );
+		}
+	}
+
+	/**
+	 * 共用帳號請求成功時清除停用標記
+	 *
+	 * @return void
+	 */
+	public static function clear_legacy_disabled(): void {
+		if ( self::is_legacy_disabled() ) {
+			\delete_option( self::LEGACY_DISABLED_OPTION );
+		}
+	}
+
+	/**
+	 * @return bool 是否看過共用帳號被停用（沒有再次成功過）
+	 */
+	public static function is_legacy_disabled(): bool {
+		return false !== \get_option( self::LEGACY_DISABLED_OPTION, false );
+	}
+
+	/**
+	 * @return bool 最近 1 小時內是否確認過共用帳號已停用
+	 */
+	public static function legacy_disabled_recently(): bool {
+		$stored = \get_option( self::LEGACY_DISABLED_OPTION, false );
+		return is_array( $stored ) && ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_DISABLED_RECHECK;
 	}
 
 	/**

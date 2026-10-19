@@ -117,6 +117,7 @@ class CloudConnectionTest extends TestCase {
 			CredentialStore::OLD_ACCOUNT_INFO_OPTION,
 			CredentialStore::DEALER_INVALID_OPTION,
 			CredentialStore::LEGACY_REJECTED_OPTION,
+			CredentialStore::LEGACY_DISABLED_OPTION,
 			ConnectionService::MIGRATION_OPTION,
 			ConnectionService::INSTALLATION_OPTION,
 			ConnectionService::LOGIN_FAILURES_OPTION,
@@ -847,5 +848,144 @@ class CloudConnectionTest extends TestCase {
 
 		$this->assertSame( 429, $blocked->get_status() );
 		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
+	}
+
+	// ========== CloudServer 停用 / 根除共用帳號之後不可無聲斷線 ==========
+
+	/** CloudServer 試關共用帳號時的回應 */
+	private const LEGACY_OFF = [ 401, '{"code":"legacy_auth_disabled","message":"legacy auth disabled","data":{"status":401,"error_code":"legacy_auth_disabled"}}' ];
+
+	/**
+	 * 經銷商等級暫時變 0 → 專屬密碼被拒成 rest_forbidden；共用帳號已停用時，不可因此「1 小時內全走 legacy」整站斷線
+	 *
+	 * @group error
+	 */
+	public function test_專屬密碼被拒且共用帳號已停用時下一個請求仍先試專屬密碼(): void {
+		$this->given_dealer();
+		$dealer_ok                            = false;
+		$this->routes['POST v2/disable-site'] = function ( $request ) use ( &$dealer_ok ) {
+			if ( $request['headers']['Authorization'] === $this->dealer_basic() ) {
+				return $dealer_ok ? [ 200, [ 'status' => 200 ] ] : [ 403, [ 'code' => 'rest_forbidden', 'message' => 'x', 'data' => [ 'status' => 403 ] ] ];
+			}
+			return self::LEGACY_OFF;
+		};
+
+		$first = CloudClient::instance()->remote_post( 'v2/disable-site', [ 'site_id' => '1' ] );
+
+		$this->assertSame( 403, \wp_remote_retrieve_response_code( $first ), '回傳專屬密碼的原始錯誤，不是共用帳號的' );
+		$this->assertCount( 2, $this->sent( 'POST', 'v2/disable-site' ) );
+		$this->assertTrue( CredentialStore::is_legacy_disabled() );
+		$this->assertSame( CloudClient::MODE_DEALER, CloudClient::preferred_mode(), '共用帳號已停用，改走它沒有意義' );
+
+		CloudClient::instance()->remote_post( 'v2/disable-site', [ 'site_id' => '1' ] );
+		$sent = $this->sent( 'POST', 'v2/disable-site' );
+		$this->assertCount( 3, $sent, '剛確認過共用帳號已停用，不再陪跑一次 legacy' );
+		$this->assertSame( $this->dealer_basic(), $sent[2]['headers']['Authorization'] ?? null );
+
+		$attention = ConnectionService::attention();
+		$this->assertSame( 'disconnected', $attention['code'] ?? null );
+		$this->assertStringNotContainsString( '不受影響', (string) ( $attention['message'] ?? '' ), '共用帳號停用後不可再說功能不受影響' );
+
+		// 等級恢復：下一個請求就自己好了，notice 跟著消失
+		$dealer_ok = true;
+		$this->assertSame( 200, \wp_remote_retrieve_response_code( CloudClient::instance()->remote_post( 'v2/disable-site', [ 'site_id' => '1' ] ) ) );
+		$this->assertFalse( CredentialStore::is_dealer_invalid() );
+		$this->assertNull( ConnectionService::attention() );
+	}
+
+	/**
+	 * 根除版刪掉共用帳號的密碼後，core 回 incorrect_password，同樣視為共用帳號已停用
+	 *
+	 * @group error
+	 */
+	public function test_根除後共用帳號回incorrect_password也視為已停用(): void {
+		$this->given_dealer();
+		$this->routes['GET apps'] = function ( $request ) {
+			return $request['headers']['Authorization'] === $this->dealer_basic()
+				? [ 403, [ 'code' => 'rest_forbidden', 'message' => 'x', 'data' => [ 'status' => 403 ] ] ]
+				: self::SHARED_REVOKED;
+		};
+
+		CloudClient::instance()->remote_get( 'apps' );
+
+		$this->assertTrue( CredentialStore::is_legacy_disabled() );
+		$this->assertSame( CloudClient::MODE_DEALER, CloudClient::preferred_mode() );
+	}
+
+	/**
+	 * 專屬密碼剛被拒、1 小時內暫走 legacy，期間 CloudServer 停用了共用帳號 → 當次改回專屬密碼
+	 *
+	 * @group error
+	 */
+	public function test_暫走共用帳號期間共用帳號被停用時當次改回專屬密碼(): void {
+		$this->given_dealer();
+		CredentialStore::mark_dealer_invalid( 'incorrect_password' );
+		$this->assertSame( CloudClient::MODE_LEGACY, CloudClient::preferred_mode() );
+		$this->routes['GET apps'] = function ( $request ) {
+			return $request['headers']['Authorization'] === $this->dealer_basic() ? [ 200, [ 'status' => 200 ] ] : self::LEGACY_OFF;
+		};
+
+		$response = CloudClient::instance()->remote_get( 'apps' );
+
+		$this->assertSame( 200, \wp_remote_retrieve_response_code( $response ) );
+		$this->assertFalse( CredentialStore::is_dealer_invalid(), '專屬密碼又能用了，清掉失效標記' );
+		$this->assertSame( CloudClient::MODE_DEALER, CloudClient::preferred_mode() );
+	}
+
+	/** @group happy */
+	public function test_共用帳號恢復後清除停用標記(): void {
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200 ] ];
+
+		CloudClient::instance()->remote_get( 'apps' );
+
+		$this->assertFalse( CredentialStore::is_legacy_disabled(), '試關後又切回：沒有專屬密碼的站照常運作' );
+	}
+
+	/** @group error */
+	public function test_共用帳號已停用時status不再送出identity(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+
+		$result = ConnectionService::status();
+
+		$this->assertSame( 401, $result['status'] );
+		$this->assertSame( '雲端連線已中斷，請重新登入。', $result['message'] );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ) );
+	}
+
+	/** @group happy */
+	public function test_提示_有partner_id卻讀不到任何憑證(): void {
+		$attention = ConnectionService::attention();
+
+		$this->assertSame( 'shared_only', $attention['code'] ?? null );
+		$this->assertSame( '目前以共用帳號連線，共用帳號即將停用，請重新登入一次以換成專屬密碼（目前功能不受影響）。', $attention['message'] ?? null );
+
+		\wp_set_current_user( $this->admin_id );
+		ob_start();
+		\J7\PowerPartner\Domains\Cloud\Core\Notices::instance()->render();
+		$this->assertStringContainsString( '共用帳號即將停用', (string) ob_get_clean() );
+	}
+
+	/** @group happy */
+	public function test_提示_不符資格(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		ConnectionService::set_migration( ConnectionService::MIGRATION_FAILED, ConnectionService::EXCHANGE_NOT_ELIGIBLE );
+
+		$attention = ConnectionService::attention();
+
+		$this->assertSame( '此帳號目前不符合經銷商資格，請聯繫站長路可。', $attention['message'] ?? null );
+		$this->assertFalse( $attention['relogin'] ?? true, '重新登入解決不了，AdminApp 不顯示「重新登入」' );
+		$this->assertTrue( \J7\PowerPartner\Domains\Cloud\Core\Notices::should_prompt_relogin(), 'wp-admin 仍要提示' );
+	}
+
+	/** @group happy */
+	public function test_提示_帳密失效的文案依共用帳號是否還能用而不同(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'old' );
+		CredentialStore::mark_legacy_account_rejected( 'bad_credentials' );
+		$this->assertSame( '雲端帳密已失效，請重新登入一次。目前功能不受影響。', ConnectionService::attention()['message'] ?? null );
+
+		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
+		$this->assertSame( '雲端連線已中斷，請重新登入。', ConnectionService::attention()['message'] ?? null );
 	}
 }

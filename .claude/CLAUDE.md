@@ -101,11 +101,11 @@ PowerCloud API key 儲存方式:
 
 | 認證模式 | 條件 | Authorization |
 |---|---|---|
-| `dealer` | `CredentialStore::get_dealer()` 有值，且最近 1 小時（`DEALER_RETRY_AFTER`）沒被 CloudServer 以憑證類錯誤拒絕 | 專屬帳號 + 專屬應用程式密碼（Basic） |
+| `dealer` | `CredentialStore::get_dealer()` 有值，且最近 1 小時（`DEALER_RETRY_AFTER`）沒被 CloudServer 以憑證類錯誤拒絕；**共用帳號已被停用（`power_partner_cloud_legacy_disabled`）時一律 dealer** | 專屬帳號 + 專屬應用程式密碼（Basic） |
 | `legacy` | 尚未取得專屬密碼、或被標記失效 | `Bootstrap` 上的共用帳號（Basic） |
 | `none` | 僅 `v3/connect` | 不帶 |
 
-- `CloudClient::request()` 每次自動選模式；dealer 收到 `CREDENTIAL_REJECTED_CODES` 的 401/403 → `CredentialStore::mark_dealer_invalid()` + **當次改用 legacy 重送**。要指定模式、不要 fallback 時用 `request_with_mode()`。
+- `CloudClient::request()` 每次自動選模式；dealer 收到 `CREDENTIAL_REJECTED_CODES` 的 401/403 → `CredentialStore::mark_dealer_invalid()` + **當次改用 legacy 重送**。legacy 也回「共用帳號已停用」（`LEGACY_DISABLED_CODES`：`legacy_auth_disabled`，或根除後 core 回的 `incorrect_password`）時，記下 `power_partner_cloud_legacy_disabled`、回傳 dealer 的原始錯誤，**之後仍先試 dealer**（不會「1 小時內全走 legacy」而整站斷線）；暫走 legacy 期間遇到共用帳號停用，當次改回 dealer。dealer 請求成功時自動清除失效標記。要指定模式、不要 fallback 時用 `request_with_mode()`。
 - `ConnectionService`：`status()`（dealer 打 `GET v3/identity`；否則解出 legacy 帳密打 `POST identity`）、`connect()`、`disconnect()`、`exchange()`（打 `POST v3/connect`）。`connect()` 先試 `v3/connect`；CloudServer 尚無此路由（404 `rest_no_route`）、帳號 `not_eligible`、或暫時錯誤 → **退回舊流程** `POST identity`，成功後以 sodium 加密保存帳密並標記 migration `pending`（不符資格標 `failed`）。帳密錯誤（401）/ 429 → 直接失敗，**不動既存憑證**。
 - `Migration`（ActionScheduler 每日）：有 legacy 帳密、沒有專屬密碼 → 打 `v3/connect`。成功即刪 legacy 帳密；404 / 429 / 5xx / 連線錯誤 → 明天再試；401（帳密錯）與 `not_eligible` → 標 `failed` 停止重試（重試會觸發 CloudServer 鎖帳號），由 `Notices` 提示重新登入，期間維持 legacy 運作。
 - 回應格式刻意與舊版 cloud `POST identity` 相同（HTTP 200 包著 body 的 `status` / `message` / `data`），另加 `connection: {mode, migration, message}`，AdminApp 讀 identity 的程式不必改。
@@ -122,7 +122,8 @@ PowerCloud API key 儲存方式:
 | `power_partner_account_info` | string | **舊格式**：v3.5.x 以前前端以 CryptoJS + 公開 passphrase（`Plugin::$kebab`）加密存放的經銷商 cloud.luke.cafe 帳密，任何人都解得開。新版程式不再產生；`CredentialStore::get_legacy_account()` 在新格式不存在時退而解密它（自行實作 EVP_BytesToKey，不依賴 Powerhouse vendor）；換成新格式（`save_legacy_account()`）或登出時刪除。`POST /partner-id` 仍接受 `encrypted_account_info` 並寫入此 option，純為舊版 AdminApp 相容 |
 | `power_partner_cloud_dealer_credentials` | string | 經銷商專屬應用程式密碼（`user_login` / `app_password` / `uuid` / `partner_id`）。sodium secretbox 密文，金鑰由 `wp_salt('auth')` + `wp_salt('secure_auth')` 衍生並**綁定 host**，`autoload=no`。salts 重產解不開、或 host 不符（模板站被 clone）一律視為「未連線」+ log，不 fatal。⛔ 不可 localize、不可進任何 REST 回應 |
 | `power_partner_cloud_legacy_account` | string | 經銷商登入帳密 `{email, password}`，加密方式同上。**只在換不到專屬密碼時存在**（CloudServer 尚無 `v3/connect`、不符資格、遷移尚未完成），供 legacy 模式的 `POST identity`、`logs/{id}/detail` 與自動遷移使用；換到專屬密碼後刪除 |
-| `power_partner_cloud_dealer_invalid` | array | `{reason, at}`：專屬密碼被 CloudServer 以憑證類錯誤拒絕的標記，`autoload=no`。1 小時內 `CloudClient` 改走 legacy、`Notices` 顯示請重新登入；`save_dealer()` / `delete_dealer()` 時清除。**不刪專屬密碼本身**——可能只是 CloudServer 暫時異常 |
+| `power_partner_cloud_dealer_invalid` | array | `{reason, at}`：專屬密碼被 CloudServer 以憑證類錯誤拒絕的標記，`autoload=no`。1 小時內 `CloudClient` 改走 legacy（共用帳號已停用時除外）、`Notices` 顯示請重新登入；`save_dealer()` / `delete_dealer()`、或專屬密碼再次被接受時清除。**不刪專屬密碼本身**——可能只是 CloudServer 暫時異常 |
+| `power_partner_cloud_legacy_disabled` | array | `{reason, at}`：共用帳號已被 CloudServer 停用或撤銷（試關回 `legacy_auth_disabled`；根除後 core 回 `incorrect_password`），`autoload=no`，1 小時內只寫一次。有值時 `CloudClient` 一律先用專屬密碼、`status()` 不再打 `POST identity`、notice 改說「雲端連線已中斷」；共用帳號請求再次成功時清除 |
 | `power_partner_cloud_legacy_account_rejected` | array | `{reason, at}`：本站保存的經銷商登入帳密已被 CloudServer 明確回覆「帳密錯誤」（`ConnectionService::is_password_rejected()`），`autoload=no`。有標記時 `status()` / 點數明細 / `Migration` **都不再送出這組帳密**，AdminApp 顯示登入畫面並提示原因；`save_legacy_account()` / `delete_legacy_account()`（重新登入成功、換到專屬密碼、登出）時清除。見常見陷阱 38 |
 | `power_partner_cloud_login_failures` | array | `{count, since}`：本站送出真實密碼的失敗次數，15 分鐘（`LOGIN_FAILURE_WINDOW`）內滿 3 次（`LOGIN_MAX_FAILURES`）就由本站直接回「嘗試次數過多，請 15 分鐘後再試」、不送出。`connect()` 與 proxy `identity` 共用；登入成功時清除 |
 | `power_partner_cloud_migration` | array | `{status: done\|pending\|failed\|none, reason, at}` 自動遷移狀態，`autoload=no`。`reason` 是 `ConnectionService::EXCHANGE_*` 常數 |
@@ -368,7 +369,7 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 34. **`Utils\Base::set_api_auth` 的寫死憑證只剩 legacy fallback 用途** — 要等 CloudServer 關閉 legacy（H1）之後才能移除；屆時 `CloudClient::authorization()` 的 legacy 分支、`Fetch::cloud_headers()` 的 `Authorization`、`Bootstrap::$t` 一併清掉。在那之前不可刪（會讓尚未換到專屬密碼的經銷商斷線），也不可新增依賴它的呼叫點（新程式碼一律走 `CloudClient`）。
 
-35. **Cloud 連線的任何異常都不寄信** — 遷移失敗、專屬密碼被拒、帳密錯誤只寫 `Plugin::logger` 或顯示 wp-admin notice（`Notices`，且文案明說「目前功能不受影響」，避免經銷商誤以為站壞了）。與第 15 條同一原則，不得新增 `wp_mail`；通知經銷商更新由營運方自行處理。
+35. **Cloud 連線的任何異常都不寄信** — 遷移失敗、專屬密碼被拒、帳密錯誤只寫 `Plugin::logger` 或顯示 wp-admin notice（`Notices`）。判斷與文案只有一處：`ConnectionService::attention()`，AdminApp 的 `MigrationAlert` 也讀它回傳的 `connection.message`，前端不可寫死文案。**「目前功能不受影響」只在還有可用憑證時才說**——CloudServer 停用或根除共用帳號、而本站也沒有可用的專屬密碼時，文案是「雲端連線已中斷，請重新登入」；不符資格是「此帳號目前不符合經銷商資格，請聯繫站長路可」；有 partner_id 卻讀不到任何憑證（salts 重產、host 改變、帳密只存在瀏覽器的很早期站）時提示「共用帳號即將停用，請重新登入一次」。與第 15 條同一原則，不得新增 `wp_mail`；通知經銷商更新由營運方自行處理。
 
 36. **wp-env 測試要帶 `WP_ENV_CORE="WordPress/WordPress#7.1"` 與 `WP_ENV_TESTS_PORT=8898`** — 最新版 WooCommerce 需要 WP >= 7.0，`.wp-env.json` 釘的 6.9 會因外掛啟用失敗而讓 wp-env rollback（看起來和 port 撞號一樣是「容器起完就被 destroy」，先看 `wp-env start` 的 log 尾巴）。power-partner 測試 port 用 8898，預設的 8896 會與 power-partner-server 撞號。**每次 `wp-env run` 都要帶同一組環境變數**；全 suite 一次跑會 OOM，分檔跑。
 

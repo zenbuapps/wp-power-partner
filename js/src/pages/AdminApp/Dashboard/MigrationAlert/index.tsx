@@ -6,8 +6,9 @@ import { connectionAtom, isReconnectingAtom } from '@/pages/AdminApp/Atom/atom'
 /**
  * 新版安全連線遷移失敗提示
  *
- * 只在「仍走舊版共用憑證（legacy）且自動遷移失敗」時顯示。
- * 此時所有功能仍照常運作，只是請經銷商重新登入一次，讓本站換取專屬金鑰。
+ * 只在「仍走舊版共用憑證（legacy）且需要重新登入」時顯示。
+ * 文案由 PHP（ConnectionService::attention）決定：共用帳號還能用時會說「目前功能不受影響」，
+ * CloudServer 停用共用帳號之後就不會，這裡不可寫死。
  *
  * 「重新登入」只切換到登入畫面，不先解除綁定（見 isReconnectingAtom）。
  */
@@ -25,8 +26,10 @@ const MigrationAlert = () => {
 			showIcon
 			closable
 			className="mb-4"
-			message="尚未完成新版安全連線，請重新登入一次以啟用專屬金鑰；目前功能不受影響。"
-			description={connection.message || undefined}
+			message={
+				connection.message ||
+				'尚未完成新版安全連線，請重新登入一次以啟用專屬金鑰。'
+			}
 			action={
 				<Button
 					size="small"

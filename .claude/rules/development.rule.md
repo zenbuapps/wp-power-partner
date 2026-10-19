@@ -163,7 +163,7 @@ pnpm zip             # 手動建立 ZIP
 - `hooks/useGetUserIdentity` — `GET /power-partner/connection`；HTTP 200 包著 body 的 `status`：`200` 已連線 → Dashboard；`401` + `mode: 'none'` 未連線 → Login（不跳錯誤通知）
 - `hooks/useConnect` — `POST /power-partner/connection {email, password}`；**成敗看 body 的 `status`**，帳密只送到本站 PHP，瀏覽器不加密、不落地
 - `hooks/useDisconnect` — `DELETE /power-partner/connection`；失敗時不切回登入畫面（PHP 端連線仍在）
-- `Dashboard/MigrationAlert` — `connection.mode === 'legacy' && migration === 'failed'` 時顯示「請重新登入一次」，目前功能不受影響
+- `Dashboard/MigrationAlert` — `connection.mode === 'legacy' && migration === 'failed'` 時顯示，文案是 PHP `ConnectionService::attention()` 回的 `connection.message`（不可在前端寫死，CloudServer 停用共用帳號後「目前功能不受影響」就不成立）
 - 已刪除：`hooks/useAccountInfo`、`accountInfoAtom`、`utils/functions/common.tsx` 的 `encrypt` / `decrypt`（CryptoJS）。顯示 API 失敗訊息用 `getErrorMessage(error, fallback)`（同檔），它會取 WP REST / proxy 原樣轉送的上游錯誤 `message`
 
 ### TypeScript 型別
@@ -220,7 +220,7 @@ inc/classes/Domains/
 3. `403 rest_cookie_invalid_nonce` — nonce 過期，`api/nonce.tsx` 會換新並重送一次；仍失敗代表已登出或 admin-ajax `rest-nonce` 被擋
 4. `403 not_owner` — customer 操作的站台不屬於自己（`change-domain` / `toggle-ssl`）
 5. `502 pp_upstream_unavailable` — 本站連不上 CloudServer，或 customer 的歸屬確認請求失敗
-6. 上游 401/403 — 看 `Plugin::logger` 是否有「CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送」；`power_partner_cloud_dealer_invalid` 有值代表專屬密碼已被標記失效（1 小時內走 legacy），請經銷商重新登入
+6. 上游 401/403 — 看 `Plugin::logger` 是否有「CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送」；`power_partner_cloud_dealer_invalid` 有值代表專屬密碼已被標記失效（1 小時內走 legacy，除非 `power_partner_cloud_legacy_disabled` 有值），請經銷商重新登入；`power_partner_cloud_legacy_account_rejected` 有值代表保存的登入帳密被拒、本站已停止送出
 7. 要確認目前走哪種模式：`CloudClient::preferred_mode()`，或 `GET /power-partner/connection` 回應的 `connection.mode`
 8. 解不開憑證（`CredentialStore` log「解密失敗」/「host 不符」）— salts 被重產或站被 clone，視為未連線，重新登入即可
 

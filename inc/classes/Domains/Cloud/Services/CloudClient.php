@@ -20,6 +20,11 @@ use J7\PowerPartner\Plugin;
  * dealer 被 CloudServer 以「憑證類」錯誤拒絕時，標記失效並**當次改用 legacy 重送**——
  * 向後相容原則：在 legacy 關閉前，任何一步遷移出錯都不能讓開站、停用、扣點、授權碼中斷。
  *
+ * CloudServer 停用或根除共用帳號之後（legacy 回 legacy_auth_disabled / incorrect_password），
+ * 改走 legacy 沒有意義：記下 CredentialStore::LEGACY_DISABLED_OPTION，之後一律先用專屬密碼，
+ * 專屬密碼被拒時也不會因此「1 小時內全走 legacy」而整站斷線。應用程式密碼錯誤不會被
+ * cloud.luke.cafe 的 Fluent Security 計數（見 CLAUDE.md 常見陷阱 38），每個請求重試 dealer 是安全的。
+ *
  * 公開方法的簽名刻意與 Powerhouse `J7\Powerhouse\Api\Base` 相同（remote_get / remote_post /
  * remote_delete），授權碼流程原本用那個 client，換過來時呼叫端不必改。
  */
@@ -77,6 +82,23 @@ final class CloudClient {
 		'license-codes/expire',
 	];
 
+	/**
+	 * 共用帳號本身已不能用的錯誤代碼（CloudServer 試關回 legacy_auth_disabled；根除後密碼被刪，core 回 incorrect_password）
+	 *
+	 * 只看 CloudClient::request() 的一般請求：它們的 body 不帶真實密碼，401 只可能來自共用帳號本身。
+	 * 不含 rest_forbidden：那可能是端點的權限判斷，不代表共用帳號失效。
+	 *
+	 * @var array<int, string>
+	 */
+	const LEGACY_DISABLED_CODES = [
+		'legacy_auth_disabled',
+		'incorrect_password',
+		'invalid_username',
+		'invalid_email',
+		'application_passwords_disabled',
+		'application_passwords_disabled_for_user',
+	];
+
 	/** @var string 最後一次請求實際使用的模式（測試與 log 用） */
 	public string $last_mode = '';
 
@@ -126,6 +148,11 @@ final class CloudClient {
 			return self::MODE_LEGACY;
 		}
 
+		// 共用帳號已被停用：就算專屬密碼剛被拒，改走 legacy 也只會失敗
+		if ( CredentialStore::is_legacy_disabled() ) {
+			return self::MODE_DEALER;
+		}
+
 		$invalid = \get_option( CredentialStore::DEALER_INVALID_OPTION, false );
 		if ( is_array( $invalid ) && ( time() - (int) ( $invalid['at'] ?? 0 ) ) < self::DEALER_RETRY_AFTER ) {
 			return self::MODE_LEGACY;
@@ -167,19 +194,37 @@ final class CloudClient {
 		$mode     = self::preferred_mode();
 		$response = $this->request_with_mode( $mode, $method, $endpoint, $params, $args );
 
-		if ( self::MODE_DEALER === $mode && self::is_credential_rejected( $response ) ) {
-			$code = self::error_code( $response );
+		if ( self::MODE_LEGACY === $mode ) {
+			return $this->after_legacy( $response, $method, $endpoint, $params, $args );
+		}
+
+		if ( self::is_credential_rejected( $response ) ) {
+			$code    = self::error_code( $response );
+			$context = [
+				'endpoint'   => $endpoint,
+				'error_code' => $code,
+			];
+
+			// 共用帳號最近確認過已停用：不再陪跑一次 legacy，下一個請求照樣先試專屬密碼
+			if ( CredentialStore::legacy_disabled_recently() ) {
+				CredentialStore::mark_dealer_invalid( $code );
+				Plugin::logger( 'CloudServer 拒絕經銷商專屬密碼，共用帳號也已停用，此次請求失敗', 'error', $context );
+				return $response;
+			}
+
+			$legacy = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
+			self::note_legacy_outcome( $legacy );
+			if ( self::is_legacy_unusable( $legacy ) ) {
+				// 不改走 legacy（只會失敗），回傳專屬密碼的原始錯誤；失效標記只供 notice 用，routing 仍是 dealer
+				CredentialStore::mark_dealer_invalid( $code );
+				Plugin::logger( 'CloudServer 拒絕經銷商專屬密碼，共用帳號也已停用，此次請求失敗', 'error', $context );
+				return $response;
+			}
+
 			CredentialStore::mark_dealer_invalid( $code );
-			Plugin::logger(
-				'CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送',
-				'warning',
-				[
-					'endpoint'   => $endpoint,
-					'error_code' => $code,
-				]
-			);
-			$response = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
-		} elseif ( self::MODE_DEALER === $mode && self::should_retry_not_owner_as_legacy( $endpoint, $response, $args ) ) {
+			Plugin::logger( 'CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送', 'warning', $context );
+			$response = $legacy;
+		} elseif ( self::should_retry_not_owner_as_legacy( $endpoint, $response, $args ) ) {
 			// 不是憑證問題，不標記專屬密碼失效
 			Plugin::logger(
 				'CloudServer 以 not_owner 拒絕本站訂閱的授權碼操作（授權碼作者不是本經銷商），暫以共用帳號重送；關閉 legacy 前請修正這批授權碼的 post_author',
@@ -191,9 +236,70 @@ final class CloudClient {
 				]
 			);
 			$response = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
+			self::note_legacy_outcome( $response );
+		} elseif ( self::is_success( $response ) ) {
+			// 專屬密碼又被接受了：之前的失效標記是暫時性誤判，清掉讓 notice 消失
+			CredentialStore::clear_dealer_invalid();
 		}
 
 		return $response;
+	}
+
+	/**
+	 * legacy 模式請求之後：記錄共用帳號是否還能用；因專屬密碼剛被拒而暫走 legacy、legacy 卻已停用時，當次改回專屬密碼
+	 *
+	 * @param array<string, mixed>|\WP_Error                   $response legacy 回應
+	 * @param string                                           $method   HTTP method
+	 * @param string                                           $endpoint 相對路徑
+	 * @param array<string, mixed>                             $params   參數
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args     參數
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	private function after_legacy( array|\WP_Error $response, string $method, string $endpoint, array $params, array $args ): array|\WP_Error {
+		self::note_legacy_outcome( $response );
+		if ( ! self::is_legacy_unusable( $response ) || null === CredentialStore::get_dealer() ) {
+			return $response;
+		}
+
+		$dealer = $this->request_with_mode( self::MODE_DEALER, $method, $endpoint, $params, $args );
+		if ( self::is_credential_rejected( $dealer ) ) {
+			return $response;
+		}
+		if ( self::is_success( $dealer ) ) {
+			CredentialStore::clear_dealer_invalid();
+		}
+		return $dealer;
+	}
+
+	/**
+	 * 依共用帳號請求的結果更新「共用帳號已停用」標記
+	 *
+	 * @param array<string, mixed>|\WP_Error $response legacy 回應
+	 * @return void
+	 */
+	public static function note_legacy_outcome( array|\WP_Error $response ): void {
+		if ( self::is_legacy_unusable( $response ) ) {
+			CredentialStore::mark_legacy_disabled( self::error_code( $response ) );
+		} elseif ( self::is_success( $response ) ) {
+			CredentialStore::clear_legacy_disabled();
+		}
+	}
+
+	/**
+	 * 共用帳號本身已不能用（見 LEGACY_DISABLED_CODES）
+	 *
+	 * @param array<string, mixed>|\WP_Error $response legacy 回應
+	 * @return bool
+	 */
+	public static function is_legacy_unusable( array|\WP_Error $response ): bool {
+		if ( \is_wp_error( $response ) ) {
+			return false;
+		}
+		$status = (int) \wp_remote_retrieve_response_code( $response );
+		if ( 401 !== $status && 403 !== $status ) {
+			return false;
+		}
+		return in_array( self::error_code( $response ), self::LEGACY_DISABLED_CODES, true );
 	}
 
 	/**
