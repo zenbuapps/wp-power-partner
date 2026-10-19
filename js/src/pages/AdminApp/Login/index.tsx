@@ -1,82 +1,24 @@
-import { Button, Form, Input, notification, Alert } from 'antd'
-import { cloudAxios, axios } from '@/api'
-import {
-	accountInfoAtom,
-	identityAtom,
-	globalLoadingAtom,
-} from '@/pages/AdminApp/Atom/atom'
-import { useSetAtom } from 'jotai'
-import { renderHTML, encrypt, LOCALSTORAGE_ACCOUNT_KEY } from '@/utils'
-import { TAccountInfo, TIdentity } from '@/pages/AdminApp/types'
-import { useMutation } from '@tanstack/react-query'
+import { Button, Form, Input, Alert } from 'antd'
+import { useAtom } from 'jotai'
 
-const index = () => {
+import { isReconnectingAtom } from '@/pages/AdminApp/Atom/atom'
+import { useConnect } from '@/pages/AdminApp/hooks'
+import { TAccountInfo } from '@/pages/AdminApp/types'
+
+/**
+ * 經銷商帳號登入
+ *
+ * 帳密送到本站 PHP 建立連線（useConnect），成功後自動切到 Dashboard。
+ * 「重新登入」時（isReconnectingAtom）原本的連線仍有效，因此提供「取消」回到 Dashboard。
+ */
+const Login = () => {
 	const [form] = Form.useForm()
-	const setIdentity = useSetAtom(identityAtom)
-	const setGlobalLoading = useSetAtom(globalLoadingAtom)
-	const setAccountInfo = useSetAtom(accountInfoAtom)
-	const { mutate: getIdentity, isPending } = useMutation({
-		mutationFn: (values: TAccountInfo) => cloudAxios.post('/identity', values),
-		onMutate: (values: TAccountInfo) => {
-			setGlobalLoading({
-				isLoading: true,
-				label: '正在獲取用戶資料...',
-			})
-		},
-		onError: (err) => {
-			console.log('err', err)
-		},
-		onSettled: () => {
-			setGlobalLoading({
-				isLoading: false,
-				label: '',
-			})
-		},
-	})
-
-	const { mutate: updatePartnerId } = useMutation({
-		mutationFn: (values: {
-			partner_id: string
-			encrypted_account_info: string
-			allowed_template_options: {
-				[key: string]: string
-			}
-		}) => axios.post('/power-partner/partner-id', values),
-		onError: (err) => {
-			console.log('err', err)
-		},
-	})
+	const [isReconnecting, setIsReconnecting] = useAtom(isReconnectingAtom)
+	const { mutate: connect, isPending } = useConnect()
 
 	const onFinish = () => {
 		const values: TAccountInfo = form.getFieldsValue()
-		getIdentity(values, {
-			onSuccess: (res) => {
-				const theIdentity = res?.data as TIdentity
-				setIdentity(theIdentity)
-				if (theIdentity?.status === 200) {
-					const encrypted_account_info = encrypt(values)
-					localStorage.setItem(LOCALSTORAGE_ACCOUNT_KEY, encrypted_account_info)
-
-					// 同一份帳密留一份在記憶體，供需要帶帳密的功能重用（例如明細下載）
-					setAccountInfo(values)
-					if (theIdentity?.data?.user_id) {
-						// 存入 wp-options  SNAKE . '_partner_id'
-
-						updatePartnerId({
-							partner_id: theIdentity?.data?.user_id,
-							encrypted_account_info,
-							allowed_template_options:
-								theIdentity?.data?.allowed_template_options,
-						})
-					}
-				} else {
-					notification.error({
-						message: theIdentity?.message,
-						description: renderHTML(JSON.stringify(theIdentity?.data || '')),
-					})
-				}
-			},
-		})
+		connect(values)
 	}
 
 	return (
@@ -118,9 +60,22 @@ const index = () => {
 						連結帳號
 					</Button>
 				</Form.Item>
+
+				{isReconnecting && (
+					<Form.Item>
+						<Button
+							onClick={() => setIsReconnecting(false)}
+							className="w-full"
+							size="large"
+							disabled={isPending}
+						>
+							取消，維持目前的連線
+						</Button>
+					</Form.Item>
+				)}
 			</Form>
 		</div>
 	)
 }
 
-export default index
+export default Login

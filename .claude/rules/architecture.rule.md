@@ -21,8 +21,8 @@ paths:
 │         │                   │                    │           │   │
 │         ▼                   ▼                    ▼           │   │
 │  ┌──────────────┐    ┌──────────────┐    ┌───────────────┐  │   │
-│  │  Fetch       │    │  ActionSched │    │  Powerhouse   │  │   │
-│  │  FetchPC     │    │  (async)     │    │  CloudApi     │  │   │
+│  │  Fetch       │    │  ActionSched │    │  Domains\Cloud│  │   │
+│  │  FetchPC     │    │  (async)     │    │  CloudClient  │  │   │
 │  └──────┬───────┘    └──────────────┘    └───────┬───────┘  │   │
 └─────────┼────────────────────────────────────────┼──────────┘
           │                                         │
@@ -33,6 +33,8 @@ paths:
 │  + license codes     │              │                        │
 └──────────────────────┘              └───────────────────────┘
 ```
+
+> `Fetch`（WPCD）、`BillingPushClient`、`LinkedLC`、LC 4 檔呼叫 cloud.luke.cafe 的 power-partner-server 時，**全部經 `Domains\Cloud\Services\CloudClient`**（圖中 `Fetch` → cloud.luke.cafe 的箭頭也是）。`FetchPowerCloud` 打 api.wpsite.pro，不經它。瀏覽器則不直連 cloud.luke.cafe，改打本站 `/power-partner/cloud/*`，由 `Cloud\Core\ProxyApi` 經 `CloudClient` 轉送。
 
 ---
 
@@ -51,7 +53,7 @@ Customer buys subscription
                                   │                 └── SiteSync::send_email() → SubscriptionEmailHooks::send_mail()
                                   │
                                   └──── LC\LifeCycle::create_lcs()
-                                             └── CloudApi::remote_post('license-codes', ...)
+                                             └── CloudClient::remote_post('license-codes', ...)
                                              └── send_email_to_subscriber()
 
          │
@@ -76,7 +78,7 @@ Customer buys subscription
                                    │         └── Fetch::enable_site() / FetchPowerCloud::enable_site()
                                    └──── LC\LifeCycle::subscription_success()
                                              └── ExpireHandler::unschedule()
-                                             └── CloudApi: license-codes/recover
+                                             └── CloudClient: license-codes/recover
 
   woocommerce_subscription_status_updated ── SubscriptionEmailHooks::on_status_updated()
          ├── → on-hold:            排程 subscription_failed 催繳信（最少延遲 10 分鐘，先清舊排程）
@@ -120,11 +122,26 @@ Customer buys subscription
 - **`Services\DisableSiteScheduler`** — ActionScheduler 包裝。args 包含 `{subscription_id}`。停用時**逐站**以 `LinkedSites::resolve_host_type($product_host_type, $site_id)` 判斷架構（**純數字 site id 一律 WPCD，覆寫產品 host_type；非純數字 UUID 才參考明確 host_type，空值預設 PowerCloud**），不靠產品欄位覆寫 id 格式（issue #18；#38621：產品被誤設 powercloud 但站是數字 WPCD id → PowerCloud 回 400 "uuid is expected"）。WPCD 與 PowerCloud 路徑皆依回傳值寫入「已停用網站」或「停用網站失敗」訂單備註（issue #13 / #18：API 失敗不再被誤記為成功）。
 
 ### `Domains\LC`（License Codes）
-管理授權碼生命週期，透過 `cloud.luke.cafe` API（Powerhouse CloudApi）。
+管理授權碼生命週期，透過 `cloud.luke.cafe` API，經 `Cloud\Services\CloudClient` 發送（原本用 Powerhouse 的 `Api\Base`；`CloudClient` 的 `remote_get/post/delete` 簽名與它相同，LC 4 檔以 `use ...CloudClient as CloudApi` 別名換入）。
 
 - **`Core\LifeCycle`** — `INITIAL_PAYMENT_COMPLETE` 建立 LCs；`SUBSCRIPTION_FAILED` 排程停用（延遲 4 小時）；`SUBSCRIPTION_SUCCESS` 恢復。
 - **`Core\Api`** — 管理端授權碼 REST API。
 - **`Services\ExpireHandler`** — ActionScheduler 包裝，延遲 LC 停用。
+
+### `Domains\Cloud`（CloudServer 連線，v3.6.0）
+本站與 CloudServer（cloud.luke.cafe 的 power-partner-server）之間的認證、連線與轉送。**最高原則：漸進、向後相容，任何一版更新後都不能 403 或功能中斷**——本版 client 可能早於、也可能晚於 CloudServer 升級，兩種順序都要能用。
+
+- **`Services\CloudClient`** — Singleton，呼叫 CloudServer 的**唯一出口**。`remote_get/post/delete(string $endpoint, array $params, array $args)` 簽名與 Powerhouse `Api\Base` 相同；`request()` 自動選模式（`MODE_DEALER` / `MODE_LEGACY`），dealer 收到 `CREDENTIAL_REJECTED_CODES` 時標記失效並**當次改用 legacy 重送**；`request_with_mode()` 指定模式、不 fallback（`v3/connect` 用 `MODE_NONE` 不帶 Authorization）。所有請求帶 `Fetch::cloud_headers()` 的 telemetry 與 `Origin`（CloudServer 部分端點的授權碼網域比對依賴它）。`last_mode` 供測試與 log 使用。
+- **`Services\CredentialStore`** — Abstract，加密存放兩種憑證（option 名見 CLAUDE.md）：經銷商專屬應用程式密碼（`get/save/delete_dealer`、`mark_dealer_invalid`）與 legacy 登入帳密（`get/save/delete_legacy_account`）。sodium secretbox，金鑰由 `wp_salt('auth')` + `wp_salt('secure_auth')` + context 衍生，host 封進密文；解不開或 host 不符回 `null`（視為未連線，不 fatal）。`decrypt_old_account_info()` 能讀舊版 CryptoJS 密文（EVP_BytesToKey + AES-256-CBC）。
+- **`Services\ConnectionService`** — Abstract。`status()` / `connect()` / `disconnect()` / `exchange()` / `installation_id()` / `migration()`。`exchange()` 打 `POST v3/connect`，結果以 `EXCHANGE_*` 常數表示（`ok` / `unsupported` / `not_eligible` / `bad_credentials` / `rate_limited` / `temporary`）。`connect()` 在 `unsupported` / `not_eligible` / `temporary` 時退回舊 `POST identity`，成功後保存 legacy 帳密。
+- **`Core\ConnectionApi`** — `GET/POST/DELETE /power-partner/connection`，`manage_options`。
+- **`Core\ProxyApi`** — Singleton。`ROUTES` 逐條宣告 `/power-partner/cloud/*`，分 admin（`manage_options`）/ customer（`is_user_logged_in`）兩種 audience。身分參數由 PHP 覆寫、customer 強制 `customer_id`、`change-domain` / `toggle-ssl` 先確認站台歸屬；上游 status 與 JSON body 原樣回傳。`forward_log_detail()` 處理 `logs/{id}/detail` 的 dealer / legacy 帳密差異。完整路由表見 CLAUDE.md「REST API Routes」。
+- **`Shared\RawResponse`** — 繼承 `WP_REST_Response`，`serve()` 掛在 `rest_pre_serve_request`，CSV 這類非 JSON 內容原文輸出（headers 已由 `serve_request` 依 `get_headers()` 送出，會蓋掉預設的 JSON `Content-Type`）。
+- **`Shared\Arr`** — `assoc()` / `from_json()`，把外部 JSON 與 option 內容收斂成字串 key 的關聯陣列（PHPStan 用）。
+- **`Core\Migration`** — Singleton。hook `power_partner/3.6.0/cloud/migrate`（AS 每日 recurring，`init` 時視 `needs_migration()` 排程或移除）。把 legacy 帳密換成專屬密碼；404 / 429 / 5xx 明天再試，401 與 `not_eligible` 標 `failed` 停止。
+- **`Core\Notices`** — Singleton。`admin_notices`，只在 `should_prompt_relogin()`（專屬密碼被標記失效，或遷移因帳密錯誤失敗）時對 `manage_options` 顯示「請重新登入一次」，文案明說目前功能不受影響。
+
+`Bootstrap` 在 `Api\User::instance()` 之後依序啟動 `ConnectionApi` → `ProxyApi` → `Migration` → `Notices`。**不寄任何信**，異常只寫 log 或顯示 notice。
 
 ### `Domains\Settings`
 監聽設定變更並重新排程。
@@ -136,12 +153,14 @@ Customer buys subscription
 ## API 層
 
 ### `Api\Fetch`（WPCD / 舊架構）
-Abstract class。透過 HTTP Basic Auth 與 `cloud.luke.cafe` 通訊。
+Abstract class。透過 `Cloud\Services\CloudClient`（HTTP Basic Auth：經銷商專屬應用程式密碼優先、共用帳號 fallback）與 `cloud.luke.cafe` 通訊。
 
+- `cloud_headers(): array` — `CloudClient` 組 request 的底：`Content-Type`、`X-PP-Client-Version`、`X-PP-Site`（telemetry，不參與驗證）、共用帳號的 `Authorization`（實際送出前由 `CloudClient` 依模式覆寫）。**不可直接拿它去打 `wp_remote_*`**
 - `site_sync(array $props)` — POST `/wp-json/power-partner-server/site-sync`
 - `disable_site(string $site_id, string $reason): bool` — POST `.../v2/disable-site`，HTTP 2xx 才回傳 `true`；`partner_id` 為空時直接回 `false` 不送出（issue #18）
 - `enable_site(string $site_id): bool` — POST `.../v2/enable-site`，HTTP 2xx 才回傳 `true`；`partner_id` 為空時直接回 `false` 不送出（issue #18）
-- `get_allowed_template_options()` — 取得 + 快取模板列表（7 天 transient）
+- `get_allowed_template_options()` — 取得 + 快取模板列表（transient `power_partner_allowed_template_options`；成功無 TTL，失敗寫空陣列 5 分鐘負面快取 `ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL`；尚未連線時不發請求也不寫快取）。前台不呼叫，`Bootstrap` 只在 `is_admin()` 才取
+- `fetch_template_sites_by_user()` — GET `.../template-sites?user_id={partner_id}`；沒有 `partner_id` 回 `null`
 
 ### `Api\FetchPowerCloud`（新架構）
 Abstract class。透過 `X-API-Key` header 與 `api.wpsite.pro` 通訊。
@@ -156,13 +175,13 @@ Abstract class。透過 `X-API-Key` header 與 `api.wpsite.pro` 通訊。
 在 `rest_api_init` 註冊。包含大部分 endpoints。
 
 ### `Api\Connect` — Partner 連線
-- `GET/POST/DELETE /partner-id`
-- `GET /account-info`
+- `GET/POST/DELETE /partner-id`（新版 AdminApp 的登入/登出改走 `Cloud\Core\ConnectionApi` 的 `/connection`；`POST /partner-id` 仍接受舊參數 `encrypted_account_info` 純為舊版相容）
+- `GET /account-info` — 需 `manage_options`（3.5.5 起；原為 public，回傳可被任何人解密的經銷商帳密）
 - 注意: 底部有 `new Connect()` 額外初始化
 
 ### `Api\User` — 客戶資料
 - `GET /customers-by-search`
-- `GET /customers`
+- `GET /customers` — 需登入（3.5.5 起；原為 public）。非管理員只能查自己，`user_ids` 為空（含被過濾到空）時在 `get_users()` 之前回空陣列，不可讓空 `include` 撈出全部使用者
 
 ---
 
@@ -179,13 +198,13 @@ Abstract class。透過 `X-API-Key` header 與 `api.wpsite.pro` 通訊。
 UI 使用 tab widget（新架構 / 舊架構），inline JS/CSS 處理切換邏輯。切換 tab 時 disabled 非活動 tab 的 hidden inputs。
 
 ### `Product\DataTabs\LinkedLC`
-在訂閱商品新增欄位，連結 cloud.luke.cafe 的授權碼商品。
+在訂閱商品新增欄位，連結 cloud.luke.cafe 的授權碼商品。取授權碼商品列表（`GET license-codes/products`）時 `user_id` 送 CloudServer 上的經銷商 id（`power_partner_partner_id`，決定授權碼牌價等級），**不是本站使用者 id**；尚未連線（沒有 partner_id）時維持舊行為送本站使用者 id，避免更新後商品編輯頁的授權碼選單變空。經 `CloudClient`。
 
 ---
 
 ## 環境設定
 
-`Utils\Base::set_api_auth(Bootstrap $bootstrap)` 根據環境設定 API 帳密:
+`Utils\Base::set_api_auth(Bootstrap $bootstrap)` 根據環境設定 API base URL 與帳密。**帳密（`username` / `psw`，共用帳號 powerpartner）寫死在這裡，現在只剩 legacy fallback 用途**（`CloudClient::MODE_LEGACY`），要等 CloudServer 關閉 legacy 後才能移除；`Bootstrap::$t` 仍被賦值但**不再 localize 到前端**。base URL 與 PowerCloud API 仍照下表使用:
 
 | `wp_get_environment_type()` | Base URL | PowerCloud API |
 |---|---|---|

@@ -1,7 +1,7 @@
 # Power Partner — AI Agent 開發指引
 
-**Last Updated:** 2026-09-01
-**Plugin Version:** 3.5.2
+**Last Updated:** 2026-10-19
+**Plugin Version:** 3.5.4（工作樹含尚未發版的 3.5.5 憑證外洩 hotfix 與 3.6.0 `Domains\Cloud`）
 **Namespace:** `J7\PowerPartner`
 
 ---
@@ -47,11 +47,20 @@ power-partner/
 │   ├── Admin/Menu/Setting.php      # 管理頁面 HTML 掛載點
 │   ├── Api/
 │   │   ├── Main.php                # 核心 REST endpoints
-│   │   ├── Connect.php             # partner-id + account-info endpoints
-│   │   ├── Fetch.php               # Abstract: WPCD API（舊架構）
+│   │   ├── Connect.php             # partner-id + account-info（manage_options）endpoints
+│   │   ├── Fetch.php               # Abstract: WPCD API（舊架構），經 CloudClient 發送
 │   │   ├── FetchPowerCloud.php     # Abstract: PowerCloud API（新架構）
 │   │   └── User.php                # 客戶搜尋 endpoints
 │   ├── Domains/
+│   │   ├── Cloud/                                   # CloudServer 連線（v3.6.0）
+│   │   │   ├── Services/CloudClient.php             # 呼叫 CloudServer 的唯一出口（dealer/legacy/none）
+│   │   │   ├── Services/CredentialStore.php         # sodium 加密存放專屬密碼 / legacy 帳密
+│   │   │   ├── Services/ConnectionService.php       # status / connect / disconnect / exchange
+│   │   │   ├── Core/ConnectionApi.php               # GET/POST/DELETE /connection
+│   │   │   ├── Core/ProxyApi.php                    # /cloud/*：瀏覽器 → 本站 → CloudServer
+│   │   │   ├── Core/Migration.php                   # AS 每日自動換專屬密碼
+│   │   │   ├── Core/Notices.php                     # 需重新登入時的 admin notice
+│   │   │   └── Shared/{Arr,RawResponse}.php
 │   │   ├── Email/Core/SubscriptionEmailHooks.php    # 訂閱生命週期 → 排程發信
 │   │   ├── Site/Core/DisableHooks.php               # 訂閱失敗 → 停用/恢復網站
 │   │   ├── LC/Core/LifeCycle.php                    # 授權碼 建立/停用/恢復
@@ -60,13 +69,13 @@ power-partner/
 │   │   ├── SiteSync.php            # INITIAL_PAYMENT_COMPLETE 觸發開站
 │   │   └── DataTabs/LinkedSites.php  # 商品欄位: host_type, template, plan
 │   └── Utils/
-│       ├── Base.php                # 環境 API 設定、常數、mail_to
+│       ├── Base.php                # 環境 API 設定、常數、mail_to；寫死的共用憑證（只剩 legacy fallback 用途）
 │       └── Token.php               # ##TOKEN## 替換
 ├── js/src/
-│   ├── main.tsx                    # 入口: 掛載 App1 (admin) + App2 (frontend)
-│   ├── pages/AdminApp/             # Dashboard tabs + Login
+│   ├── main.tsx                    # 入口: 掛載 App1 (admin) + App2 (frontend)；開機清除 localStorage 舊帳密
+│   ├── pages/AdminApp/             # Dashboard tabs + Login + MigrationAlert
 │   ├── pages/UserApp/              # 客戶網站列表 + 授權碼
-│   └── api/                        # Axios 實例 + CRUD resource helpers
+│   └── api/                        # Axios 實例 + CRUD resource helpers；cloudAxios 打本站 proxy，nonce.tsx 負責 nonce 換新重送
 ├── spec/                           # 規格文件
 ├── tests/e2e/                      # Playwright E2E 測試
 └── release/                        # release-it 設定和腳本
@@ -79,12 +88,28 @@ power-partner/
 | `host_type` 值 | 類別 | API base | 認證 |
 |---|---|---|---|
 | `powercloud` *（預設）* | `Api\FetchPowerCloud` | `https://api.wpsite.pro` | `X-API-Key` header |
-| `wpcd` | `Api\Fetch` | `https://cloud.luke.cafe` | HTTP Basic Auth |
+| `wpcd` | `Api\Fetch` | `https://cloud.luke.cafe` | HTTP Basic Auth，一律經 `Domains\Cloud\Services\CloudClient`：經銷商專屬應用程式密碼（dealer）優先、共用帳號（legacy）fallback，見下節 |
 
 PowerCloud API key 儲存方式:
 - 全域: transient `power_partner_powercloud_api_key`（無 TTL）
 - Per-user 舊版: transient `power_partner_powercloud_api_key_{user_id}`（無 TTL）
 - `FetchPowerCloud::get_powercloud_api_key()` 優先使用全域 key，fallback 到 per-user key
+
+## CloudServer 連線（`Domains\Cloud`，v3.6.0）
+
+「CloudServer」= cloud.luke.cafe 上的 power-partner-server 外掛（`/wp-json/power-partner-server/`）。**不論 `host_type`**，開站（WPCD）、停用/啟用、模板列表、每日計費推送、授權碼全部打它。原本所有站共用一組寫死在 `Utils\Base::set_api_auth` 的 `powerpartner` 帳密，並經 `wp_localize_script` 的 `t` 輸出到每個前台頁面而外洩；現在改成每位經銷商一把專屬應用程式密碼，由本站 PHP 保管，瀏覽器不碰。**最高原則：漸進、向後相容——任何一版更新後都不能 403 或功能中斷**，所以共用帳號保留作 fallback。
+
+| 認證模式 | 條件 | Authorization |
+|---|---|---|
+| `dealer` | `CredentialStore::get_dealer()` 有值，且最近 1 小時（`DEALER_RETRY_AFTER`）沒被 CloudServer 以憑證類錯誤拒絕 | 專屬帳號 + 專屬應用程式密碼（Basic） |
+| `legacy` | 尚未取得專屬密碼、或被標記失效 | `Bootstrap` 上的共用帳號（Basic） |
+| `none` | 僅 `v3/connect` | 不帶 |
+
+- `CloudClient::request()` 每次自動選模式；dealer 收到 `CREDENTIAL_REJECTED_CODES` 的 401/403 → `CredentialStore::mark_dealer_invalid()` + **當次改用 legacy 重送**。要指定模式、不要 fallback 時用 `request_with_mode()`。
+- `ConnectionService`：`status()`（dealer 打 `GET v3/identity`；否則解出 legacy 帳密打 `POST identity`）、`connect()`、`disconnect()`、`exchange()`（打 `POST v3/connect`）。`connect()` 先試 `v3/connect`；CloudServer 尚無此路由（404 `rest_no_route`）、帳號 `not_eligible`、或暫時錯誤 → **退回舊流程** `POST identity`，成功後以 sodium 加密保存帳密並標記 migration `pending`（不符資格標 `failed`）。帳密錯誤（401）/ 429 → 直接失敗，**不動既存憑證**。
+- `Migration`（ActionScheduler 每日）：有 legacy 帳密、沒有專屬密碼 → 打 `v3/connect`。成功即刪 legacy 帳密；404 / 429 / 5xx / 連線錯誤 → 明天再試；401（帳密錯）與 `not_eligible` → 標 `failed` 停止重試（重試會觸發 CloudServer 鎖帳號），由 `Notices` 提示重新登入，期間維持 legacy 運作。
+- 回應格式刻意與舊版 cloud `POST identity` 相同（HTTP 200 包著 body 的 `status` / `message` / `data`），另加 `connection: {mode, migration, message}`，AdminApp 讀 identity 的程式不必改。
+- 憑證存放見 WordPress Options 的 `power_partner_cloud_*`。**不寄任何信**：異常只寫 log（`Plugin::logger`）或顯示 wp-admin notice。
 
 ---
 
@@ -94,7 +119,12 @@ PowerCloud API key 儲存方式:
 |---|---|---|
 | `power_partner_settings` | array | `{power_partner_disable_site_after_n_days: int, emails: Email[]}` |
 | `power_partner_partner_id` | string | cloud.luke.cafe 的 Partner ID |
-| `power_partner_account_info` | string | 加密帳號資訊 |
+| `power_partner_account_info` | string | **舊格式**：v3.5.x 以前前端以 CryptoJS + 公開 passphrase（`Plugin::$kebab`）加密存放的經銷商 cloud.luke.cafe 帳密，任何人都解得開。新版程式不再產生；`CredentialStore::get_legacy_account()` 在新格式不存在時退而解密它（自行實作 EVP_BytesToKey，不依賴 Powerhouse vendor）；換成新格式（`save_legacy_account()`）或登出時刪除。`POST /partner-id` 仍接受 `encrypted_account_info` 並寫入此 option，純為舊版 AdminApp 相容 |
+| `power_partner_cloud_dealer_credentials` | string | 經銷商專屬應用程式密碼（`user_login` / `app_password` / `uuid` / `partner_id`）。sodium secretbox 密文，金鑰由 `wp_salt('auth')` + `wp_salt('secure_auth')` 衍生並**綁定 host**，`autoload=no`。salts 重產解不開、或 host 不符（模板站被 clone）一律視為「未連線」+ log，不 fatal。⛔ 不可 localize、不可進任何 REST 回應 |
+| `power_partner_cloud_legacy_account` | string | 經銷商登入帳密 `{email, password}`，加密方式同上。**只在換不到專屬密碼時存在**（CloudServer 尚無 `v3/connect`、不符資格、遷移尚未完成），供 legacy 模式的 `POST identity`、`logs/{id}/detail` 與自動遷移使用；換到專屬密碼後刪除 |
+| `power_partner_cloud_dealer_invalid` | array | `{reason, at}`：專屬密碼被 CloudServer 以憑證類錯誤拒絕的標記，`autoload=no`。1 小時內 `CloudClient` 改走 legacy、`Notices` 顯示請重新登入；`save_dealer()` / `delete_dealer()` 時清除。**不刪專屬密碼本身**——可能只是 CloudServer 暫時異常 |
+| `power_partner_cloud_migration` | array | `{status: done\|pending\|failed\|none, reason, at}` 自動遷移狀態，`autoload=no`。`reason` 是 `ConnectionService::EXCHANGE_*` 常數 |
+| `power_partner_cloud_installation` | array | `{id: uuid4, host}` 本站安裝識別，`autoload=no`。送給 `v3/connect`，讓 CloudServer 只撤銷「這個站」的那把專屬密碼；host 變更（被 clone）時重新產生，避免複製站撤銷到原站的密碼 |
 | `power_partner_compatibility_scheduled` | string | 已跑過相容設定的版本號。⚠️ constructor 在版本不同時會先 `delete_option()`，所以 `compatibility()` 裡讀到的 `$previous_version` 永遠是 `'0.0.1'`——`version_compare('3.1.0')` 區塊事實上每次升版都會執行 |
 | `power_partner_issue22_backfilled` | string | issue #22 一次性補排的守門（值為當時版本號）。**不可改用 `$previous_version` 判斷**，理由同上。⚠️ **必須等 `as_enqueue_async_action()` 回傳非 0 才寫入**——AS 未初始化時它回 0 且不排任何東西，而 `compatibility()` 也綁在 `upgrader_process_complete`（同步 wp-admin request）上；先寫旗標會讓補排永久跳過（旗標無清除路徑、後台無手動入口）。防重複排程改由 `as_has_scheduled_action()` 負責 |
 | `pp_site_sync_lock_{order_id}` | string | issue #24 開站併發鎖，`autoload=no`。值的格式是 `{unix_timestamp}:{隨機}`——前半供逾時判定，後半是持有者身分，讓釋放能做條件式刪除。正常路徑由 `try/finally` 清除，fatal/OOM 留下的殘鎖由逾時接管機制回收 |
@@ -103,7 +133,7 @@ PowerCloud API key 儲存方式:
 
 | Key | TTL | Description |
 |---|---|---|
-| `power_partner_allowed_template_options` | 7 天 | WPCD 模板列表 `{id: title}` |
+| `power_partner_allowed_template_options` | 成功：無 TTL；失敗：5 分鐘 | WPCD 模板列表 `{id: title}`（由 `POST /partner-id`、登入、「清除快取」維護）。抓取失敗時寫**空陣列**的負面快取（`Fetch::ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL`），見常見陷阱 33 |
 | `power_partner_allowed_template_options_powercloud` | 7 天 | PowerCloud 模板列表 `{id: domain}` |
 | `power_partner_open_site_plan_options_powercloud` | 7 天 | PowerCloud 方案列表 `{id: name-price}` |
 | `power_partner_powercloud_api_key` | 永久 | 全域 PowerCloud API key |
@@ -147,11 +177,38 @@ PowerCloud API key 儲存方式:
 | POST | `/settings` | `manage_options` | 儲存 `power_partner_settings` |
 | POST | `/powercloud-api-key` | `manage_options` | 儲存 PowerCloud API key |
 | GET | `/partner-id` | public | 取得 partner ID |
-| POST | `/partner-id` | `manage_options` | 設定 partner ID + 更新模板快取 |
+| POST | `/partner-id` | `manage_options` | 設定 partner ID + 更新模板快取（新版 AdminApp 改走 `/connection`，不再呼叫） |
 | DELETE | `/partner-id` | `manage_options` | 移除 partner ID + 清除快取 |
-| GET | `/account-info` | public | 取得加密帳號資訊 |
+| GET | `/account-info` | `manage_options` | 取得**舊格式**加密帳號資訊（3.5.5 起不再 public：密文是經銷商真實帳密、passphrase 公開；新版 AdminApp 不呼叫） |
+| GET | `/connection` | `manage_options` | 連線狀態 + 經銷商身分 `{status, message, data, connection: {mode, migration, message}}`；未連線回 HTTP 200 包 `{status: 401, connection: {mode: 'none'}}` |
+| POST | `/connection` | `manage_options` | `{email, password}` 登入：先試 `v3/connect`，不支援/不符資格退回舊 `POST identity`。帳密錯誤也回 HTTP 200，失敗看 body 的 `status`；回應帶 `Cache-Control: no-store` |
+| DELETE | `/connection` | `manage_options` | 登出：盡力呼叫 `DELETE v3/connect` 撤銷專屬密碼，再清除本地專屬密碼、legacy 帳密、partner_id、migration、模板快取 |
+| GET/POST/DELETE | `/cloud/*` | admin 或已登入 | 瀏覽器 → 本站 → CloudServer 的轉送層，逐條宣告，見下表 |
 | GET | `/customers-by-search` | `manage_options` | 搜尋用戶 |
-| GET | `/customers` | public | 以 ID 陣列查詢用戶 |
+| GET | `/customers` | 已登入（`is_user_logged_in`） | 以 ID 陣列查詢用戶。3.5.5 起不再 public；非管理員只能查自己，範圍不含自己時回空陣列（見常見陷阱 32） |
+
+### `/cloud/*` 轉送路由（`ProxyApi::ROUTES`）
+
+路徑 = `/wp-json/power-partner/cloud/<path>` → 轉送到 `{base_url}/wp-json/power-partner-server/<path>`。audience：**admin** = `manage_options`（AdminApp）；**customer** = `is_user_logged_in`（前台 UserApp，管理員也可呼叫）。
+
+| Method | `<path>` | Audience | 由 PHP 覆寫為 partner_id 的身分參數 |
+|---|---|---|---|
+| POST | `identity` | admin | — |
+| GET | `apps` | customer | `user_id` |
+| GET | `logs` | admin | `user_id` |
+| POST | `logs/{log_id}/detail` | admin | —（legacy 模式由 PHP 補經銷商帳密，dealer 模式不帶） |
+| GET | `license-codes` | customer | `author` |
+| POST | `license-codes` | admin | `post_author` |
+| GET | `license-codes/products` | admin | `user_id` |
+| POST | `license-codes/release` | customer | — |
+| POST | `v2/change-customer` | admin | `partner_id` |
+| POST | `v2/toggle-site` | admin | `partner_id` |
+| POST | `change-domain` | customer | —（先確認站台歸屬） |
+| POST | `toggle-ssl` | customer | —（先確認站台歸屬） |
+
+- 上游 status 與 JSON body **原樣回傳**，前端 `res.data` 與舊版直連時相同；CSV 以 `Shared\RawResponse` 在 `rest_pre_serve_request` 原文輸出，只轉送 `Content-Type` 與過濾過的 `Content-Disposition`。
+- 本站沒有 partner_id → 409 `pp_not_connected`；上游連不上 → 502 `pp_upstream_unavailable`；上游回應不是 JSON → `pp_invalid_upstream_response`。
+- 非管理員存取 `apps` / `license-codes` / `license-codes/release` / `change-domain` / `toggle-ssl` 時，`customer_id` 強制為 `get_current_user_id()`；`change-domain` / `toggle-ssl` 另外先向 CloudServer 確認 body 的 `id` 屬於自己，否則 403 `not_owner`（見常見陷阱 31）。
 
 **IP Whitelist** (`/customer-notification`, `/link-site`):
 - 固定: `103.153.176.121`, `199.99.88.1`, `163.61.60.80`
@@ -177,6 +234,7 @@ PowerCloud API key 儲存方式:
 | `pp_site_sync_retry_after_lock` | `subscription_id` | issue #24：搶不到開站鎖時排一次延後重試（`timeout + 60` 秒後）。真正決定要不要重開的是 item 上的冪等旗標。⛔ **去重必須用 `as_has_scheduled_action($hook, $args)`，不可用 `as_schedule_single_action()` 的 `$unique`**——AS 的 unique 判斷（`ActionScheduler_DBStore::build_where_clause_for_insert`）只比對 `hook` + `group_id`，args 完全不進 WHERE；group 留空即 `group_id = 0`，等於「全站只允許一個」，訂閱 A 等重試期間訂閱 B 的重試會被靜默丟棄（回 0 且無人檢查回傳值），B 的客戶付了錢永遠沒有站 |
 | `power_partner_issue22_backfill_batch` | `page` | issue #22：一次性補排的分批處理，每批 50 筆，處理滿一批就排下一頁。handler 必須綁在 `Compatibility::__construct()` 的 early return **之前**，否則第二批之後找不到 callback |
 | `power_partner_compatibility_scheduler` | — | 相容設定的非同步入口 |
+| `power_partner/3.6.0/cloud/migrate` | — | `Cloud\Core\Migration::run()`：每日（`DAY_IN_SECONDS`）recurring，把 legacy 帳密換成經銷商專屬應用程式密碼。`init` 時若 `needs_migration()` 且未排程 → 排 `time() + 300` 首次執行；不需遷移（已有有效專屬密碼 / 沒有 legacy 帳密 / 已標 `failed`）時 `as_unschedule_all_actions()` 自動移除。不寄信，結果寫 `power_partner_cloud_migration` + log |
 | `powerhouse_delay_send_email` | `to`, `subscription_id` | PowerCloud 開站後 240 秒寄帳密；寄送失敗時也用它排 `EMAIL_RETRY_DELAY` 後的重試。**hook 名不屬於本外掛命名空間，改 args 會動到跨 plugin 合約** |
 
 ---
@@ -283,3 +341,29 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 
 24. **`update_linked_site_ids()` 收到的是「完整清單」，四個寫入點一律附加語義** — 傳 `[$new_site_id]` 等於宣告「這個訂閱只有這一個站」。`/customer-notification` 原本就是這樣傳，一張訂單兩個商品各開一站時，第二次回調會擠掉站 1：站 1 從此不會被停用/恢復（錢照扣），而 `pp_site_url` 是「第一個站先寫、之後不覆蓋」，於是 `##URL##` 指向站 1、綁定卻只剩站 2；更糟的是 `pp_linked_site_ids_updated` 會 fire，把這次靜默遺失當成一次正常變更通知出去。四個寫入點（PowerCloud 開站、`/customer-notification`、`/link-site`、後台手動編輯）除了後台手動編輯（本來就是全量覆寫的 UI）之外，一律「先 `get_linked_site_ids()` 再 `in_array` 去重附加」。
+
+25. **⛔ 不可再把任何 CloudServer 憑證 localize 到前端，或放進 REST 回應** — 共用帳號就是經 `Bootstrap` 的 `wp_localize_script`（`t` = base64(帳號:密碼)）輸出到每個前台頁面，連匿名訪客都拿得到；另外公開的 `GET /account-info` 回傳經銷商真實帳密，加密用的是公開 passphrase（`Plugin::$kebab`）的 CryptoJS 密文，任何人都解得開。現在 `Bootstrap` 不再輸出 `t` / `cloudBaseUrl`（`Bootstrap::$t` 屬性與 `Base::set_api_auth` 的賦值仍在，只是沒人輸出），`/connection` 回應只有身分與連線模式。新增任何 localize 欄位或 REST 回應前，先確認沒有夾帶 `CredentialStore` 的內容；`CredentialExposureHotfixTest` 守的就是這件事。
+
+26. **呼叫 CloudServer 一律經 `CloudClient`，不可直接拿 `Fetch::cloud_headers()` 去打 `wp_remote_*`** — 那組 headers 的 `Authorization` 永遠是共用帳號（legacy），繞過 `CloudClient` 等於同時繞過 dealer 模式與「專屬密碼被拒 → 當次改用 legacy 重送」，共用帳號被 CloudServer 撤銷時該呼叫點就是第一個斷的。`Fetch`、`BillingPushClient`、`LinkedLC`、LC 4 檔（`LifeCycle` / `Api` / `Deprecated` / `ExpireHandler`）都已改走它；LC 原本用 Powerhouse 的 `Api\Base`，`CloudClient` 的 `remote_get/post/delete` 簽名刻意與它相同，所以是以 `use ...CloudClient as CloudApi` 別名換入、呼叫端不用改。`cloud_headers()` 是 `CloudClient` 組 request 的底：`Content-Type`、`X-PP-Client-Version` / `X-PP-Site` telemetry（供 CloudServer 統計還有哪些站用舊版、舊憑證，不參與驗證），`Authorization` 則由 `CloudClient` 依模式覆寫。
+
+27. **`CloudClient::CREDENTIAL_REJECTED_CODES` 只能放「憑證本身被拒」的錯誤碼** — 現有 `incorrect_password`、`invalid_username`、`invalid_email`、`application_passwords_disabled(_for_user)`、`rest_forbidden`、`rest_not_logged_in`、`auth_required`，且只在 HTTP 401/403 時才認。加入 `partner_mismatch` / `not_owner` 這類「身分正確但無權操作」的碼，等於 CloudServer 正確擋下越權後，client 換成權限更大的共用帳號重送一次，**繞過 CloudServer 的歸屬檢查**。錯誤碼先看 `data.error_code`（CloudServer 契約），沒有才退回 WP REST 的 `code`。`BillingPushClient::PERMANENT_ERROR_CODES` 方向相反：放 `partner_mismatch`、`legacy_auth_disabled`（重試也不會好，要立即通知）。
+
+28. **`v3/connect` 必須用 `MODE_NONE`（不帶 Authorization）** — 公開端點也不能順手帶共用帳號：共用密碼一旦被 CloudServer 撤銷，WP core 會在 permission callback 之前就把整個帶著已撤銷 `Authorization` 的請求回 401，連公開端點都打不進去，經銷商就再也換不到專屬密碼。
+
+29. **「查身分」類請求不可走自動 fallback** — `v3/identity`、legacy `POST identity`、`logs/{id}/detail` 一律用 `request_with_mode()` 指定模式。`request()` 的 dealer → legacy 重送會查到**共用帳號自己的身分**，不是這位經銷商的。`logs/{id}/detail` 另外要處理帳密：`ProxyApi::forward_log_detail()` 先試 dealer（不帶帳密），憑證被拒才 `mark_dealer_invalid()` 並以 legacy 重送、由 PHP 補上 `CredentialStore::get_legacy_account()` 的 email/password；瀏覽器送來的 `email` / `password` 一律先剝掉。
+
+30. **前端「重新登入」不可先 `DELETE /connection`** — 重新登入只切換 `isReconnectingAtom` 顯示 Login，`POST /connection` 成功時才直接覆寫、失敗不動既存憑證。先 DELETE 的話，使用者在登入畫面放棄或打錯密碼，整站就斷線（開站、停用/恢復、授權碼全部失效）。同理 `useDisconnect` 失敗時不可切回登入畫面——PHP 端連線仍在，重新整理後會自動登入。
+
+31. **Proxy 的身分與歸屬由 PHP 決定，不信任瀏覽器** — `ProxyApi::ROUTES` 第 4 欄的身分參數一律以本站 `power_partner_partner_id` 覆寫；非管理員另外強制 `customer_id`；`change-domain` / `toggle-ssl` 轉送前先 `GET apps?user_id=<partner>&customer_id=<自己>` 確認 `id` 屬於該客戶（CloudServer 舊版沒有歸屬檢查），確認不了（非 200）回 502 而不是放行。新增 proxy 路由要在 `ROUTES` 逐條宣告（不用 catch-all regex），並決定 audience、是否加入 `CUSTOMER_SCOPED_ROUTES` / `CUSTOMER_OWNERSHIP_ROUTES`。`logs/{log_id}/detail` 的 regex 刻意用 `[\w\-]*`（與 CloudServer 相同），非法值要由 CloudServer 回 400，不是在這裡變 404。
+
+32. **`GET /customers`：`get_users(['include' => []])` 會回傳「全部」使用者** — 3.5.5 起此端點需登入，非管理員只能查自己（`user_ids` 不含自己 → 空陣列）。`$user_ids` 為空時必須在呼叫 `get_users()` 之前就回空，不可讓空陣列流進去，否則「過濾到空」會退化成「撈出全站會員的 email」。
+
+33. **模板列表失敗要寫負面快取，且前台不呼叫它** — `Fetch::get_allowed_template_options()` 抓取失敗（`WP_Error` 或回應沒有 `data.list`）時寫空陣列 5 分鐘（`ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL`），否則 CloudServer 撤銷共用帳號、或經銷商尚未重新連線時，每次載入 AdminApp / 商品編輯頁都再打一次（timeout 120 秒）。尚未連線（沒有 `partner_id`）時根本沒發請求，不寫快取。`Bootstrap` 只在 `is_admin()` 才呼叫它——前台每個 page view 都會跑到 localize，快取為空時會變成「每個訪客 × 每一頁」打一次 CloudServer。
+
+34. **`Utils\Base::set_api_auth` 的寫死憑證只剩 legacy fallback 用途** — 要等 CloudServer 關閉 legacy（H1）之後才能移除；屆時 `CloudClient::authorization()` 的 legacy 分支、`Fetch::cloud_headers()` 的 `Authorization`、`Bootstrap::$t` 一併清掉。在那之前不可刪（會讓尚未換到專屬密碼的經銷商斷線），也不可新增依賴它的呼叫點（新程式碼一律走 `CloudClient`）。
+
+35. **Cloud 連線的任何異常都不寄信** — 遷移失敗、專屬密碼被拒、帳密錯誤只寫 `Plugin::logger` 或顯示 wp-admin notice（`Notices`，且文案明說「目前功能不受影響」，避免經銷商誤以為站壞了）。與第 15 條同一原則，不得新增 `wp_mail`；通知經銷商更新由營運方自行處理。
+
+36. **wp-env 測試要帶 `WP_ENV_CORE="WordPress/WordPress#7.1"` 與 `WP_ENV_TESTS_PORT=8898`** — 最新版 WooCommerce 需要 WP >= 7.0，`.wp-env.json` 釘的 6.9 會因外掛啟用失敗而讓 wp-env rollback（看起來和 port 撞號一樣是「容器起完就被 destroy」，先看 `wp-env start` 的 log 尾巴）。power-partner 測試 port 用 8898，預設的 8896 會與 power-partner-server 撞號。**每次 `wp-env run` 都要帶同一組環境變數**；全 suite 一次跑會 OOM，分檔跑。
+
+37. **`DailyBillingPushTest::test_payload_carries_partner_id_and_billing_date` 在每天 UTC 16:00–21:00 必定失敗，是既有問題，與 Cloud 改動無關** — payload 的 `billing_date` 取自「最近一次 21:00 UTC 排程時刻」（刻意設計，見 `DailyBillingCron`），測試卻拿 `get_billing_date()`（現在 + 8 小時）去比；UTC 16:00 之後 UTC+8 已跨日，但最近一個排程時刻仍是前一天，兩者差一天。判斷回歸時先排除這個時段，不要為了讓它變綠去改 `DailyBillingCron`。

@@ -20,12 +20,13 @@ export const apiTimeout = '300000'
 export const is_kiwissec = window?.[APP_DOMAIN]?.env?.is_kiwissec || false
 
 export const myAccountUrl = window?.[APP_DOMAIN]?.env?.myAccountUrl || '/my-account'
-// cloud site API
-export const cloudBaseUrl =
-    window?.[APP_DOMAIN]?.env?.cloudBaseUrl || 'https://cloud.luke.cafe'
-export const t = window?.[APP_DOMAIN]?.env?.t || ''
 
-export const cloudApiUrl = `${cloudBaseUrl}/wp-json/power-partner-server`
+// cloud site API：一律打本站 PHP proxy（由 PHP 加上雲端認證後轉送），
+// 瀏覽器不持有任何雲端憑證；<path> 與雲端 power-partner-server 的路徑完全相同。
+// 去掉 root 結尾的 /，避免 useDownloadDetail 的原生 fetch 組出 //power-partner（axios 會自行處理，fetch 不會）
+export const cloudProxyUrl = `${apiUrl.replace(/\/+$/, '')}/power-partner/cloud`
+
+// 舊版把經銷商帳密以可逆密文存在 localStorage 的 key，現在只用於開機時清除殘留
 export const LOCALSTORAGE_ACCOUNT_KEY = 'power-partner-account'
 
 export const nonce = window?.[APP_DOMAIN]?.env?.nonce || ''

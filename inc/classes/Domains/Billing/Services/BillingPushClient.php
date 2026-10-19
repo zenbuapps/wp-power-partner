@@ -4,15 +4,15 @@ declare(strict_types=1);
 
 namespace J7\PowerPartner\Domains\Billing\Services;
 
-use J7\PowerPartner\Api\Fetch;
 use J7\PowerPartner\Bootstrap;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient;
 use J7\PowerPartner\Plugin;
 
 /**
  * 新架構（PowerCloud）每日計費資料推送 client
  *
  * 對端契約見 power-partner-server/specs/api.yml 的 POST /v2/powercloud-daily-billing。
- * 認證與其他 CloudServer 呼叫共用 Fetch::cloud_headers()，不另造機制。
+ * 認證與其他 CloudServer 呼叫一樣經過 CloudClient（經銷商專屬密碼，沒有時用共用帳號），不另造機制。
  */
 abstract class BillingPushClient {
 
@@ -37,6 +37,10 @@ abstract class BillingPushClient {
 		'invalid_billing_date',
 		'missing_field',
 		'invalid_field',
+		// 每位經銷商專屬密碼上線後（CloudServer 以已驗證的使用者推導身分）新增的代碼：
+		// 本站 partner_id 與憑證的身分不一致、共用帳號已被 CloudServer 關閉 —— 都不是重試能解決的
+		'partner_mismatch',
+		'legacy_auth_disabled',
 	];
 
 	/**
@@ -55,15 +59,12 @@ abstract class BillingPushClient {
 			return self::result( false, 0 );
 		}
 
-		$url  = Bootstrap::instance()->base_url . self::ENDPOINT;
-		$args = [
-			'method'  => 'POST',
-			'body'    => $body,
-			'headers' => Fetch::cloud_headers(),
-			'timeout' => 120,
-		];
-
-		$response = \wp_remote_post( $url, $args );
+		$url      = Bootstrap::instance()->base_url . self::ENDPOINT;
+		$response = CloudClient::instance()->remote_post(
+			ltrim( str_replace( CloudClient::API_PATH, '', self::ENDPOINT ), '/' ),
+			$payload,
+			[ 'timeout' => 120 ]
+		);
 
 		if ( \is_wp_error( $response ) ) {
 			Plugin::logger(

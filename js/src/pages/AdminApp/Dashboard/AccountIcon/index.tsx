@@ -1,10 +1,7 @@
 import { Avatar, Badge, Dropdown, MenuProps, Tooltip } from 'antd'
-import {
-	identityAtom,
-	globalLoadingAtom,
-	defaultIdentity,
-} from '@/pages/AdminApp/Atom/atom'
-import { useAtom } from 'jotai'
+import { identityAtom, globalLoadingAtom } from '@/pages/AdminApp/Atom/atom'
+import { useDisconnect } from '@/pages/AdminApp/hooks'
+import { useAtomValue } from 'jotai'
 import {
 	UserOutlined,
 	PoweroffOutlined,
@@ -13,41 +10,26 @@ import {
 	CrownFilled,
 	WalletOutlined,
 } from '@ant-design/icons'
-import { LOCALSTORAGE_ACCOUNT_KEY } from '@/utils'
 import { LoadingText } from '@/components'
-import { axios } from '@/api'
 import { useQueryClient } from '@tanstack/react-query'
 import { useRef } from 'react'
 
 const DEPOSIT_LINK = 'https://cloud.luke.cafe/product/partner-top-up/'
 
-const index = () => {
+const AccountIcon = () => {
 	const containerRef = useRef<HTMLDivElement>(null)
-	const [identity, setIdentity] = useAtom(identityAtom)
+	const identity = useAtomValue(identityAtom)
 	const powerMoney = identity.data?.power_money_amount || '0.00'
 	const email = identity.data?.email
 	const user_id = identity.data?.user_id || ''
 	const partnerLvTitle = identity.data?.partner_lv?.title || ''
 	const partnerLvKey = identity.data?.partner_lv?.key || '0'
-	const [globalLoading, setGlobalLoading] = useAtom(globalLoadingAtom)
+	const globalLoading = useAtomValue(globalLoadingAtom)
 	const queryClient = useQueryClient()
+	const { mutate: disconnect } = useDisconnect()
 
-	const handleDisconnect = async () => {
-		setGlobalLoading({
-			isLoading: true,
-			label: '正在解除帳號綁定...',
-		})
-		try {
-			await axios.delete('/power-partner/partner-id')
-		} catch (error) {
-			console.log('error', error)
-		}
-		localStorage.removeItem(LOCALSTORAGE_ACCOUNT_KEY)
-		setIdentity(defaultIdentity)
-		setGlobalLoading({
-			isLoading: false,
-			label: '',
-		})
+	const handleDisconnect = () => {
+		disconnect()
 	}
 
 	const handleRefetch = () => {
@@ -181,4 +163,4 @@ const index = () => {
 	)
 }
 
-export default index
+export default AccountIcon

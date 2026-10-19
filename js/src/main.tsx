@@ -2,7 +2,15 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
-import { app1Selector, app2Selector } from '@/utils'
+import { app1Selector, app2Selector, LOCALSTORAGE_ACCOUNT_KEY } from '@/utils'
+
+// 舊版把經銷商帳密以可逆密文（公開 passphrase）存在 localStorage，
+// 新版改由 PHP 保管，開機時清掉殘留；存取 localStorage 可能被瀏覽器封鎖而拋錯
+try {
+	window.localStorage.removeItem(LOCALSTORAGE_ACCOUNT_KEY)
+} catch {
+	// 無法存取 localStorage 時也不會有殘留可清
+}
 
 const App1 = React.lazy(() => import('./App1'))
 const App2 = React.lazy(() => import('./App2'))

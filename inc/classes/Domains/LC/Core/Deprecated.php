@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace J7\PowerPartner\Domains\LC\Core;
 
-use J7\Powerhouse\Api\Base as CloudApi;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient as CloudApi;
 use J7\WpUtils\Classes\General;
 
 /**

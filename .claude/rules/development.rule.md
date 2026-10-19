@@ -76,6 +76,17 @@ vendor/bin/pest      # Pest + wp-pest
 vendor/bin/phpunit   # PHPUnit
 ```
 
+整合測試（`tests/Integration/`）經 wp-env（Docker）跑：
+
+```bash
+WP_ENV_CORE="WordPress/WordPress#7.1" WP_ENV_TESTS_PORT=8898 npx wp-env start
+WP_ENV_CORE="WordPress/WordPress#7.1" WP_ENV_TESTS_PORT=8898 npx wp-env run tests-cli --env-cwd=wp-content/plugins/power-partner -- vendor/bin/phpunit -c phpunit.xml.dist --filter <X> --colors=never --testdox
+```
+- 最新版 WooCommerce 需要 WP >= 7.0，`.wp-env.json` 釘的 6.9 會讓外掛啟用失敗、wp-env rollback；所以要帶 `WP_ENV_CORE="WordPress/WordPress#7.1"`。power-partner 測試 port 用 **8898**（預設 8896 會與 power-partner-server 撞）。**每次 `wp-env run` 都要帶同一組環境變數**
+- 全 suite 一次跑會 OOM，**分檔跑**；`RestApiTest` 與 `SubscriptionEmailHooksTest` 合跑會交叉污染，各自單檔跑才準
+- Cloud 相關：`CloudConnectionTest`（`CredentialStore` / `CloudClient` / `ConnectionService` / `ProxyApi` / `Migration`，用 `pre_http_request` 模擬 CloudServer，含真實 CryptoJS 舊密文 fixture）、`CredentialExposureHotfixTest`（頁面資料不含憑證、`/account-info` 與 `/customers` 權限、模板列表負面快取、`LinkedLC` 送 partner_id）
+- 已知與程式無關的失敗：`DailyBillingPushTest::test_payload_carries_partner_id_and_billing_date` 在每天 UTC 16:00–21:00 必定失敗（測試用現在 +8h 比對、payload 取最近一次 21:00 UTC 排程時刻），見 CLAUDE.md 常見陷阱 37
+
 ### E2E 測試
 ```bash
 cd tests/e2e
@@ -135,14 +146,25 @@ pnpm zip             # 手動建立 ZIP
 | `react-router` v7 | 路由 |
 
 ### 狀態管理
-- **Jotai atoms**: `identityAtom`, `globalLoadingAtom`, `tabAtom`, `powercloudAtom`
-- **TanStack Query**: 所有 API 查詢和 mutations
+- **Jotai atoms**: `identityAtom`, `connectionAtom`, `isReconnectingAtom`, `globalLoadingAtom`, `tabAtom`, `powercloudAtom`
+  - `identityAtom` / `connectionAtom` 由同一份 `GET /power-partner/connection` 回應寫入（`useGetUserIdentity`），不各自寫
+  - `isReconnectingAtom`：已連線時切到 Login 畫面的旗標，**不可為了「重新登入」先呼叫 `DELETE /connection`**（放棄登入會整站斷線）
+- **TanStack Query**: 所有 API 查詢和 mutations。連線狀態的快取 key 是 `CONNECTION_QUERY_KEY`（`['connection']`），`useConnect` / `useDisconnect` 都是改寫這份快取
 
 ### API 層
-- `api/axios.tsx` — WP REST Axios 實例（使用 `wpApiSettings.nonce`）
-- `api/cloudAxios.tsx` — cloud.luke.cafe Axios 實例
+- `api/axios.tsx` — WP REST Axios 實例（每次請求經 `applyCurrentNonce` 帶 `wpApiSettings.nonce`）
+- `api/cloudAxios.tsx` — cloud.luke.cafe 的 Axios 實例，**baseURL 是本站 PHP proxy**（`cloudProxyUrl` = `{wpApiSettings.root}/power-partner/cloud`），呼叫路徑與 CloudServer 相同；雲端認證由 PHP 補上，**瀏覽器不帶任何雲端憑證**。路由與 audience 見 CLAUDE.md `/cloud/*` 表，新增呼叫前先確認 `ProxyApi::ROUTES` 有宣告，沒有的路徑會 404
+- `api/nonce.tsx` — nonce 管理：`applyCurrentNonce`（request interceptor）、`retryWithFreshNonce`（response error）、`refreshNonce()`、`fetchWithNonce()`（原生 `fetch` 用）。nonce 過期（HTTP 403 + `rest_cookie_invalid_nonce`）時打 admin-ajax `action=rest-nonce` 換新、寫回 `wpApiSettings.nonce` 並**只重送一次**（`ppNonceRetried` 防迴圈）；多個請求同時過期共用同一次換新，換新有 30 秒逾時。重送失敗由重送那一輪通知並 reject，呼叫端不可再通知一次
 - `api/powerCloudAxios.tsx` — api.wpsite.pro Axios 實例
 - `api/resources/` — CRUD helpers（create, get, update, delete）
+- **不要**再從 `window.power_partner_data.env` 讀 `t` / `cloudBaseUrl`（已移除）；不要把帳密存進 localStorage（開機時 `main.tsx` 會清掉殘留的 `power-partner-account`）
+
+### AdminApp 連線流程
+- `hooks/useGetUserIdentity` — `GET /power-partner/connection`；HTTP 200 包著 body 的 `status`：`200` 已連線 → Dashboard；`401` + `mode: 'none'` 未連線 → Login（不跳錯誤通知）
+- `hooks/useConnect` — `POST /power-partner/connection {email, password}`；**成敗看 body 的 `status`**，帳密只送到本站 PHP，瀏覽器不加密、不落地
+- `hooks/useDisconnect` — `DELETE /power-partner/connection`；失敗時不切回登入畫面（PHP 端連線仍在）
+- `Dashboard/MigrationAlert` — `connection.mode === 'legacy' && migration === 'failed'` 時顯示「請重新登入一次」，目前功能不受影響
+- 已刪除：`hooks/useAccountInfo`、`accountInfoAtom`、`utils/functions/common.tsx` 的 `encrypt` / `decrypt`（CryptoJS）。顯示 API 失敗訊息用 `getErrorMessage(error, fallback)`（同檔），它會取 WP REST / proxy 原樣轉送的上游錯誤 `message`
 
 ### TypeScript 型別
 - `types/custom/` — 自訂型別
@@ -192,6 +214,16 @@ inc/classes/Domains/
 2. 檢查 CORS headers
 3. IP whitelist routes 檢查 `REMOTE_ADDR`
 
+### 雲端（cloudAxios）呼叫失敗?
+1. `409 pp_not_connected` — 本站沒有 `power_partner_partner_id`，請先在 AdminApp 登入
+2. `404` — 該路徑沒在 `Cloud\Core\ProxyApi::ROUTES` 宣告（proxy 逐條註冊，沒有 catch-all）
+3. `403 rest_cookie_invalid_nonce` — nonce 過期，`api/nonce.tsx` 會換新並重送一次；仍失敗代表已登出或 admin-ajax `rest-nonce` 被擋
+4. `403 not_owner` — customer 操作的站台不屬於自己（`change-domain` / `toggle-ssl`）
+5. `502 pp_upstream_unavailable` — 本站連不上 CloudServer，或 customer 的歸屬確認請求失敗
+6. 上游 401/403 — 看 `Plugin::logger` 是否有「CloudServer 拒絕經銷商專屬密碼，改用共用帳號重送」；`power_partner_cloud_dealer_invalid` 有值代表專屬密碼已被標記失效（1 小時內走 legacy），請經銷商重新登入
+7. 要確認目前走哪種模式：`CloudClient::preferred_mode()`，或 `GET /power-partner/connection` 回應的 `connection.mode`
+8. 解不開憑證（`CredentialStore` log「解密失敗」/「host 不符」）— salts 被重產或站被 clone，視為未連線，重新登入即可
+
 ### PowerCloud 開站失敗?
 1. 確認 `power_partner_powercloud_api_key` transient 存在
 2. 請管理員在**新架構權限** tab 重新認證
@@ -213,7 +245,13 @@ inc/classes/Domains/
 | `inc/classes/Utils/Base.php` | 環境設定、API endpoints |
 | `inc/classes/Api/Main.php` | 核心 REST endpoints |
 | `inc/classes/Api/FetchPowerCloud.php` | PowerCloud API 整合 |
-| `inc/classes/Api/Fetch.php` | WPCD API 整合 |
+| `inc/classes/Api/Fetch.php` | WPCD API 整合、`cloud_headers()` telemetry |
+| `inc/classes/Domains/Cloud/Services/CloudClient.php` | CloudServer 認證模式、`CREDENTIAL_REJECTED_CODES`、fallback 規則 |
+| `inc/classes/Domains/Cloud/Services/CredentialStore.php` | 專屬密碼 / legacy 帳密的加密存放、舊 CryptoJS 密文解密 |
+| `inc/classes/Domains/Cloud/Services/ConnectionService.php` | 登入 / 登出 / 查身分 / `v3/connect` 與退回舊流程 |
+| `inc/classes/Domains/Cloud/Core/ProxyApi.php` | 新增或調整瀏覽器可呼叫的 CloudServer 路徑與 audience |
+| `inc/classes/Domains/Cloud/Core/Migration.php` | 自動遷移（AS 每日） |
+| `js/src/api/nonce.tsx` | nonce 換新重送、`fetchWithNonce` |
 | `inc/classes/Product/DataTabs/LinkedSites.php` | 商品設定欄位 |
 | `inc/classes/Domains/Email/Core/SubscriptionEmailHooks.php` | Email 觸發點 |
 | `inc/classes/Domains/Settings/Core/WatchSettingHooks.php` | 設定變更處理 |

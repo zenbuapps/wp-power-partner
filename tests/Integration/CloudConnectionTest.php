@@ -1,0 +1,701 @@
+<?php
+/**
+ * 經銷商專屬應用程式密碼（Domains\Cloud）整合測試
+ *
+ * 核心約束：向後相容。本版 client 不論早於或晚於 CloudServer 升級上線，都必須照常運作：
+ * - CloudServer 有 v3/connect → 換到專屬密碼（dealer 模式）
+ * - 沒有（404）/ 不符資格 / 專屬密碼被拒 → 共用帳號（legacy 模式），行為與 3.5.x 相同
+ * 並且任何情況下，憑證都不可出現在 REST 回應或頁面資料裡。
+ */
+
+declare( strict_types=1 );
+
+namespace Tests\Integration;
+
+use J7\PowerPartner\Api\Connect;
+use J7\PowerPartner\Bootstrap;
+use J7\PowerPartner\Domains\Cloud\Core\Migration;
+use J7\PowerPartner\Domains\Cloud\Core\ProxyApi;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient;
+use J7\PowerPartner\Domains\Cloud\Services\ConnectionService;
+use J7\PowerPartner\Domains\Cloud\Services\CredentialStore;
+use J7\PowerPartner\Domains\Cloud\Shared\RawResponse;
+
+/**
+ * @group security
+ */
+class CloudConnectionTest extends TestCase {
+
+	/**
+	 * 舊版前端 CryptoJS.AES.encrypt(JSON.stringify({email, password}), 'power-partner') 的真實輸出
+	 * （以專案 node_modules 的 crypto-js 產生），用來證明既有安裝的密文讀得回來
+	 */
+	private const OLD_CIPHER = 'U2FsdGVkX18jurO/JPfxROKprWmYHV/yuiBE3CHhdFXajd/kMtqhaXrGLiRRakYp7W8EhYN9Pq3W9u8mYzIc4MAtkwcPt/Kk4YGtaiO1VfI=';
+
+	private const OLD_EMAIL    = 'dealer@test.com';
+	private const OLD_PASSWORD = 'p@ss w0rd 中文';
+
+	private const DEALER_LOGIN    = 'dealer_login';
+	private const DEALER_PASSWORD = 'AbCd EfGh IjKl MnOp QrSt UvWx';
+
+	/** @var int */
+	private int $admin_id;
+
+	/** @var int */
+	private int $customer_id;
+
+	/** @var array<int, array{url: string, method: string, headers: array<string, string>, body: array<string, mixed>, query: array<string, mixed>}> */
+	private array $requests = [];
+
+	/**
+	 * 依「METHOD 路徑」回應的假 CloudServer；值為 [status, body(array|string), headers]
+	 *
+	 * @var array<string, array{0: int, 1: array<string, mixed>|string, 2?: array<string, string>}|callable>
+	 */
+	private array $routes = [];
+
+	/** @var callable|null */
+	private $http_filter = null;
+
+	protected function configure_dependencies(): void {
+		$this->admin_id    = $this->factory()->user->create( [ 'role' => 'administrator' ] );
+		$this->customer_id = $this->factory()->user->create( [ 'role' => 'customer' ] );
+
+		$this->clean();
+		\update_option( Connect::PARTNER_ID_OPTION_NAME, '777' );
+
+		$this->http_filter = function ( $pre, $args, $url ) {
+			$method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
+			$path   = (string) \wp_parse_url( (string) $url, PHP_URL_PATH );
+			$path   = (string) preg_replace( '#^.*/wp-json/power-partner-server/#', '', $path );
+			$query  = [];
+			parse_str( (string) \wp_parse_url( (string) $url, PHP_URL_QUERY ), $query );
+			$body = json_decode( (string) ( $args['body'] ?? '' ), true );
+
+			$this->requests[] = [
+				'url'     => (string) $url,
+				'method'  => $method,
+				'path'    => $path,
+				'headers' => (array) ( $args['headers'] ?? [] ),
+				'body'    => is_array( $body ) ? $body : [],
+				'query'   => $query,
+			];
+
+			$route = $this->routes[ "{$method} {$path}" ] ?? [ 404, [ 'code' => 'rest_no_route', 'message' => 'No route' ] ];
+			if ( is_callable( $route ) ) {
+				$route = $route( end( $this->requests ) );
+			}
+			[ $status, $resp_body ] = $route;
+			$headers                = $route[2] ?? [ 'content-type' => 'application/json' ];
+			return [
+				'headers'  => new \WpOrg\Requests\Utility\CaseInsensitiveDictionary( $headers ),
+				'body'     => is_string( $resp_body ) ? $resp_body : (string) \wp_json_encode( $resp_body ),
+				'response' => [
+					'code'    => $status,
+					'message' => '',
+				],
+				'cookies'  => [],
+			];
+		};
+		\add_filter( 'pre_http_request', $this->http_filter, 10, 3 );
+
+		rest_get_server();
+	}
+
+	public function tear_down(): void {
+		\remove_filter( 'pre_http_request', $this->http_filter, 10 );
+		\remove_all_filters( 'salt' );
+		\wp_set_current_user( 0 );
+		$this->clean();
+		parent::tear_down();
+	}
+
+	private function clean(): void {
+		foreach ( [
+			CredentialStore::DEALER_OPTION,
+			CredentialStore::LEGACY_ACCOUNT_OPTION,
+			CredentialStore::OLD_ACCOUNT_INFO_OPTION,
+			CredentialStore::DEALER_INVALID_OPTION,
+			ConnectionService::MIGRATION_OPTION,
+			ConnectionService::INSTALLATION_OPTION,
+			Connect::PARTNER_ID_OPTION_NAME,
+		] as $option ) {
+			\delete_option( $option );
+		}
+	}
+
+	/** @return array<string, mixed> */
+	private function identity_data(): array {
+		return [
+			'user_id'                  => '777',
+			'email'                    => self::OLD_EMAIL,
+			'power_money_amount'       => '100.00',
+			'partner_lv'               => [
+				'key'      => '1',
+				'title'    => '經銷商',
+				'discount' => '0.9',
+			],
+			'allowed_template_options' => [ '12' => '模板 A' ],
+		];
+	}
+
+	private function given_dealer(): void {
+		CredentialStore::save_dealer(
+			[
+				'user_login'   => self::DEALER_LOGIN,
+				'app_password' => self::DEALER_PASSWORD,
+				'uuid'         => 'uuid-1',
+				'partner_id'   => '777',
+			]
+		);
+	}
+
+	private function legacy_basic(): string {
+		return 'Basic ' . base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ); // phpcs:ignore
+	}
+
+	private function dealer_basic(): string {
+		return 'Basic ' . base64_encode( self::DEALER_LOGIN . ':' . self::DEALER_PASSWORD ); // phpcs:ignore
+	}
+
+	/**
+	 * @param string $method method
+	 * @param string $path   path
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function sent( string $method, string $path ): array {
+		return array_values( array_filter( $this->requests, static fn( $r ) => $r['method'] === $method && $r['path'] === $path ) );
+	}
+
+	// ========== CredentialStore ==========
+
+	/** @group happy */
+	public function test_專屬密碼加密存放且讀得回來(): void {
+		$this->given_dealer();
+
+		$stored = (string) \get_option( CredentialStore::DEALER_OPTION );
+		$this->assertStringNotContainsString( self::DEALER_PASSWORD, $stored );
+		$this->assertStringNotContainsString( self::DEALER_LOGIN, $stored );
+		$this->assertSame( self::DEALER_PASSWORD, CredentialStore::get_dealer()['app_password'] ?? null );
+
+		global $wpdb;
+		$autoload = $wpdb->get_var( $wpdb->prepare( "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s", CredentialStore::DEALER_OPTION ) );
+		$this->assertContains( $autoload, [ 'no', 'off' ], '憑證不可 autoload' );
+	}
+
+	/** @group security */
+	public function test_站台網域改變時專屬密碼視為未連線(): void {
+		$this->given_dealer();
+		// wp-env 以 WP_HOME 常數固定網址，改 option 無效，改用 filter 模擬「站台被 clone 到另一個網域」
+		\add_filter( 'home_url', static fn() => 'https://cloned-customer-site.test' );
+
+		$this->assertNull( CredentialStore::get_dealer(), '模板站被 clone 成終端客戶站時不可繼承經銷商憑證' );
+
+		\remove_all_filters( 'home_url' );
+		$this->assertNotNull( CredentialStore::get_dealer(), '回到原網域即可讀回（對照組）' );
+	}
+
+	/** @group error */
+	public function test_salts重產後解不開視為未連線而非fatal(): void {
+		$this->given_dealer();
+		\add_filter( 'salt', static fn( $salt ) => $salt . '-rotated' );
+
+		$this->assertNull( CredentialStore::get_dealer() );
+	}
+
+	/** @group happy */
+	public function test_讀得回舊版前端CryptoJS密文(): void {
+		$this->assertSame(
+			[
+				'email'    => self::OLD_EMAIL,
+				'password' => self::OLD_PASSWORD,
+			],
+			CredentialStore::decrypt_old_account_info( self::OLD_CIPHER )
+		);
+	}
+
+	/** @group happy */
+	public function test_舊版密文在換成新格式後刪除(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->assertSame( self::OLD_PASSWORD, CredentialStore::get_legacy_account()['password'] ?? null );
+
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertFalse( \get_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION ), '可被任何人解開的舊密文必須刪除' );
+		$this->assertSame( self::OLD_PASSWORD, CredentialStore::get_legacy_account()['password'] ?? null );
+	}
+
+	// ========== CloudClient ==========
+
+	/** @group happy */
+	public function test_沒有專屬密碼時用共用帳號(): void {
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200 ] ];
+
+		CloudClient::instance()->remote_get( 'apps', [ 'user_id' => '777' ] );
+
+		$this->assertSame( $this->legacy_basic(), $this->sent( 'GET', 'apps' )[0]['headers']['Authorization'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_有專屬密碼時用專屬密碼(): void {
+		$this->given_dealer();
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200 ] ];
+
+		CloudClient::instance()->remote_get( 'apps' );
+
+		$this->assertSame( $this->dealer_basic(), $this->sent( 'GET', 'apps' )[0]['headers']['Authorization'] ?? null );
+	}
+
+	/**
+	 * 向後相容的保險：專屬密碼被拒時當次改用共用帳號重送，功能不中斷
+	 *
+	 * @group error
+	 */
+	public function test_專屬密碼被拒時改用共用帳號重送並標記失效(): void {
+		$this->given_dealer();
+		$this->routes['POST v2/disable-site'] = function ( $request ) {
+			return $request['headers']['Authorization'] === $this->dealer_basic()
+				? [ 401, [ 'code' => 'incorrect_password', 'message' => 'x', 'data' => [ 'status' => 401 ] ] ]
+				: [ 200, [ 'status' => 200 ] ];
+		};
+
+		$response = CloudClient::instance()->remote_post( 'v2/disable-site', [ 'site_id' => '1' ] );
+
+		$this->assertSame( 200, \wp_remote_retrieve_response_code( $response ) );
+		$this->assertCount( 2, $this->sent( 'POST', 'v2/disable-site' ) );
+		$this->assertTrue( CredentialStore::is_dealer_invalid() );
+		$this->assertSame( CloudClient::MODE_LEGACY, CloudClient::preferred_mode(), '剛被拒的一小時內直接用共用帳號' );
+	}
+
+	/**
+	 * 越權（身分正確但無權操作）不可 fallback —— 換成共用帳號重送等於繞過 CloudServer 的歸屬檢查
+	 *
+	 * @group security
+	 */
+	public function test_歸屬錯誤不會改用共用帳號重送(): void {
+		$this->given_dealer();
+		$this->routes['POST change-domain'] = [ 403, [ 'code' => 'not_owner', 'message' => 'x', 'data' => [ 'status' => 403, 'error_code' => 'not_owner' ] ] ];
+
+		$response = CloudClient::instance()->remote_post( 'change-domain', [ 'id' => 5 ] );
+
+		$this->assertSame( 403, \wp_remote_retrieve_response_code( $response ) );
+		$this->assertCount( 1, $this->sent( 'POST', 'change-domain' ) );
+		$this->assertFalse( CredentialStore::is_dealer_invalid() );
+	}
+
+	/** @group happy */
+	public function test_請求帶telemetry與Origin(): void {
+		$this->routes['GET apps'] = [ 200, [] ];
+
+		CloudClient::instance()->remote_get( 'apps' );
+
+		$headers = $this->sent( 'GET', 'apps' )[0]['headers'];
+		$this->assertArrayHasKey( 'X-PP-Client-Version', $headers );
+		$this->assertSame( (string) \wp_parse_url( \site_url(), PHP_URL_HOST ), $headers['Origin'] ?? null );
+	}
+
+	// ========== ConnectionService::connect ==========
+
+	/** @group happy */
+	public function test_CloudServer支援v3時換到專屬密碼(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = [
+			201,
+			[
+				'user_login'   => self::DEALER_LOGIN,
+				'app_password' => self::DEALER_PASSWORD,
+				'uuid'         => 'uuid-9',
+				'identity'     => $this->identity_data(),
+			],
+		];
+
+		$result = ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( CloudClient::MODE_DEALER, $result['connection']['mode'] );
+		$this->assertSame( '777', $result['data']['user_id'] );
+		$this->assertStringNotContainsString( self::DEALER_PASSWORD, (string) \wp_json_encode( $result ), '專屬密碼不可回傳給瀏覽器' );
+
+		$this->assertSame( self::DEALER_PASSWORD, CredentialStore::get_dealer()['app_password'] ?? null );
+		$this->assertNull( CredentialStore::get_legacy_account(), '換到專屬密碼後不再保留登入密碼' );
+		$this->assertSame( '777', \get_option( Connect::PARTNER_ID_OPTION_NAME ) );
+
+		$connect = $this->sent( 'POST', 'v3/connect' )[0];
+		$this->assertArrayNotHasKey( 'Authorization', $connect['headers'], 'v3/connect 不可帶共用帳號（被撤銷後會讓整個請求 401）' );
+		$this->assertSame( self::OLD_EMAIL, $connect['body']['login'] ?? null );
+		$this->assertNotSame( '', (string) ( $connect['body']['installation_id'] ?? '' ) );
+	}
+
+	/**
+	 * CloudServer 還沒升級（沒有 v3/connect）時，登入行為必須與 3.5.x 完全相同
+	 *
+	 * @group happy
+	 */
+	public function test_CloudServer尚未支援v3時照舊以identity登入(): void {
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$result = ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( CloudClient::MODE_LEGACY, $result['connection']['mode'] );
+		$this->assertSame( ConnectionService::MIGRATION_PENDING, $result['connection']['migration'] );
+		$this->assertSame( $this->legacy_basic(), $this->sent( 'POST', 'identity' )[0]['headers']['Authorization'] ?? null );
+		$this->assertSame( self::OLD_PASSWORD, CredentialStore::get_legacy_account()['password'] ?? null );
+		$this->assertSame( '777', \get_option( Connect::PARTNER_ID_OPTION_NAME ) );
+	}
+
+	/** @group error */
+	public function test_帳密錯誤時不退回identity且不存任何東西(): void {
+		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => '帳號或密碼錯誤', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
+
+		$result = ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+
+		$this->assertSame( 401, $result['status'] );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ) );
+		$this->assertNull( CredentialStore::get_dealer() );
+		$this->assertNull( CredentialStore::get_legacy_account() );
+	}
+
+	/**
+	 * 不符資格的帳號在 3.5.x 能登入，更新後也必須能（以共用帳號），且不提示「請重新登入」
+	 *
+	 * @group happy
+	 */
+	public function test_不符資格時照舊以identity登入且不提示重新登入(): void {
+		$this->routes['POST v3/connect'] = [ 403, [ 'code' => 'not_eligible', 'message' => 'x', 'data' => [ 'status' => 403, 'error_code' => 'not_eligible' ] ] ];
+		$this->routes['POST identity']   = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$result = ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( CloudClient::MODE_LEGACY, $result['connection']['mode'] );
+		$this->assertNotSame( ConnectionService::MIGRATION_FAILED, $result['connection']['migration'] );
+	}
+
+	// ========== 與 CloudServer S1 的真實回應格式對齊（以下 JSON 由 server 整合測試實際擷取）==========
+
+	/** @group contract */
+	public function test_契約_v3connect成功回應包在data裡也能解析(): void {
+		$this->routes['POST v3/connect'] = [
+			200,
+			'{"status":200,"message":"connected","data":{"user_login":"dealer_a","app_password":"P0yIKDcaL6cWjyAhGz14A53N","uuid":"20a1b06c-2469-4ea9-877b-998e429065af","identity":{"user_id":"125","email":"dealer_a@example.com","power_money_amount":"1,000.00","partner_lv":{"key":"1","title":"初階經銷商","discount":1},"allowed_template_options":[]}}}',
+		];
+
+		$result = ConnectionService::connect( 'dealer_a@example.com', 'pw' );
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( CloudClient::MODE_DEALER, $result['connection']['mode'] );
+		$this->assertSame( '125', $result['data']['user_id'] );
+		$this->assertSame( 'P0yIKDcaL6cWjyAhGz14A53N', CredentialStore::get_dealer()['app_password'] ?? null );
+		$this->assertSame( '20a1b06c-2469-4ea9-877b-998e429065af', CredentialStore::get_dealer()['uuid'] ?? null );
+		$this->assertSame( '125', \get_option( Connect::PARTNER_ID_OPTION_NAME ) );
+	}
+
+	/** @group contract */
+	public function test_契約_v3connect帳密錯誤與不具資格的真實回應(): void {
+		$this->routes['POST v3/connect'] = [ 401, '{"code":"auth_required","message":"email or password invalid","data":{"status":401,"error_code":"auth_required"}}' ];
+		$this->assertSame( ConnectionService::EXCHANGE_BAD_PASSWORD, ConnectionService::exchange( 'a', 'b' )['result'] );
+
+		$this->routes['POST v3/connect'] = [ 403, '{"code":"not_eligible","message":"此帳號不具經銷商資格","data":{"status":403,"error_code":"not_eligible"}}' ];
+		$this->assertSame( ConnectionService::EXCHANGE_NOT_ELIGIBLE, ConnectionService::exchange( 'a', 'b' )['result'] );
+
+		$this->routes['POST v3/connect'] = [ 429, '{"code":"rate_limited","message":"too many","data":{"status":429,"error_code":"rate_limited"}}' ];
+		$this->assertSame( ConnectionService::EXCHANGE_RATE_LIMITED, ConnectionService::exchange( 'a', 'b' )['result'] );
+
+		$this->routes['POST v3/connect'] = [ 500, '{"code":"connect_failed","message":"x","data":{"status":500}}' ];
+		$this->assertSame( ConnectionService::EXCHANGE_TEMPORARY, ConnectionService::exchange( 'a', 'b' )['result'] );
+	}
+
+	/** @group contract */
+	public function test_契約_v3identity真實回應(): void {
+		$this->given_dealer();
+		$this->routes['GET v3/identity'] = [
+			200,
+			'{"status":200,"message":"user authenticated","data":{"user_id":"2","email":"dealer_a@example.com","power_money_amount":"1,000.00","partner_lv":{"key":"1","title":"初階經銷商","discount":1},"allowed_template_options":[]}}',
+		];
+
+		$result = ConnectionService::status();
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( '2', $result['data']['user_id'] );
+		$this->assertSame( CloudClient::MODE_DEALER, $result['connection']['mode'] );
+	}
+
+	/**
+	 * 專屬密碼被撤銷（core 回 incorrect_password）：標記失效；背景功能改走共用帳號不中斷
+	 *
+	 * @group contract
+	 */
+	public function test_契約_專屬密碼被撤銷時標記失效且背景請求改走共用帳號(): void {
+		$this->given_dealer();
+		$revoked = [ 401, '{"code":"incorrect_password","message":"The provided password is an invalid application password.","data":{"status":401}}' ];
+		$this->routes['GET v3/identity']      = $revoked;
+		$this->routes['POST v2/disable-site'] = function ( $request ) use ( $revoked ) {
+			return $request['headers']['Authorization'] === $this->dealer_basic() ? $revoked : [ 200, [ 'status' => 200 ] ];
+		};
+
+		$status = ConnectionService::status();
+		$this->assertTrue( CredentialStore::is_dealer_invalid() );
+		$this->assertSame( CloudClient::MODE_NONE, $status['connection']['mode'], '沒有 legacy 帳密可查身分 → AdminApp 顯示登入畫面' );
+
+		$this->assertTrue( \J7\PowerPartner\Api\Fetch::disable_site( '101' ), '停用網站等背景功能不可中斷' );
+		$this->assertSame( $this->legacy_basic(), end( $this->requests )['headers']['Authorization'] ?? null );
+	}
+
+	// ========== ConnectionService::status ==========
+
+	/**
+	 * 3.5.x 的既有安裝只有舊密文：更新後打開 AdminApp 必須直接登入，不能跳回登入畫面
+	 *
+	 * @group happy
+	 */
+	public function test_既有安裝更新後以舊密文照常取得身分(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$result = ConnectionService::status();
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( CloudClient::MODE_LEGACY, $result['connection']['mode'] );
+		$this->assertSame( self::OLD_EMAIL, $this->sent( 'POST', 'identity' )[0]['body']['email'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_dealer模式以v3identity取得身分(): void {
+		$this->given_dealer();
+		$this->routes['GET v3/identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		$result = ConnectionService::status();
+
+		$this->assertSame( CloudClient::MODE_DEALER, $result['connection']['mode'] );
+		$this->assertSame( $this->dealer_basic(), $this->sent( 'GET', 'v3/identity' )[0]['headers']['Authorization'] ?? null );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ) );
+	}
+
+	/** @group happy */
+	public function test_完全沒有連線時回401_none(): void {
+		$result = ConnectionService::status();
+
+		$this->assertSame( 401, $result['status'] );
+		$this->assertSame( CloudClient::MODE_NONE, $result['connection']['mode'] );
+		$this->assertSame( [], $this->requests );
+	}
+
+	/** @group happy */
+	public function test_登出清除所有本地憑證並撤銷雲端密碼(): void {
+		$this->given_dealer();
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['DELETE v3/connect'] = [ 200, [ 'status' => 200 ] ];
+
+		ConnectionService::disconnect();
+
+		$this->assertCount( 1, $this->sent( 'DELETE', 'v3/connect' ) );
+		$this->assertNull( CredentialStore::get_dealer() );
+		$this->assertNull( CredentialStore::get_legacy_account() );
+		$this->assertFalse( \get_option( Connect::PARTNER_ID_OPTION_NAME ) );
+	}
+
+	// ========== REST：/power-partner/connection ==========
+
+	/** @group security */
+	public function test_connection端點需要管理員(): void {
+		$this->assertSame( 401, rest_do_request( new \WP_REST_Request( 'GET', '/power-partner/connection' ) )->get_status() );
+
+		\wp_set_current_user( $this->customer_id );
+		$this->assertSame( 403, rest_do_request( new \WP_REST_Request( 'GET', '/power-partner/connection' ) )->get_status() );
+	}
+
+	// ========== Proxy ==========
+
+	/**
+	 * @param string               $method method
+	 * @param string               $route  本地路由（不含 namespace）
+	 * @param array<string, mixed> $params 參數
+	 * @return \WP_REST_Response
+	 */
+	private function proxy( string $method, string $route, array $params = [] ): \WP_REST_Response {
+		$request = new \WP_REST_Request( $method, "/power-partner/cloud/{$route}" );
+		if ( 'GET' === $method ) {
+			$request->set_query_params( $params );
+		} else {
+			$request->set_header( 'Content-Type', 'application/json' );
+			$request->set_body( (string) \wp_json_encode( $params ) );
+		}
+		return rest_do_request( $request );
+	}
+
+	/** @group security */
+	public function test_proxy未登入一律拒絕(): void {
+		$this->assertSame( 401, $this->proxy( 'GET', 'apps' )->get_status() );
+		$this->assertSame( [], $this->requests );
+	}
+
+	/** @group security */
+	public function test_proxy一般會員不能使用管理員路由(): void {
+		\wp_set_current_user( $this->customer_id );
+
+		$this->assertSame( 403, $this->proxy( 'GET', 'logs', [ 'user_id' => '777' ] )->get_status() );
+		$this->assertSame( 403, $this->proxy( 'POST', 'v2/toggle-site', [ 'site_id' => 1 ] )->get_status() );
+		$this->assertSame( [], $this->requests );
+	}
+
+	/** @group security */
+	public function test_proxy以本站partner_id覆寫瀏覽器送來的身分參數(): void {
+		\wp_set_current_user( $this->admin_id );
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200, 'data' => [ 'list' => [] ] ] ];
+
+		$response = $this->proxy( 'GET', 'apps', [ 'user_id' => '999', 'offset' => '10' ] );
+
+		$this->assertSame( 200, $response->get_status() );
+		$sent = $this->sent( 'GET', 'apps' )[0];
+		$this->assertSame( '777', $sent['query']['user_id'] ?? null );
+		$this->assertSame( '10', $sent['query']['offset'] ?? null, '非身分參數原樣轉送' );
+		$this->assertSame( $this->legacy_basic(), $sent['headers']['Authorization'] ?? null );
+	}
+
+	/** @group security */
+	public function test_proxy一般會員只能查自己的站(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200, 'data' => [ 'list' => [] ] ] ];
+
+		$this->proxy( 'GET', 'apps', [ 'user_id' => '777', 'customer_id' => '1' ] );
+
+		$this->assertSame( (string) $this->customer_id, $this->sent( 'GET', 'apps' )[0]['query']['customer_id'] ?? null );
+	}
+
+	/** @group security */
+	public function test_proxy一般會員不能改別人網站的網域(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->routes['GET apps'] = [ 200, [ 'status' => 200, 'data' => [ 'list' => [ [ 'ID' => 55 ] ] ] ] ];
+
+		$response = $this->proxy( 'POST', 'change-domain', [ 'id' => 66, 'new_domain' => 'evil.test' ] );
+
+		$this->assertSame( 403, $response->get_status() );
+		$this->assertSame( [], $this->sent( 'POST', 'change-domain' ), '不屬於自己的站不可轉送' );
+	}
+
+	/** @group happy */
+	public function test_proxy一般會員可以改自己網站的網域(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->routes['GET apps']           = [ 200, [ 'status' => 200, 'data' => [ 'list' => [ [ 'ID' => 55 ] ] ] ] ];
+		$this->routes['POST change-domain'] = [ 200, [ 'status' => 200, 'message' => 'ok' ] ];
+
+		$response = $this->proxy( 'POST', 'change-domain', [ 'id' => 55, 'new_domain' => 'mine.test' ] );
+
+		$this->assertSame( 200, $response->get_status() );
+		$sent = $this->sent( 'POST', 'change-domain' )[0];
+		$this->assertSame( 55, $sent['body']['id'] ?? null );
+		$this->assertSame( (string) $this->customer_id, $sent['body']['customer_id'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_proxy原樣轉送上游錯誤狀態與訊息(): void {
+		\wp_set_current_user( $this->admin_id );
+		$this->routes['POST v2/toggle-site'] = [ 403, [ 'status' => 403, 'message' => 'You are not the owner of this site #1' ] ];
+
+		$response = $this->proxy( 'POST', 'v2/toggle-site', [ 'site_id' => 1 ] );
+
+		$this->assertSame( 403, $response->get_status() );
+		$this->assertSame( 'You are not the owner of this site #1', $response->get_data()['message'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_proxy明細在legacy模式由PHP補上經銷商帳密(): void {
+		\wp_set_current_user( $this->admin_id );
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST logs/abc-1/detail'] = [ 200, [ 'status' => 200, 'data' => [] ] ];
+
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json', 'email' => 'browser@x', 'password' => 'browser' ] );
+
+		$body = $this->sent( 'POST', 'logs/abc-1/detail' )[0]['body'];
+		$this->assertSame( self::OLD_EMAIL, $body['email'] ?? null, '不採用瀏覽器送來的帳密' );
+		$this->assertSame( 'json', $body['format'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_proxy明細在dealer模式不帶帳密(): void {
+		\wp_set_current_user( $this->admin_id );
+		$this->given_dealer();
+		$this->routes['POST logs/abc-1/detail'] = [ 200, [ 'status' => 200, 'data' => [] ] ];
+
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+
+		$sent = $this->sent( 'POST', 'logs/abc-1/detail' )[0];
+		$this->assertArrayNotHasKey( 'password', $sent['body'] );
+		$this->assertSame( $this->dealer_basic(), $sent['headers']['Authorization'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_proxy以原文輸出CSV(): void {
+		$response = ProxyApi::to_rest_response(
+			[
+				'headers'  => new \WpOrg\Requests\Utility\CaseInsensitiveDictionary(
+					[
+						'content-type'        => 'text/csv; charset=utf-8',
+						'content-disposition' => 'attachment; filename="log-abc.csv"; x=";rm -rf"',
+					]
+				),
+				'body'     => "a,b\n1,2\n",
+				'response' => [ 'code' => 200 ],
+			]
+		);
+
+		$this->assertInstanceOf( RawResponse::class, $response );
+		$this->assertSame( 'attachment; filename="log-abc.csv"', $response->get_headers()['Content-Disposition'] ?? null );
+
+		ob_start();
+		$served = RawResponse::serve( false, $response );
+		$output = (string) ob_get_clean();
+		$this->assertTrue( $served );
+		$this->assertSame( "a,b\n1,2\n", $output );
+	}
+
+	// ========== Migration ==========
+
+	/** @group happy */
+	public function test_自動遷移成功後改用專屬密碼並刪除登入密碼(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = [
+			200,
+			[
+				'user_login'   => self::DEALER_LOGIN,
+				'app_password' => self::DEALER_PASSWORD,
+				'identity'     => $this->identity_data(),
+			],
+		];
+
+		Migration::run();
+
+		$this->assertNotNull( CredentialStore::get_dealer() );
+		$this->assertNull( CredentialStore::get_legacy_account() );
+		$this->assertFalse( Migration::needs_migration() );
+	}
+
+	/** @group happy */
+	public function test_CloudServer尚未支援時遷移保持pending明天再試(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+
+		Migration::run();
+
+		$this->assertSame( ConnectionService::MIGRATION_PENDING, ConnectionService::migration()['status'] );
+		$this->assertTrue( Migration::needs_migration() );
+		$this->assertNotNull( CredentialStore::get_legacy_account(), '尚未換到前登入密碼必須保留' );
+	}
+
+	/**
+	 * 帳密錯誤時重試會觸發 CloudServer 的鎖帳號 —— 停止重試，改由 notice 請經銷商重新登入
+	 *
+	 * @group error
+	 */
+	public function test_遷移帳密錯誤時停止重試(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => 'x', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
+
+		Migration::run();
+		Migration::run();
+
+		$this->assertCount( 1, $this->sent( 'POST', 'v3/connect' ) );
+		$this->assertFalse( Migration::needs_migration() );
+		$this->assertTrue( \J7\PowerPartner\Domains\Cloud\Core\Notices::should_prompt_relogin() );
+	}
+}

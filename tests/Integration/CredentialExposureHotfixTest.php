@@ -246,22 +246,37 @@ class CredentialExposureHotfixTest extends TestCase {
 		Bootstrap::instance()->frontend_enqueue_script();
 
 		$env = $this->localized_env();
-		$this->assertSame( '', $env['t'] ?? null );
+		$this->assertArrayNotHasKey( 't', $env );
+		$this->assertArrayNotHasKey( 'cloudBaseUrl', $env );
 		$this->assertStringNotContainsString( Bootstrap::instance()->t, (string) \wp_scripts()->get_data( Plugin::$kebab, 'data' ) );
 	}
 
 	/**
-	 * 過渡期內 UserApp 仍以 t 呼叫 cloudAxios，登入會員必須拿得到，否則前台網站列表會壞
+	 * 3.6.0 起前端一律走本站 proxy（/power-partner/cloud/*），登入會員與管理員也拿不到共用憑證
 	 *
-	 * @group happy
+	 * @group security
 	 */
-	public function test_前台登入會員的頁面資料仍含共用憑證(): void {
+	public function test_前台登入會員的頁面資料也不含共用憑證(): void {
 		$this->reset_scripts();
 		\wp_set_current_user( $this->member_a_id );
 
 		Bootstrap::instance()->frontend_enqueue_script();
 
-		$this->assertSame( Bootstrap::instance()->t, $this->localized_env()['t'] ?? null );
+		$this->assertArrayNotHasKey( 't', $this->localized_env() );
+		$this->assertStringNotContainsString( Bootstrap::instance()->t, (string) \wp_scripts()->get_data( Plugin::$kebab, 'data' ) );
+	}
+
+	/** @group security */
+	public function test_後台管理員的頁面資料也不含共用憑證(): void {
+		$this->reset_scripts();
+		\set_current_screen( 'dashboard' );
+		\wp_set_current_user( $this->admin_id );
+		$this->mock_http( $this->http_response( 200, '{"data":{"list":[]}}' ) );
+
+		Bootstrap::instance()->enqueue_script();
+
+		$this->assertArrayNotHasKey( 't', $this->localized_env() );
+		$this->assertStringNotContainsString( Bootstrap::instance()->t, (string) \wp_scripts()->get_data( Plugin::$kebab, 'data' ) );
 	}
 
 	/** @group security */

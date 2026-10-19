@@ -5,14 +5,19 @@ import {
 	useMigratePowercloudApiKey,
 } from '@/pages/AdminApp/hooks'
 import { Spin } from 'antd'
-import { globalLoadingAtom, identityAtom } from './Atom/atom'
+import {
+	globalLoadingAtom,
+	identityAtom,
+	isReconnectingAtom,
+} from './Atom/atom'
 import { useAtomValue } from 'jotai'
 
 function AdminApp() {
 	useMigratePowercloudApiKey()
-	const mutation = useGetUserIdentity()
+	const { isPending } = useGetUserIdentity()
 	const globalLoading = useAtomValue(globalLoadingAtom)
 	const identity = useAtomValue(identityAtom)
+	const isReconnecting = useAtomValue(isReconnectingAtom)
 	const identityData = identity?.data
 	const status = identity?.status
 
@@ -21,10 +26,14 @@ function AdminApp() {
 			<Spin
 				size="large"
 				wrapperClassName="w-full"
-				spinning={globalLoading?.isLoading || mutation?.isPending}
+				spinning={globalLoading?.isLoading || isPending}
 				tip={globalLoading?.isLoading ? globalLoading?.label : 'Loading...'}
 			>
-				{status === 200 && identityData ? <Dashboard /> : <Login />}
+				{status === 200 && identityData && !isReconnecting ? (
+					<Dashboard />
+				) : (
+					<Login />
+				)}
 			</Spin>
 		</div>
 	)

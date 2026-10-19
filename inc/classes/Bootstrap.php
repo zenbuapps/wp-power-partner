@@ -36,6 +36,11 @@ final class Bootstrap {
 		Api\Main::instance();
 		Api\Connect::instance();
 		Api\User::instance();
+		// CloudServer 連線：經銷商專屬密碼、瀏覽器 proxy、背景自動遷移
+		Domains\Cloud\Core\ConnectionApi::instance();
+		Domains\Cloud\Core\ProxyApi::instance();
+		Domains\Cloud\Core\Migration::instance();
+		Domains\Cloud\Core\Notices::instance();
 		Order::instance();
 		Product\DataTabs\LinkedSites::instance();
 		Product\DataTabs\LinkedLC::instance();
@@ -130,10 +135,8 @@ final class Bootstrap {
 					'partner_id'                => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
 					'disable_site_after_n_days' => (int) ( $power_partner_settings['power_partner_disable_site_after_n_days'] ?? '7' ),
 					'allow_delete_site'         => !empty( $power_partner_settings['power_partner_allow_delete_site'] ),
-					// ⚠️ 共用帳號憑證，過渡期內 cloudAxios 仍需要；至少不再送給未登入的訪客
-					// （UserApp 未登入時什麼都不呼叫）。新版改走本地 proxy 後整個欄位移除
-					't'                         => \is_user_logged_in() ? $this->t : '',
-					'cloudBaseUrl'              => $this->base_url,
+					// ⛔ 不可再輸出任何 CloudServer 憑證（原本的 `t` 就是這樣外洩的）：
+					// 前端一律打本站 /power-partner/cloud/*，由 Domains\Cloud\Core\ProxyApi 加上認證後轉送
 					'POWERCLOUD_API'            => $this->powercloud_api,
 					'powercloud_api_key'        => $powercloud_api_key,
 					'is_kiwissec'               => strpos( \site_url(), 'kiwissec.io' ) !== false,
