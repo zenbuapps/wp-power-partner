@@ -116,8 +116,10 @@ class CloudConnectionTest extends TestCase {
 			CredentialStore::LEGACY_ACCOUNT_OPTION,
 			CredentialStore::OLD_ACCOUNT_INFO_OPTION,
 			CredentialStore::DEALER_INVALID_OPTION,
+			CredentialStore::LEGACY_REJECTED_OPTION,
 			ConnectionService::MIGRATION_OPTION,
 			ConnectionService::INSTALLATION_OPTION,
+			ConnectionService::LOGIN_FAILURES_OPTION,
 			Connect::PARTNER_ID_OPTION_NAME,
 		] as $option ) {
 			\delete_option( $option );
@@ -697,5 +699,153 @@ class CloudConnectionTest extends TestCase {
 		$this->assertCount( 1, $this->sent( 'POST', 'v3/connect' ) );
 		$this->assertFalse( Migration::needs_migration() );
 		$this->assertTrue( \J7\PowerPartner\Domains\Cloud\Core\Notices::should_prompt_relogin() );
+	}
+
+	// ========== 真實密碼不可在本站主機的 IP 上累積失敗（cloud.luke.cafe 的 Fluent Security 依 IP 封鎖）==========
+
+	/** CloudServer `POST identity` 驗證真實密碼失敗時的真實回應：HTTP 200 包著 status 500 */
+	private const IDENTITY_BAD_PASSWORD = [ 200, '{"status":500,"message":"email or password invalid","data":"<strong>Error:</strong> The password you entered is incorrect."}' ];
+
+	/** 共用帳號被撤銷時 core 的回應：真實密碼根本沒被驗證 */
+	private const SHARED_REVOKED = [ 401, '{"code":"incorrect_password","message":"The provided password is an invalid application password.","data":{"status":401}}' ];
+
+	/** @group security */
+	public function test_legacy帳密被拒一次後不再送出真實密碼(): void {
+		\wp_set_current_user( $this->admin_id );
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'changed-on-cloud' );
+		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
+
+		$first = ConnectionService::status();
+
+		$this->assertSame( 401, $first['status'] );
+		$this->assertSame( CloudClient::MODE_LEGACY, $first['connection']['mode'], '不是「未連線」，AdminApp 要提示原因' );
+		$this->assertStringContainsString( '重新登入', (string) $first['message'] );
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+
+		ConnectionService::status();
+		ConnectionService::status();
+		$this->assertCount( 1, $this->sent( 'POST', 'identity' ), '之後每次打開 AdminApp 都不可再送出這組帳密' );
+
+		$detail = $this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+		$this->assertSame( 401, $detail->get_status() );
+		$this->assertSame( 'pp_relogin_required', $detail->get_data()['code'] ?? null );
+		$this->assertSame( [], $this->sent( 'POST', 'logs/abc-1/detail' ), '點數明細也不可再送出帳密' );
+
+		$this->assertFalse( Migration::needs_migration(), '自動遷移也不可再拿它去換專屬密碼' );
+		$this->assertTrue( \J7\PowerPartner\Domains\Cloud\Core\Notices::should_prompt_relogin() );
+	}
+
+	/** @group security */
+	public function test_點數明細回帳密錯誤時標記且不再送出(): void {
+		\wp_set_current_user( $this->admin_id );
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'changed-on-cloud' );
+		$this->routes['POST logs/abc-1/detail'] = [ 401, '{"status":401,"message":"email or password invalid"}' ];
+
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+		$this->assertCount( 1, $this->sent( 'POST', 'logs/abc-1/detail' ) );
+	}
+
+	/**
+	 * 共用帳號被撤銷時 core 回 401，但經銷商的真實密碼沒被驗證，不可誤判成「帳密錯誤」
+	 *
+	 * @group error
+	 */
+	public function test_共用帳號被撤銷不算經銷商帳密錯誤(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['POST identity'] = self::SHARED_REVOKED;
+
+		ConnectionService::status();
+
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
+	}
+
+	/** @group security */
+	public function test_遷移帳密錯誤時也標記帳密被拒(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => 'x', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
+
+		Migration::run();
+
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+		$this->assertSame( 401, ConnectionService::status()['status'] );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ), '遷移失敗後打開 AdminApp 也不可再送出這組帳密' );
+	}
+
+	/** @group security */
+	public function test_登入失敗第4次由本站擋下不送出(): void {
+		$this->routes['POST v3/connect'] = [ 401, [ 'code' => 'auth_required', 'message' => 'x', 'data' => [ 'status' => 401, 'error_code' => 'auth_required' ] ] ];
+
+		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+			$this->assertSame( 401, ConnectionService::connect( self::OLD_EMAIL, 'wrong' )['status'] );
+		}
+		$blocked = ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+
+		$this->assertSame( 429, $blocked['status'] );
+		$this->assertSame( '嘗試次數過多，請 15 分鐘後再試', $blocked['message'] );
+		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'v3/connect' ), '超過上限後不可再送出真實密碼' );
+
+		\update_option(
+			ConnectionService::LOGIN_FAILURES_OPTION,
+			[
+				'count' => ConnectionService::LOGIN_MAX_FAILURES,
+				'since' => time() - ConnectionService::LOGIN_FAILURE_WINDOW - 1,
+			],
+			false
+		);
+		$this->assertFalse( ConnectionService::login_throttled(), '15 分鐘後恢復' );
+	}
+
+	/**
+	 * 退回舊流程時，v3/connect 與 identity 是兩次真實密碼請求，只有真的失敗才計數
+	 *
+	 * @group security
+	 */
+	public function test_舊流程identity帳密錯誤也計入失敗次數(): void {
+		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
+
+		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+			ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+		}
+
+		$this->assertSame( 429, ConnectionService::connect( self::OLD_EMAIL, 'wrong' )['status'] );
+		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
+	}
+
+	/** @group happy */
+	public function test_登入成功清除失敗次數與帳密被拒標記(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, 'old' );
+		CredentialStore::mark_legacy_account_rejected( 'bad_credentials' );
+		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
+		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+		ConnectionService::connect( self::OLD_EMAIL, 'wrong' );
+
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+		$this->assertSame( 200, ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD )['status'] );
+
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
+		$this->assertFalse( ConnectionService::login_throttled() );
+		$this->assertFalse( \get_option( ConnectionService::LOGIN_FAILURES_OPTION, false ) );
+		$this->assertSame( 200, ConnectionService::status()['status'], '重新登入後恢復送出（新帳密）' );
+	}
+
+	/**
+	 * proxy 的 identity 路由會把瀏覽器送來的真實密碼轉給 CloudServer，同樣受失敗次數上限保護
+	 *
+	 * @group security
+	 */
+	public function test_proxy_identity受本站失敗次數上限保護(): void {
+		\wp_set_current_user( $this->admin_id );
+		$this->routes['POST identity'] = self::IDENTITY_BAD_PASSWORD;
+
+		for ( $i = 0; $i < ConnectionService::LOGIN_MAX_FAILURES; $i++ ) {
+			$this->proxy( 'POST', 'identity', [ 'email' => 'a@b.c', 'password' => 'wrong' ] );
+		}
+		$blocked = $this->proxy( 'POST', 'identity', [ 'email' => 'a@b.c', 'password' => 'wrong' ] );
+
+		$this->assertSame( 429, $blocked->get_status() );
+		$this->assertCount( ConnectionService::LOGIN_MAX_FAILURES, $this->sent( 'POST', 'identity' ) );
 	}
 }

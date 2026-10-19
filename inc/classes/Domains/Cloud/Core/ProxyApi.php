@@ -6,6 +6,7 @@ namespace J7\PowerPartner\Domains\Cloud\Core;
 
 use J7\PowerPartner\Api\Connect;
 use J7\PowerPartner\Domains\Cloud\Services\CloudClient;
+use J7\PowerPartner\Domains\Cloud\Services\ConnectionService;
 use J7\PowerPartner\Domains\Cloud\Services\CredentialStore;
 use J7\PowerPartner\Domains\Cloud\Shared\Arr;
 use J7\PowerPartner\Domains\Cloud\Shared\RawResponse;
@@ -62,6 +63,14 @@ final class ProxyApi {
 
 	/** @var array<int, string> customer 存取時必須強制 customer_id 的端點 */
 	const CUSTOMER_SCOPED_ROUTES = [ 'apps', 'license-codes', 'license-codes/release', 'change-domain', 'toggle-ssl' ];
+
+	/**
+	 * @var array<int, string> body 帶經銷商真實密碼的端點：與登入共用本站的失敗次數上限
+	 *
+	 * CloudServer 以 wp_authenticate() 驗證真實密碼，失敗次數會被 cloud.luke.cafe 的 Fluent Security
+	 * 記在本站主機的 IP 上（見 ConnectionService::LOGIN_FAILURES_OPTION）
+	 */
+	const REAL_PASSWORD_ROUTES = [ 'identity' ];
 
 	/** Constructor */
 	public function __construct() {
@@ -134,9 +143,29 @@ final class ProxyApi {
 			}
 		}
 
-		$response = $upstream !== $path
-			? $this->forward_log_detail( $upstream, $params )
-			: CloudClient::instance()->request( $method, $upstream, $params, [ 'timeout' => 120 ] );
+		$sends_password = in_array( $path, self::REAL_PASSWORD_ROUTES, true );
+		if ( $sends_password && ConnectionService::login_throttled() ) {
+			return new \WP_REST_Response(
+				[
+					'status'  => 429,
+					'code'    => 'pp_login_throttled',
+					'message' => '嘗試次數過多，請 15 分鐘後再試',
+				],
+				429
+			);
+		}
+
+		if ( $upstream !== $path ) {
+			$response = $this->forward_log_detail( $upstream, $params );
+			if ( $response instanceof \WP_REST_Response ) {
+				return $response;
+			}
+		} else {
+			$response = CloudClient::instance()->request( $method, $upstream, $params, [ 'timeout' => 120 ] );
+			if ( $sends_password && ConnectionService::is_password_rejected( $response ) ) {
+				ConnectionService::record_login_failure();
+			}
+		}
 
 		return self::to_rest_response( $response );
 	}
@@ -149,9 +178,9 @@ final class ProxyApi {
 	 *
 	 * @param string               $upstream 上游路徑
 	 * @param array<string, mixed> $params   body
-	 * @return array<string, mixed>|\WP_Error
+	 * @return array<string, mixed>|\WP_Error|\WP_REST_Response 本站直接回覆（不轉送）時為 WP_REST_Response
 	 */
-	private function forward_log_detail( string $upstream, array $params ): array|\WP_Error {
+	private function forward_log_detail( string $upstream, array $params ): array|\WP_Error|\WP_REST_Response {
 		unset( $params['email'], $params['password'] );
 		$client = CloudClient::instance();
 		$args   = [ 'timeout' => 120 ];
@@ -166,10 +195,26 @@ final class ProxyApi {
 
 		$account = CredentialStore::get_legacy_account();
 		if ( null !== $account ) {
+			// 帳密被拒過就不再送出，避免在本站主機的 IP 上累積失敗
+			if ( CredentialStore::is_legacy_account_rejected() ) {
+				return new \WP_REST_Response(
+					[
+						'status'  => 401,
+						'code'    => 'pp_relogin_required',
+						'message' => ConnectionService::attention()['message'] ?? '雲端帳密已失效，請重新登入一次。',
+					],
+					401
+				);
+			}
 			$params['email']    = $account['email'];
 			$params['password'] = $account['password'];
 		}
-		return $client->request_with_mode( CloudClient::MODE_LEGACY, 'POST', $upstream, $params, $args );
+
+		$response = $client->request_with_mode( CloudClient::MODE_LEGACY, 'POST', $upstream, $params, $args );
+		if ( null !== $account && ConnectionService::is_password_rejected( $response ) ) {
+			CredentialStore::mark_legacy_account_rejected( ConnectionService::EXCHANGE_BAD_PASSWORD );
+		}
+		return $response;
 	}
 
 	/**

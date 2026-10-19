@@ -42,6 +42,15 @@ abstract class CredentialStore {
 	/** @var string 專屬密碼被 CloudServer 拒絕時記錄的時間與原因（admin notice 用） */
 	const DEALER_INVALID_OPTION = 'power_partner_cloud_dealer_invalid';
 
+	/**
+	 * @var string 經銷商登入帳密（legacy account）已被 CloudServer 拒絕的標記
+	 *
+	 * 有標記時本站不再送出這組帳密，直到經銷商重新登入成功。原因：CloudServer 驗證真實密碼走
+	 * `wp_authenticate()`，cloud.luke.cafe 上的 Fluent Security 依「來源 IP」累計失敗次數並封鎖整個 IP；
+	 * 這些請求的來源是本站主機，同一台主機上其他經銷商站的雲端功能會一起被封鎖。
+	 */
+	const LEGACY_REJECTED_OPTION = 'power_partner_cloud_legacy_account_rejected';
+
 	/** @var string 衍生金鑰時的 context，避免與其他用到同一組 salt 的用途撞 key */
 	const KEY_CONTEXT = '|power-partner/cloud-credentials/v1';
 
@@ -176,6 +185,7 @@ abstract class CredentialStore {
 		);
 		if ( $saved ) {
 			\delete_option( self::OLD_ACCOUNT_INFO_OPTION );
+			\delete_option( self::LEGACY_REJECTED_OPTION );
 		}
 		return $saved;
 	}
@@ -188,6 +198,37 @@ abstract class CredentialStore {
 	public static function delete_legacy_account(): void {
 		\delete_option( self::LEGACY_ACCOUNT_OPTION );
 		\delete_option( self::OLD_ACCOUNT_INFO_OPTION );
+		\delete_option( self::LEGACY_REJECTED_OPTION );
+	}
+
+	/**
+	 * 標記經銷商登入帳密已被 CloudServer 拒絕（之後不再送出，見 LEGACY_REJECTED_OPTION）
+	 *
+	 * @param string $reason 原因
+	 * @return void
+	 */
+	public static function mark_legacy_account_rejected( string $reason ): void {
+		if ( self::is_legacy_account_rejected() ) {
+			return;
+		}
+		\update_option(
+			self::LEGACY_REJECTED_OPTION,
+			[
+				'reason' => $reason,
+				'at'     => time(),
+			],
+			false
+		);
+		Plugin::logger( 'CloudServer 拒絕本站保存的經銷商登入帳密，停止送出直到重新登入', 'warning', [ 'reason' => $reason ] );
+	}
+
+	/**
+	 * 經銷商登入帳密是否已被標記為被拒
+	 *
+	 * @return bool
+	 */
+	public static function is_legacy_account_rejected(): bool {
+		return false !== \get_option( self::LEGACY_REJECTED_OPTION, false );
 	}
 
 	/**

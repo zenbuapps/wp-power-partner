@@ -71,6 +71,10 @@ final class Migration {
 		if ( null === CredentialStore::get_legacy_account() ) {
 			return false;
 		}
+		// 帳密已被拒：再送一次只會在本站主機的 IP 上多累積一次失敗
+		if ( CredentialStore::is_legacy_account_rejected() ) {
+			return false;
+		}
 		$migration = ConnectionService::migration();
 		return ConnectionService::MIGRATION_FAILED !== $migration['status'];
 	}
@@ -101,6 +105,9 @@ final class Migration {
 
 			case ConnectionService::EXCHANGE_BAD_PASSWORD:
 			case ConnectionService::EXCHANGE_NOT_ELIGIBLE:
+				if ( ConnectionService::EXCHANGE_BAD_PASSWORD === $exchange['result'] ) {
+					CredentialStore::mark_legacy_account_rejected( $exchange['result'] );
+				}
 				ConnectionService::set_migration( ConnectionService::MIGRATION_FAILED, $exchange['result'] );
 				Plugin::logger(
 					'自動換取經銷商專屬密碼失敗，停止重試，維持共用帳號運作',

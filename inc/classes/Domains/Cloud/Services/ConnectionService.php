@@ -44,6 +44,23 @@ abstract class ConnectionService {
 	const EXCHANGE_TEMPORARY     = 'temporary';       // 連線錯誤、5xx
 
 	/**
+	 * @var string 本站送出經銷商真實密碼的失敗次數 `{count, since}`
+	 *
+	 * CloudServer 以 `wp_authenticate()` 驗證真實密碼，cloud.luke.cafe 的 Fluent Security 依來源 IP
+	 * 計數（30 分鐘 5 次）並封鎖整個 IP，而這些請求的來源是本站主機。上限刻意比它低，留出安全邊際。
+	 */
+	const LOGIN_FAILURES_OPTION = 'power_partner_cloud_login_failures';
+
+	/** @var int 視窗內最多幾次真實密碼失敗 */
+	const LOGIN_MAX_FAILURES = 3;
+
+	/** @var int 失敗次數的計算視窗（15 分鐘） */
+	const LOGIN_FAILURE_WINDOW = 900;
+
+	/** @var string CloudServer 驗證真實密碼失敗時的固定訊息（`POST identity` 與點數明細兩個端點相同） */
+	const BAD_CREDENTIALS_MESSAGE = 'email or password invalid';
+
+	/**
 	 * 目前的連線狀態與身分
 	 *
 	 * @return array<string, mixed>
@@ -68,9 +85,20 @@ abstract class ConnectionService {
 			return self::not_connected();
 		}
 
-		$body = self::legacy_identity( $account['email'], $account['password'] );
+		// 帳密被拒過就不再送出：每次打開 AdminApp 都重送一次，失敗次數會累積在本站主機的 IP 上
+		if ( CredentialStore::is_legacy_account_rejected() ) {
+			return self::relogin_required();
+		}
+
+		$response = self::send_legacy_identity( $account['email'], $account['password'] );
+		$body     = self::identity_body( $response );
 		if ( 200 !== (int) ( $body['status'] ?? 0 ) ) {
-			// 帳密已失效（經銷商改過密碼）→ 與舊版行為一致：請他重新登入
+			// 帳密已失效（經銷商改過密碼）→ 記下來不再重送，請他重新登入
+			if ( self::is_password_rejected( $response ) ) {
+				CredentialStore::mark_legacy_account_rejected( self::EXCHANGE_BAD_PASSWORD );
+				return self::relogin_required();
+			}
+			// 暫時錯誤（連線失敗、5xx）→ 與舊版行為一致：顯示登入畫面
 			return self::not_connected( (string) ( $body['message'] ?? '' ) );
 		}
 
@@ -85,9 +113,22 @@ abstract class ConnectionService {
 	 * @return array<string, mixed>
 	 */
 	public static function connect( string $email, string $password ): array {
+		if ( self::login_throttled() ) {
+			return [
+				'status'     => 429,
+				'message'    => '嘗試次數過多，請 15 分鐘後再試',
+				'connection' => [ 'mode' => CloudClient::MODE_NONE ],
+			];
+		}
+
 		$exchange = self::exchange( $email, $password );
 
+		if ( self::EXCHANGE_BAD_PASSWORD === $exchange['result'] ) {
+			self::record_login_failure();
+		}
+
 		if ( self::EXCHANGE_OK === $exchange['result'] ) {
+			self::clear_login_failures();
 			$identity = $exchange['identity'] ?? [];
 			self::after_login( $identity );
 			CredentialStore::delete_legacy_account();
@@ -111,15 +152,20 @@ abstract class ConnectionService {
 		}
 
 		// CloudServer 尚未支援 / 帳號不符資格 / 暫時錯誤 → 舊流程，與 3.5.x 行為相同
-		$body = self::legacy_identity( $email, $password );
+		$response = self::send_legacy_identity( $email, $password );
+		$body     = self::identity_body( $response );
 		if ( 200 !== (int) ( $body['status'] ?? 0 ) ) {
+			if ( self::is_password_rejected( $response ) ) {
+				self::record_login_failure();
+			}
 			return [
 				'status'     => (int) ( $body['status'] ?? 500 ),
-				'message'    => (string) ( $body['message'] ?? 'email or password invalid' ),
+				'message'    => (string) ( $body['message'] ?? self::BAD_CREDENTIALS_MESSAGE ),
 				'connection' => [ 'mode' => CloudClient::MODE_NONE ],
 			];
 		}
 
+		self::clear_login_failures();
 		CredentialStore::save_legacy_account( $email, $password );
 		self::after_login( Arr::assoc( $body['data'] ?? null ) );
 		self::set_migration(
@@ -289,10 +335,10 @@ abstract class ConnectionService {
 	 *
 	 * @param string $email    email 或帳號
 	 * @param string $password 密碼
-	 * @return array<string, mixed> CloudServer 回應 body（`{status, message, data}`）
+	 * @return array<string, mixed>|\WP_Error CloudServer 回應
 	 */
-	private static function legacy_identity( string $email, string $password ): array {
-		$response = CloudClient::instance()->request_with_mode(
+	private static function send_legacy_identity( string $email, string $password ): array|\WP_Error {
+		return CloudClient::instance()->request_with_mode(
 			CloudClient::MODE_LEGACY,
 			'POST',
 			'identity',
@@ -301,7 +347,15 @@ abstract class ConnectionService {
 				'password' => $password,
 			]
 		);
+	}
 
+	/**
+	 * `POST identity` 回應的 body（`{status, message, data}`）；body 沒有 status 時以 HTTP status 補上
+	 *
+	 * @param array<string, mixed>|\WP_Error $response 回應
+	 * @return array<string, mixed>
+	 */
+	private static function identity_body( array|\WP_Error $response ): array {
 		if ( \is_wp_error( $response ) ) {
 			return [
 				'status'  => 500,
@@ -314,6 +368,127 @@ abstract class ConnectionService {
 			$body['status'] = (int) \wp_remote_retrieve_response_code( $response );
 		}
 		return $body;
+	}
+
+	/**
+	 * CloudServer 是否明確回覆「經銷商真實密碼錯誤」
+	 *
+	 * 只認 CloudServer 驗證真實密碼失敗時的固定回應：`POST identity` 是 HTTP 200 包著 status 500，
+	 * 點數明細是 HTTP 401，兩者 message 都是 BAD_CREDENTIALS_MESSAGE。共用帳號被撤銷時 core 也回 401，
+	 * 但 message 不同、真實密碼根本沒被驗證，不算在內。
+	 *
+	 * @param array<string, mixed>|\WP_Error $response 回應
+	 * @return bool
+	 */
+	public static function is_password_rejected( array|\WP_Error $response ): bool {
+		if ( \is_wp_error( $response ) ) {
+			return false;
+		}
+		$body = self::decode( $response );
+		if ( self::BAD_CREDENTIALS_MESSAGE !== ( $body['message'] ?? null ) ) {
+			return false;
+		}
+		$http = (int) \wp_remote_retrieve_response_code( $response );
+		return 401 === $http || ( $http >= 200 && $http < 300 && 500 === (int) ( $body['status'] ?? 0 ) );
+	}
+
+	/**
+	 * 本站送出真實密碼的失敗次數是否已達上限（見 LOGIN_FAILURES_OPTION）
+	 *
+	 * @return bool
+	 */
+	public static function login_throttled(): bool {
+		return self::login_failures()['count'] >= self::LOGIN_MAX_FAILURES;
+	}
+
+	/**
+	 * 記一次真實密碼失敗
+	 *
+	 * @return void
+	 */
+	public static function record_login_failure(): void {
+		$failures = self::login_failures();
+		\update_option(
+			self::LOGIN_FAILURES_OPTION,
+			[
+				'count' => $failures['count'] + 1,
+				'since' => $failures['count'] > 0 ? $failures['since'] : time(),
+			],
+			false
+		);
+	}
+
+	/**
+	 * 登入成功時清除失敗次數
+	 *
+	 * @return void
+	 */
+	public static function clear_login_failures(): void {
+		if ( false !== \get_option( self::LOGIN_FAILURES_OPTION, false ) ) {
+			\delete_option( self::LOGIN_FAILURES_OPTION );
+		}
+	}
+
+	/**
+	 * @return array{count: int, since: int} 視窗已過時視為 0
+	 */
+	private static function login_failures(): array {
+		$stored = \get_option( self::LOGIN_FAILURES_OPTION, [] );
+		$stored = is_array( $stored ) ? $stored : [];
+		$since  = (int) ( $stored['since'] ?? 0 );
+		if ( time() - $since >= self::LOGIN_FAILURE_WINDOW ) {
+			return [
+				'count' => 0,
+				'since' => 0,
+			];
+		}
+		return [
+			'count' => (int) ( $stored['count'] ?? 0 ),
+			'since' => $since,
+		];
+	}
+
+	/**
+	 * 需要經銷商重新登入才能解決的連線問題；wp-admin notice 與 AdminApp 共用這個判斷
+	 *
+	 * @return array{code: string, message: string}|null
+	 */
+	public static function attention(): ?array {
+		$migration = self::migration();
+		if (
+			CredentialStore::is_legacy_account_rejected()
+			|| ( self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_BAD_PASSWORD === $migration['reason'] )
+		) {
+			return [
+				'code'    => 'credentials_rejected',
+				'message' => '雲端帳密已失效，請重新登入一次。目前功能不受影響。',
+			];
+		}
+		if ( CredentialStore::is_dealer_invalid() ) {
+			return [
+				'code'    => 'dealer_rejected',
+				'message' => '尚未完成新版安全連線，請重新登入一次以啟用專屬金鑰；目前功能不受影響。',
+			];
+		}
+		return null;
+	}
+
+	/**
+	 * 保存的帳密已失效：AdminApp 顯示登入畫面並提示原因
+	 *
+	 * @return array<string, mixed>
+	 */
+	private static function relogin_required(): array {
+		$message = self::attention()['message'] ?? '雲端帳密已失效，請重新登入一次。';
+		return [
+			'status'     => 401,
+			'message'    => $message,
+			'connection' => [
+				'mode'      => CloudClient::MODE_LEGACY,
+				'migration' => self::MIGRATION_FAILED,
+				'message'   => $message,
+			],
+		];
 	}
 
 	/**
@@ -338,15 +513,13 @@ abstract class ConnectionService {
 	 * @return array<string, mixed>
 	 */
 	private static function with_connection( array $body, string $mode ): array {
-		$migration = self::migration();
-		// 只有「重新登入就能解決」時才提示；不符資格（not_eligible）重新登入也沒用，不打擾經銷商
-		$relogin_helps      = CredentialStore::is_dealer_invalid()
-			|| ( self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_BAD_PASSWORD === $migration['reason'] );
+		$migration          = self::migration();
+		$attention          = self::attention();
 		$body['connection'] = [
 			'mode'      => $mode,
-			// 前端只在 failed 時顯示「請重新登入」，不符資格時回報為 none
-			'migration' => $relogin_helps ? self::MIGRATION_FAILED : ( self::MIGRATION_FAILED === $migration['status'] ? self::MIGRATION_NONE : $migration['status'] ),
-			'message'   => $relogin_helps ? '尚未完成新版安全連線，請重新登入一次以啟用專屬金鑰；目前功能不受影響。' : '',
+			// 前端只在 failed 時顯示提示；不需要經銷商處理的 failed 回報為 none
+			'migration' => null !== $attention ? self::MIGRATION_FAILED : ( self::MIGRATION_FAILED === $migration['status'] ? self::MIGRATION_NONE : $migration['status'] ),
+			'message'   => $attention['message'] ?? '',
 		];
 		return $body;
 	}
