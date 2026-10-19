@@ -988,4 +988,63 @@ class CloudConnectionTest extends TestCase {
 		CredentialStore::mark_legacy_disabled( 'legacy_auth_disabled' );
 		$this->assertSame( '雲端連線已中斷，請重新登入。', ConnectionService::attention()['message'] ?? null );
 	}
+
+	// ========== 自動遷移換到的帳號必須是本站綁定的經銷商 ==========
+
+	/**
+	 * 保存的帳密屬於另一個經銷商：保存下來的話之後每個請求都是 partner_mismatch（刻意不 fallback），整站斷線
+	 *
+	 * @group error
+	 */
+	public function test_遷移換到的帳號與本站partner不一致時不保存並撤銷(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect']   = [
+			200,
+			[
+				'user_login'   => 'other_dealer',
+				'app_password' => 'OTHR PASS WORD',
+				'uuid'         => 'uuid-other',
+				'identity'     => [ 'user_id' => '888' ] + $this->identity_data(),
+			],
+		];
+		$this->routes['DELETE v3/connect'] = [ 200, [ 'status' => 200 ] ];
+
+		Migration::run();
+
+		$this->assertNull( CredentialStore::get_dealer(), '不可保存別人的專屬密碼' );
+		$revoke = $this->sent( 'DELETE', 'v3/connect' );
+		$this->assertCount( 1, $revoke, '盡力撤銷，避免在 CloudServer 留下孤兒密碼' );
+		$this->assertSame( 'Basic ' . base64_encode( 'other_dealer:OTHR PASS WORD' ), $revoke[0]['headers']['Authorization'] ?? null ); // phpcs:ignore
+
+		$migration = ConnectionService::migration();
+		$this->assertSame( ConnectionService::MIGRATION_FAILED, $migration['status'] );
+		$this->assertSame( ConnectionService::EXCHANGE_PARTNER_MISMATCH, $migration['reason'] );
+		$this->assertNotNull( CredentialStore::get_legacy_account(), '保留 legacy 帳密，功能照舊以共用帳號運作' );
+		$this->assertSame( '777', \get_option( Connect::PARTNER_ID_OPTION_NAME ), '不可改掉本站綁定的經銷商' );
+		$this->assertFalse( Migration::needs_migration() );
+		$this->assertSame( '本站綁定的經銷商與登入帳號不同，請重新登入。', ConnectionService::attention()['message'] ?? null );
+	}
+
+	/**
+	 * 手動登入以登入者為準：不比對、照常覆寫 partner_id
+	 *
+	 * @group happy
+	 */
+	public function test_手動登入不同經銷商時以登入者為準(): void {
+		$this->routes['POST v3/connect'] = [
+			200,
+			[
+				'user_login'   => 'other_dealer',
+				'app_password' => 'OTHR PASS WORD',
+				'identity'     => [ 'user_id' => '888' ] + $this->identity_data(),
+			],
+		];
+
+		$result = ConnectionService::connect( 'other@x.test', 'pw' );
+
+		$this->assertSame( 200, $result['status'] );
+		$this->assertSame( '888', \get_option( Connect::PARTNER_ID_OPTION_NAME ) );
+		$this->assertNotNull( CredentialStore::get_dealer() );
+		$this->assertSame( [], $this->sent( 'DELETE', 'v3/connect' ) );
+	}
 }

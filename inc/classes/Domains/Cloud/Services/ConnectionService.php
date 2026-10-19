@@ -36,12 +36,13 @@ abstract class ConnectionService {
 	/**
 	 * v3/connect 結果
 	 */
-	const EXCHANGE_OK            = 'ok';
-	const EXCHANGE_UNSUPPORTED   = 'unsupported';     // CloudServer 尚無 v3/connect
-	const EXCHANGE_NOT_ELIGIBLE  = 'not_eligible';    // 帳號不符經銷商資格
-	const EXCHANGE_BAD_PASSWORD  = 'bad_credentials'; // 帳密錯誤
-	const EXCHANGE_RATE_LIMITED  = 'rate_limited';
-	const EXCHANGE_TEMPORARY     = 'temporary';       // 連線錯誤、5xx
+	const EXCHANGE_OK               = 'ok';
+	const EXCHANGE_UNSUPPORTED      = 'unsupported';      // CloudServer 尚無 v3/connect
+	const EXCHANGE_NOT_ELIGIBLE     = 'not_eligible';     // 帳號不符經銷商資格
+	const EXCHANGE_BAD_PASSWORD     = 'bad_credentials';  // 帳密錯誤
+	const EXCHANGE_RATE_LIMITED     = 'rate_limited';
+	const EXCHANGE_TEMPORARY        = 'temporary';        // 連線錯誤、5xx
+	const EXCHANGE_PARTNER_MISMATCH = 'partner_mismatch'; // 換到的帳號不是本站綁定的經銷商（只在自動遷移比對）
 
 	/**
 	 * @var string 本站送出經銷商真實密碼的失敗次數 `{count, since}`
@@ -202,11 +203,12 @@ abstract class ConnectionService {
 	/**
 	 * 用登入帳密向 CloudServer 換取本站專屬應用程式密碼（成功時直接存好）
 	 *
-	 * @param string $email    email 或帳號
-	 * @param string $password 密碼
+	 * @param string      $email               email 或帳號
+	 * @param string      $password            密碼
+	 * @param string|null $expected_partner_id 換到的帳號必須是這個經銷商，否則不保存並撤銷（自動遷移用；手動登入傳 null，以登入者為準）
 	 * @return array{result: string, message: string, identity?: array<string, mixed>}
 	 */
-	public static function exchange( string $email, string $password ): array {
+	public static function exchange( string $email, string $password, ?string $expected_partner_id = null ): array {
 		$response = CloudClient::instance()->request_with_mode(
 			CloudClient::MODE_NONE,
 			'POST',
@@ -254,12 +256,27 @@ abstract class ConnectionService {
 			return self::exchange_result( self::EXCHANGE_TEMPORARY, 'invalid response' );
 		}
 
+		$partner_id = (string) ( $identity['user_id'] ?? '' );
+		if ( null !== $expected_partner_id && '' !== $expected_partner_id && $partner_id !== $expected_partner_id ) {
+			// 保存的話之後每個請求都會被 CloudServer 以 partner_mismatch 拒絕（而且刻意不 fallback），整站斷線
+			self::revoke_unsaved( $user_login, $app_password );
+			Plugin::logger(
+				'自動遷移換到的帳號不是本站綁定的經銷商，不保存並撤銷這把專屬密碼',
+				'warning',
+				[
+					'partner_id'     => $expected_partner_id,
+					'got_partner_id' => $partner_id,
+				]
+			);
+			return self::exchange_result( self::EXCHANGE_PARTNER_MISMATCH, '本站綁定的經銷商與登入帳號不同' );
+		}
+
 		$saved = CredentialStore::save_dealer(
 			[
 				'user_login'   => $user_login,
 				'app_password' => $app_password,
 				'uuid'         => (string) ( $data['uuid'] ?? '' ),
-				'partner_id'   => (string) ( $identity['user_id'] ?? '' ),
+				'partner_id'   => $partner_id,
 			]
 		);
 		if ( ! $saved ) {
@@ -271,6 +288,29 @@ abstract class ConnectionService {
 			'message'  => '',
 			'identity' => $identity,
 		];
+	}
+
+	/**
+	 * 盡力撤銷一把剛換到、但不保存的專屬密碼，避免在 CloudServer 留下沒人用的密碼
+	 *
+	 * @param string $user_login   專屬帳號
+	 * @param string $app_password 專屬應用程式密碼
+	 * @return void
+	 */
+	private static function revoke_unsaved( string $user_login, string $app_password ): void {
+		$response = CloudClient::instance()->request_with_mode(
+			CloudClient::MODE_DEALER,
+			'DELETE',
+			'v3/connect',
+			[],
+			[
+				'timeout'       => 10,
+				'authorization' => 'Basic ' . base64_encode( "{$user_login}:{$app_password}" ), // phpcs:ignore
+			]
+		);
+		if ( ! CloudClient::is_success( $response ) ) {
+			Plugin::logger( '撤銷未保存的專屬密碼失敗', 'warning', [ 'error_code' => CloudClient::error_code( $response ) ] );
+		}
 	}
 
 	/**
@@ -464,6 +504,13 @@ abstract class ConnectionService {
 		$legacy_down   = CredentialStore::is_legacy_disabled();
 		$dealer_usable = null !== CredentialStore::get_dealer() && ! CredentialStore::is_dealer_invalid();
 
+		if ( ! $dealer_usable && self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_PARTNER_MISMATCH === $migration['reason'] ) {
+			return [
+				'code'    => 'partner_mismatch',
+				'message' => '本站綁定的經銷商與登入帳號不同，請重新登入。',
+				'relogin' => true,
+			];
+		}
 		if ( ! $dealer_usable && self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_NOT_ELIGIBLE === $migration['reason'] ) {
 			return [
 				'code'    => 'not_eligible',

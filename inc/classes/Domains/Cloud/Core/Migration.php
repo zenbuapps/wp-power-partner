@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace J7\PowerPartner\Domains\Cloud\Core;
 
+use J7\PowerPartner\Api\Connect;
 use J7\PowerPartner\Domains\Cloud\Services\ConnectionService;
 use J7\PowerPartner\Domains\Cloud\Services\CredentialStore;
 use J7\PowerPartner\Plugin;
@@ -16,6 +17,7 @@ use J7\PowerPartner\Plugin;
  * - 帳密錯誤（401，經銷商改過密碼）→ 停止，不再重試（重試會觸發 CloudServer 的鎖帳號），
  *   改由 admin notice 請經銷商重新登入一次；在那之前一律走共用帳號，功能不受影響
  * - 不符經銷商資格（403 not_eligible）→ 停止，維持共用帳號（由 CloudServer 管理員決定是否放行）
+ * - 換到的帳號不是本站綁定的經銷商 → 不保存、撤銷那把密碼、停止，請經銷商重新登入（以登入者為準）
  * - 429 / 5xx / 連線錯誤 → 明天再試
  *
  * 不寄信：通知經銷商由營運方自行處理。
@@ -94,7 +96,8 @@ final class Migration {
 			return;
 		}
 
-		$exchange = ConnectionService::exchange( $account['email'], $account['password'] );
+		// 保存的帳密可能屬於另一個經銷商（例如站台換過綁定），換到的專屬密碼必須是本站綁定的那一位
+		$exchange = ConnectionService::exchange( $account['email'], $account['password'], (string) \get_option( Connect::PARTNER_ID_OPTION_NAME, '' ) );
 
 		switch ( $exchange['result'] ) {
 			case ConnectionService::EXCHANGE_OK:
@@ -105,6 +108,7 @@ final class Migration {
 
 			case ConnectionService::EXCHANGE_BAD_PASSWORD:
 			case ConnectionService::EXCHANGE_NOT_ELIGIBLE:
+			case ConnectionService::EXCHANGE_PARTNER_MISMATCH:
 				if ( ConnectionService::EXCHANGE_BAD_PASSWORD === $exchange['result'] ) {
 					CredentialStore::mark_legacy_account_rejected( $exchange['result'] );
 				}

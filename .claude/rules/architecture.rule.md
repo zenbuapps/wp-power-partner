@@ -138,7 +138,7 @@ Customer buys subscription
 - **`Core\ProxyApi`** — Singleton。`ROUTES` 逐條宣告 `/power-partner/cloud/*`，分 admin（`manage_options`）/ customer（`is_user_logged_in`）兩種 audience。身分參數由 PHP 覆寫、customer 強制 `customer_id`、`change-domain` / `toggle-ssl` 先確認站台歸屬；上游 status 與 JSON body 原樣回傳。`forward_log_detail()` 處理 `logs/{id}/detail` 的 dealer / legacy 帳密差異；帳密被拒過就直接回 401 `pp_relogin_required`，不送出。`REAL_PASSWORD_ROUTES`（`identity`）的 body 帶真實密碼，與登入共用同一個失敗上限。完整路由表見 CLAUDE.md「REST API Routes」。
 - **`Shared\RawResponse`** — 繼承 `WP_REST_Response`，`serve()` 掛在 `rest_pre_serve_request`，CSV 這類非 JSON 內容原文輸出（headers 已由 `serve_request` 依 `get_headers()` 送出，會蓋掉預設的 JSON `Content-Type`）。
 - **`Shared\Arr`** — `assoc()` / `from_json()`，把外部 JSON 與 option 內容收斂成字串 key 的關聯陣列（PHPStan 用）。
-- **`Core\Migration`** — Singleton。hook `power_partner/3.6.0/cloud/migrate`（AS 每日 recurring，`init` 時視 `needs_migration()` 排程或移除）。把 legacy 帳密換成專屬密碼；404 / 429 / 5xx 明天再試，401 與 `not_eligible` 標 `failed` 停止。401 另外標記帳密被拒，之後不再送出。
+- **`Core\Migration`** — Singleton。hook `power_partner/3.6.0/cloud/migrate`（AS 每日 recurring，`init` 時視 `needs_migration()` 排程或移除）。把 legacy 帳密換成專屬密碼；404 / 429 / 5xx 明天再試，401 與 `not_eligible` 標 `failed` 停止。401 另外標記帳密被拒，之後不再送出。`exchange()` 帶本站 partner_id 比對，換到別的經銷商時不保存、撤銷並標 `failed`（`EXCHANGE_PARTNER_MISMATCH`）。
 - **`Core\Notices`** — Singleton。`admin_notices`：`ConnectionService::attention()` 有值時，對 `manage_options` 顯示它的文案。判斷與文案都不寫在這裡。
 
 `Bootstrap` 在 `Api\User::instance()` 之後依序啟動 `ConnectionApi` → `ProxyApi` → `Migration` → `Notices`。**不寄任何信**，異常只寫 log 或顯示 notice。

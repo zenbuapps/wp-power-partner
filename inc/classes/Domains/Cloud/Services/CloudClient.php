@@ -407,11 +407,12 @@ final class CloudClient {
 	 *
 	 * 「查身分」這類請求必須用這個：自動 fallback 到 legacy 會查到共用帳號自己的身分。
 	 *
-	 * @param string                                           $mode     認證模式
-	 * @param string                                           $method   HTTP method
-	 * @param string                                           $endpoint 相對路徑
-	 * @param array<string, mixed>                             $params   GET 為 query、其他為 JSON body
-	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args     timeout（秒）；這裡不處理 legacy_on_not_owner
+	 * @param string                                                                  $mode     認證模式
+	 * @param string                                                                  $method   HTTP method
+	 * @param string                                                                  $endpoint 相對路徑
+	 * @param array<string, mixed>                                                    $params   GET 為 query、其他為 JSON body
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool, authorization?: string} $args     timeout（秒）；這裡不處理 legacy_on_not_owner；
+	 *                                                                                          authorization 只給「撤銷剛換到、尚未保存的專屬密碼」用
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function request_with_mode( string $mode, string $method, string $endpoint, array $params = [], array $args = [] ): array|\WP_Error {
@@ -420,7 +421,7 @@ final class CloudClient {
 		$url = Bootstrap::instance()->base_url . self::API_PATH . ltrim( $endpoint, '/' );
 
 		$headers       = Fetch::cloud_headers();
-		$authorization = self::authorization( $mode );
+		$authorization = $args['authorization'] ?? self::authorization( $mode );
 		if ( '' === $authorization ) {
 			unset( $headers['Authorization'] );
 		} else {
