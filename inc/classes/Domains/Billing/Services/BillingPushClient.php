@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace J7\PowerPartner\Domains\Billing\Services;
 
+use J7\PowerPartner\Api\Fetch;
 use J7\PowerPartner\Bootstrap;
 use J7\PowerPartner\Plugin;
 
@@ -11,7 +12,7 @@ use J7\PowerPartner\Plugin;
  * 新架構（PowerCloud）每日計費資料推送 client
  *
  * 對端契約見 power-partner-server/specs/api.yml 的 POST /v2/powercloud-daily-billing。
- * 認證沿用既有 Fetch::disable_site() 的 Basic Auth 組法，不另造機制。
+ * 認證與其他 CloudServer 呼叫共用 Fetch::cloud_headers()，不另造機制。
  */
 abstract class BillingPushClient {
 
@@ -58,10 +59,7 @@ abstract class BillingPushClient {
 		$args = [
 			'method'  => 'POST',
 			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
+			'headers' => Fetch::cloud_headers(),
 			'timeout' => 120,
 		];
 

@@ -289,8 +289,15 @@ paths:
     get:
       tags: [Partner]
       summary: 取得加密的合作夥伴帳號資訊
+      description: 需要 manage_options。密文是經銷商的真實帳密且 passphrase 公開，不可對外開放。
       operationId: GetAccountInfo
+      security:
+        - wpNonce: []
       responses:
+        "401":
+          description: 未登入
+        "403":
+          description: 權限不足（非 manage_options）
         "200":
           description: 成功
           content:
@@ -667,7 +674,10 @@ paths:
     get:
       tags: [User]
       summary: 根據 user_ids 取得客戶資訊
+      description: 需要登入。manage_options 可查任意用戶；其他已登入用戶只會拿到自己（範圍不含自己時回空陣列）。
       operationId: GetCustomers
+      security:
+        - wpNonce: []
       parameters:
         - name: user_ids
           in: query
@@ -692,6 +702,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/CustomerSummary"
+        "401":
+          description: 未登入
         "500":
           description: 缺少 user_ids
 

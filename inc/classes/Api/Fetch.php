@@ -13,6 +13,32 @@ abstract class Fetch {
 	const ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY = 'power_partner_allowed_template_options';
 
 	/**
+	 * 模板列表抓取失敗時的負面快取秒數
+	 *
+	 * 成功的結果不設 TTL（由 POST /partner-id 與「清除快取」維護），但失敗時若不寫快取，
+	 * 每一次載入 AdminApp / 商品編輯頁都會再打一次 CloudServer（timeout 120 秒）。
+	 * CloudServer 撤銷共用帳號或經銷商尚未重新連線時，失敗會是常態，必須擋住重打。
+	 */
+	const ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL = 5 * MINUTE_IN_SECONDS;
+
+	/**
+	 * 呼叫 CloudServer（power-partner-server）共用的 request headers
+	 *
+	 * X-PP-Client-Version / X-PP-Site 供 CloudServer 統計「還有哪些站用舊版、舊憑證」，
+	 * 是撤銷共用帳號前判斷能否關閉的依據，不參與任何驗證。
+	 *
+	 * @return array<string, string>
+	 */
+	public static function cloud_headers(): array {
+		return [
+			'Content-Type'        => 'application/json',
+			'Authorization'       => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
+			'X-PP-Client-Version' => (string) Plugin::$version,
+			'X-PP-Site'           => \site_url(),
+		];
+	}
+
+	/**
 	 * 發 API 開站
 	 *
 	 * @param array{
@@ -47,10 +73,7 @@ abstract class Fetch {
 		}
 		$args     = [
 			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
+			'headers' => self::cloud_headers(),
 			'timeout' => 600,
 		];
 		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/site-sync', $args );
@@ -99,10 +122,7 @@ abstract class Fetch {
 		}
 		$args     = [
 			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
+			'headers' => self::cloud_headers(),
 			'timeout' => 600,
 		];
 		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/disable-site', $args );
@@ -170,10 +190,7 @@ abstract class Fetch {
 		}
 		$args     = [
 			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
+			'headers' => self::cloud_headers(),
 			'timeout' => 600,
 		];
 		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/enable-site', $args );
@@ -224,7 +241,12 @@ abstract class Fetch {
 		if ( false === $allowed_template_options ) {
 			$allowed_template_options = [];
 			$result                   = self::fetch_template_sites_by_user();
+			// null = 尚未連線（沒有 partner_id），根本沒發請求，不需要負面快取
+			if ( null === $result ) {
+				return [];
+			}
 			if (\is_wp_error($result)) {
+				\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, [], self::ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL );
 				return [];
 			}
 
@@ -233,6 +255,7 @@ abstract class Fetch {
 			$template_sites = $result_obj->data->list ?? null;
 
 			if (!$template_sites) {
+				\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, [], self::ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL );
 				return [];
 			}
 
@@ -259,10 +282,7 @@ abstract class Fetch {
 		}
 
 		$args = [
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
+			'headers' => self::cloud_headers(),
 			'timeout' => 120,
 		];
 

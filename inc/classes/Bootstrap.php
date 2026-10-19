@@ -91,7 +91,9 @@ final class Bootstrap {
 
 		$post_id                  = \get_the_ID();
 		$permalink                = $post_id ? \get_permalink( $post_id ) : '';
-		$allowed_template_options = Fetch::get_allowed_template_options();
+		// 模板列表只有 AdminApp（手動開站）用得到；前台每個 page view 都會跑到這裡，
+		// 快取空的時候會變成「每個訪客 × 每一頁」打一次 CloudServer
+		$allowed_template_options = \is_admin() ? Fetch::get_allowed_template_options() : [];
 
 		$power_partner_settings = (array) \get_option( 'power_partner_settings', [] );
 
@@ -128,7 +130,9 @@ final class Bootstrap {
 					'partner_id'                => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
 					'disable_site_after_n_days' => (int) ( $power_partner_settings['power_partner_disable_site_after_n_days'] ?? '7' ),
 					'allow_delete_site'         => !empty( $power_partner_settings['power_partner_allow_delete_site'] ),
-					't'                         => $this->t,
+					// ⚠️ 共用帳號憑證，過渡期內 cloudAxios 仍需要；至少不再送給未登入的訪客
+					// （UserApp 未登入時什麼都不呼叫）。新版改走本地 proxy 後整個欄位移除
+					't'                         => \is_user_logged_in() ? $this->t : '',
 					'cloudBaseUrl'              => $this->base_url,
 					'POWERCLOUD_API'            => $this->powercloud_api,
 					'powercloud_api_key'        => $powercloud_api_key,

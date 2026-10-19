@@ -96,6 +96,10 @@ final class Connect {
 
 		/**
 	 * Register account info API
+	 *
+	 * ⛔ 不可改回 __return_true：encrypted_account_info 是經銷商在 cloud.luke.cafe 的
+	 * 真實帳密，而加密用的 passphrase 是公開的 Plugin::$kebab，任何人拿到密文都解得開。
+	 * 唯一的讀取方是 AdminApp（wp-admin、帶 wp_rest nonce），本來就是 manage_options。
 	 */
 		\register_rest_route(
 			Plugin::$kebab,
@@ -103,10 +107,9 @@ final class Connect {
 			[
 				'methods'             => 'GET',
 				'callback'            => [ $this, 'get_account_info_callback' ],
-				'permission_callback' => '__return_true',
-			// 'permission_callback' => function () {
-			// return \current_user_can( 'manage_options' );
-			// },
+				'permission_callback' => function () {
+					return \current_user_can( 'manage_options' );
+				},
 			]
 		);
 	}

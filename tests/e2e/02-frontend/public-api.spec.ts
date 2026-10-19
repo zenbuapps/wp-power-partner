@@ -1,16 +1,17 @@
 /**
  * 公開 API 測試（不需認證）
  *
- * 涵蓋: GetPartnerId, GetAccountInfo, GetApps, GetCustomers, GetSubscriptionsNextPayment
+ * 涵蓋: GetPartnerId, GetApps, GetSubscriptionsNextPayment（public），
+ *       以及已從 public 收斂的 GetAccountInfo、GetCustomers（驗證匿名被拒）
  *
  * 對應 spec:
  *   spec/features/partner/查詢合作夥伴ID.feature — Rule: 無權限限制（public）
- *   spec/features/partner/查詢帳號資訊.feature — Rule: 無權限限制（public）
+ *   spec/features/partner/查詢帳號資訊.feature — Rule: 需要 manage_options
  *   spec/features/subscription/查詢網站對應訂閱.feature — Rule: 無權限限制（public）
- *   spec/features/user/查詢客戶資訊.feature — Rule: 無權限限制（public）
+ *   spec/features/user/查詢客戶資訊.feature — Rule: 需要登入
  *   spec/features/license-code/查詢訂閱下次付款日.feature — Rule: 無權限限制（public）
  *
- * 這些 API 是 Public 端點，完全不需要 WordPress 登入 Cookie 或 X-WP-Nonce。
+ * 全部以完全未認證（無 Cookie、無 X-WP-Nonce）的方式呼叫。
  */
 import { test, expect, request as pwRequest } from '@playwright/test'
 
@@ -70,40 +71,20 @@ test.describe('GET /partner-id — Public API', () => {
 	})
 })
 
-// ─── GetAccountInfo (Public) ─────────────────────────────────
+// ─── GetAccountInfo (Admin only) ─────────────────────────────
 
-test.describe('GET /account-info — Public API', () => {
+// encrypted_account_info 是經銷商在 cloud.luke.cafe 的真實帳密，加密 passphrase 是公開的
+// Plugin::$kebab，任何人拿到密文都解得開 —— 匿名必須被擋（管理員路徑見 01-admin/partner-api.spec.ts）
+test.describe('GET /account-info — 匿名存取被拒', () => {
 
-	// P0: 不需認證即可存取
-	test('P0: 未認證可呼叫 account-info（不回 401/403）', async () => {
+	test('P0: 未認證呼叫 account-info 回 401', async () => {
 		const res = await publicGet('power-partner/account-info')
-		// spec: 無權限限制，應回 200
-		expect(res.status).toBe(200)
+		expect(res.status).toBe(401)
 	})
 
-	// P1: 回應格式
-	test('P1: 回應包含 data 欄位', async () => {
+	test('P0: 未認證的回應不含 encrypted_account_info', async () => {
 		const res = await publicGet('power-partner/account-info')
-		expect(res.status).toBe(200)
-		if (res.status === 200) {
-			expect(res.data).toHaveProperty('data')
-		}
-	})
-
-	test('P1: data 包含 encrypted_account_info 欄位', async () => {
-		const res = await publicGet('power-partner/account-info')
-		expect(res.status).toBe(200)
-		const body = res.data as { data?: { encrypted_account_info?: unknown } }
-		expect(body.data).toHaveProperty('encrypted_account_info')
-	})
-
-	// P2: 未設定時回 null（spec 明確規定）
-	test('P2: 未設定時 encrypted_account_info 可能為 null', async () => {
-		const res = await publicGet('power-partner/account-info')
-		expect(res.status).toBe(200)
-		// 無論設定與否，都應是合法回應
-		const body = res.data as { data?: { encrypted_account_info?: unknown } }
-		expect(body.data).toBeDefined()
+		expect(JSON.stringify(res.data)).not.toContain('encrypted_account_info')
 	})
 })
 
@@ -151,56 +132,24 @@ test.describe('GET /apps — Public API', () => {
 	})
 })
 
-// ─── GetCustomers (Public) ───────────────────────────────────
+// ─── GetCustomers (Logged-in only) ───────────────────────────
 
-test.describe('GET /customers — Public API', () => {
+// 原本公開，傳任意 user_ids 就回 user_login / user_email —— 匿名必須被擋。
+// 登入後的範圍（管理員任意、一般會員只能查自己）由 PHPUnit 的 CredentialExposureHotfixTest 覆蓋
+test.describe('GET /customers — 匿名存取被拒', () => {
 
-	// P0: 不需認證即可存取
-	test('P0: 未認證可以 user_ids 查詢客戶', async () => {
+	test('P0: 未認證以 user_ids 查詢客戶回 401', async () => {
 		const res = await publicGet('power-partner/customers', url => {
 			url.searchParams.append('user_ids[]', '1')
 		})
-		expect(res.status).toBe(200)
-		expect(Array.isArray(res.data)).toBe(true)
+		expect(res.status).toBe(401)
 	})
 
-	// P1: 回應格式（spec 規定包含 id, user_login, user_email, display_name）
-	test('P1: 回應包含分頁 header', async () => {
+	test('P0: 未認證的回應不含任何 user_email', async () => {
 		const res = await publicGet('power-partner/customers', url => {
 			url.searchParams.append('user_ids[]', '1')
 		})
-		expect(res.status).toBe(200)
-		expect(res.headers['x-wp-total']).toBeDefined()
-		expect(res.headers['x-wp-totalpages']).toBeDefined()
-	})
-
-	test('P1: 客戶資料包含 id, user_login, user_email, display_name', async () => {
-		const res = await publicGet('power-partner/customers', url => {
-			url.searchParams.append('user_ids[]', '1')
-		})
-		expect(res.status).toBe(200)
-		const data = res.data as Array<Record<string, string>>
-		if (data.length > 0) {
-			expect(data[0]).toHaveProperty('id')
-			expect(data[0]).toHaveProperty('user_login')
-			expect(data[0]).toHaveProperty('user_email')
-			expect(data[0]).toHaveProperty('display_name')
-		}
-	})
-
-	// P2: 缺少必填參數
-	test('P2: 缺少 user_ids 回 500', async () => {
-		const res = await publicGet('power-partner/customers')
-		// spec: "missing user ids"
-		expect(res.status).toBe(500)
-	})
-
-	test('P2: 不存在的 user_id 回空陣列', async () => {
-		const res = await publicGet('power-partner/customers', url => {
-			url.searchParams.append('user_ids[]', '999999')
-		})
-		expect(res.status).toBe(200)
-		expect((res.data as Array<unknown>).length).toBe(0)
+		expect(JSON.stringify(res.data)).not.toContain('user_email')
 	})
 })
 
