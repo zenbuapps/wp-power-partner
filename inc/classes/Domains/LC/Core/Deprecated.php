@@ -59,9 +59,8 @@ final class Deprecated {
 				'ids' => $lc_ids,
 			]
 		);
-		$is_error     = \is_wp_error($response);
-		if ($is_error) {
-			$subscription->add_order_note("站長路可《過期》授權碼 失敗: \n{$response->get_error_message()}");
+		if (!CloudApi::is_success($response)) {
+			LifeCycle::log_failure($subscription, '《過期》', $lc_ids, $response);
 			return;
 		}
 

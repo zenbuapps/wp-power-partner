@@ -124,14 +124,14 @@ Customer buys subscription
 ### `Domains\LC`（License Codes）
 管理授權碼生命週期，透過 `cloud.luke.cafe` API，經 `Cloud\Services\CloudClient` 發送（原本用 Powerhouse 的 `Api\Base`；`CloudClient` 的 `remote_get/post/delete` 簽名與它相同，LC 4 檔以 `use ...CloudClient as CloudApi` 別名換入）。
 
-- **`Core\LifeCycle`** — `INITIAL_PAYMENT_COMPLETE` 建立 LCs；`SUBSCRIPTION_FAILED` 排程停用（延遲 4 小時）；`SUBSCRIPTION_SUCCESS` 恢復。
+- **`Core\LifeCycle`** — `INITIAL_PAYMENT_COMPLETE` 建立 LCs；`SUBSCRIPTION_FAILED` 排程停用（延遲 4 小時）；`SUBSCRIPTION_SUCCESS` 恢復（帶 `legacy_on_not_owner`）。成敗看 HTTP 2xx（`CloudClient::is_success()`），失敗統一走 `log_failure()`：備註「❌失敗」+ error log；建立失敗時不寫 `lc_id`。
 - **`Core\Api`** — 管理端授權碼 REST API。
-- **`Services\ExpireHandler`** — ActionScheduler 包裝，延遲 LC 停用。
+- **`Services\ExpireHandler`** — ActionScheduler 包裝，延遲 LC 停用（`license-codes/expire`，帶 `legacy_on_not_owner`；失敗走 `LifeCycle::log_failure()`）。
 
 ### `Domains\Cloud`（CloudServer 連線，v3.6.0）
 本站與 CloudServer（cloud.luke.cafe 的 power-partner-server）之間的認證、連線與轉送。**最高原則：漸進、向後相容，任何一版更新後都不能 403 或功能中斷**——本版 client 可能早於、也可能晚於 CloudServer 升級，兩種順序都要能用。
 
-- **`Services\CloudClient`** — Singleton，呼叫 CloudServer 的**唯一出口**。`remote_get/post/delete(string $endpoint, array $params, array $args)` 簽名與 Powerhouse `Api\Base` 相同；`request()` 自動選模式（`MODE_DEALER` / `MODE_LEGACY`），dealer 收到 `CREDENTIAL_REJECTED_CODES` 時標記失效並**當次改用 legacy 重送**；`request_with_mode()` 指定模式、不 fallback（`v3/connect` 用 `MODE_NONE` 不帶 Authorization）。所有請求帶 `Fetch::cloud_headers()` 的 telemetry 與 `Origin`（CloudServer 部分端點的授權碼網域比對依賴它）。`last_mode` 供測試與 log 使用。
+- **`Services\CloudClient`** — Singleton，呼叫 CloudServer 的**唯一出口**。`remote_get/post/delete(string $endpoint, array $params, array $args)` 簽名與 Powerhouse `Api\Base` 相同；`request()` 自動選模式（`MODE_DEALER` / `MODE_LEGACY`），dealer 收到 `CREDENTIAL_REJECTED_CODES` 時標記失效並**當次改用 legacy 重送**；`request_with_mode()` 指定模式、不 fallback（`v3/connect` 用 `MODE_NONE` 不帶 Authorization）。唯一的窄例外：`$args['legacy_on_not_owner'] = true` 且端點在 `LEGACY_ON_NOT_OWNER_ENDPOINTS`（`license-codes/recover`、`license-codes/expire`）時，dealer 收到 403 `not_owner` 以 legacy 重送一次（不標記失效、寫 warning log；只有 LifeCycle 重啟與 ExpireHandler 停用開啟，理由見 CLAUDE.md 陷阱 27）。`is_success()`（HTTP 2xx）/ `failure_message()` 供呼叫端判定成敗——不可只看 `is_wp_error()`。所有請求帶 `Fetch::cloud_headers()` 的 telemetry 與 `Origin`（CloudServer 部分端點的授權碼網域比對依賴它）。`last_mode` 供測試與 log 使用。
 - **`Services\CredentialStore`** — Abstract，加密存放兩種憑證（option 名見 CLAUDE.md）：經銷商專屬應用程式密碼（`get/save/delete_dealer`、`mark_dealer_invalid`）與 legacy 登入帳密（`get/save/delete_legacy_account`）。sodium secretbox，金鑰由 `wp_salt('auth')` + `wp_salt('secure_auth')` + context 衍生，host 封進密文；解不開或 host 不符回 `null`（視為未連線，不 fatal）。`decrypt_old_account_info()` 能讀舊版 CryptoJS 密文（EVP_BytesToKey + AES-256-CBC）。
 - **`Services\ConnectionService`** — Abstract。`status()` / `connect()` / `disconnect()` / `exchange()` / `installation_id()` / `migration()`。`exchange()` 打 `POST v3/connect`，結果以 `EXCHANGE_*` 常數表示（`ok` / `unsupported` / `not_eligible` / `bad_credentials` / `rate_limited` / `temporary`）。`connect()` 在 `unsupported` / `not_eligible` / `temporary` 時退回舊 `POST identity`，成功後保存 legacy 帳密。
 - **`Core\ConnectionApi`** — `GET/POST/DELETE /power-partner/connection`，`manage_options`。

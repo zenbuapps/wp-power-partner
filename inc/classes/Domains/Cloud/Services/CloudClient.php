@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace J7\PowerPartner\Domains\Cloud\Services;
 
+use J7\PowerPartner\Api\Connect;
 use J7\PowerPartner\Api\Fetch;
 use J7\PowerPartner\Bootstrap;
 use J7\PowerPartner\Domains\Cloud\Shared\Arr;
@@ -47,6 +48,7 @@ final class CloudClient {
 	 *
 	 * ⛔ 不可加入 partner_mismatch / not_owner 這類「身分正確但無權操作」的代碼：
 	 * 那是 CloudServer 正確地拒絕越權，換成 legacy 重送等於繞過檢查。
+	 * （授權碼作者不符的窄例外另見 LEGACY_ON_NOT_OWNER_ENDPOINTS，需呼叫端明確開啟）
 	 *
 	 * @var array<int, string>
 	 */
@@ -61,15 +63,29 @@ final class CloudClient {
 		'auth_required',
 	];
 
+	/**
+	 * 作者不符（not_owner）時允許以 legacy 重送一次的端點 —— 窄例外，還要呼叫端以 `legacy_on_not_owner` 明確開啟
+	 *
+	 * 只給授權碼生命週期（LifeCycle 重啟、ExpireHandler 停用）用：ids 來自本站訂閱的 `lc_id` meta，
+	 * 不是瀏覽器輸入；存量授權碼的 post_author 可能不是本經銷商（例如在 CloudServer 後台建立後才綁到訂閱），
+	 * 而這兩個操作 legacy 本來就允許。legacy 關閉後這條路自然失效，必須在那之前修正這批授權碼的 post_author。
+	 *
+	 * @var array<int, string>
+	 */
+	const LEGACY_ON_NOT_OWNER_ENDPOINTS = [
+		'license-codes/recover',
+		'license-codes/expire',
+	];
+
 	/** @var string 最後一次請求實際使用的模式（測試與 log 用） */
 	public string $last_mode = '';
 
 	/**
 	 * 發送 GET 請求
 	 *
-	 * @param string               $endpoint   相對於 power-partner-server namespace 的路徑
-	 * @param array<string, mixed> $url_params query 參數
-	 * @param array{timeout?: int} $args       timeout（秒）
+	 * @param string                                           $endpoint   相對於 power-partner-server namespace 的路徑
+	 * @param array<string, mixed>                             $url_params query 參數
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args       timeout（秒）；legacy_on_not_owner 見 LEGACY_ON_NOT_OWNER_ENDPOINTS
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function remote_get( string $endpoint, array $url_params = [], array $args = [] ): array|\WP_Error {
@@ -79,9 +95,9 @@ final class CloudClient {
 	/**
 	 * 發送 POST 請求
 	 *
-	 * @param string               $endpoint    相對於 power-partner-server namespace 的路徑
-	 * @param array<string, mixed> $body_params JSON body
-	 * @param array{timeout?: int} $args        timeout（秒）
+	 * @param string                                           $endpoint    相對於 power-partner-server namespace 的路徑
+	 * @param array<string, mixed>                             $body_params JSON body
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args        timeout（秒）；legacy_on_not_owner 見 LEGACY_ON_NOT_OWNER_ENDPOINTS
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function remote_post( string $endpoint, array $body_params = [], array $args = [] ): array|\WP_Error {
@@ -91,9 +107,9 @@ final class CloudClient {
 	/**
 	 * 發送 DELETE 請求
 	 *
-	 * @param string               $endpoint    相對於 power-partner-server namespace 的路徑
-	 * @param array<string, mixed> $body_params JSON body
-	 * @param array{timeout?: int} $args        timeout（秒）
+	 * @param string                                           $endpoint    相對於 power-partner-server namespace 的路徑
+	 * @param array<string, mixed>                             $body_params JSON body
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args        timeout（秒）；legacy_on_not_owner 見 LEGACY_ON_NOT_OWNER_ENDPOINTS
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function remote_delete( string $endpoint, array $body_params = [], array $args = [] ): array|\WP_Error {
@@ -141,10 +157,10 @@ final class CloudClient {
 	/**
 	 * 發送請求，必要時以 legacy 重送
 	 *
-	 * @param string               $method   HTTP method
-	 * @param string               $endpoint 相對路徑
-	 * @param array<string, mixed> $params   GET 為 query、其他為 JSON body
-	 * @param array{timeout?: int} $args     timeout（秒）
+	 * @param string                                           $method   HTTP method
+	 * @param string                                           $endpoint 相對路徑
+	 * @param array<string, mixed>                             $params   GET 為 query、其他為 JSON body
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args     timeout（秒）；legacy_on_not_owner 見 LEGACY_ON_NOT_OWNER_ENDPOINTS
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function request( string $method, string $endpoint, array $params = [], array $args = [] ): array|\WP_Error {
@@ -163,9 +179,86 @@ final class CloudClient {
 				]
 			);
 			$response = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
+		} elseif ( self::MODE_DEALER === $mode && self::should_retry_not_owner_as_legacy( $endpoint, $response, $args ) ) {
+			// 不是憑證問題，不標記專屬密碼失效
+			Plugin::logger(
+				'CloudServer 以 not_owner 拒絕本站訂閱的授權碼操作（授權碼作者不是本經銷商），暫以共用帳號重送；關閉 legacy 前請修正這批授權碼的 post_author',
+				'warning',
+				[
+					'endpoint'   => $endpoint,
+					'ids'        => $params['ids'] ?? [],
+					'partner_id' => (string) \get_option( Connect::PARTNER_ID_OPTION_NAME, '' ),
+				]
+			);
+			$response = $this->request_with_mode( self::MODE_LEGACY, $method, $endpoint, $params, $args );
 		}
 
 		return $response;
+	}
+
+	/**
+	 * 是否符合「作者不符時以 legacy 重送」的窄例外：呼叫端明確開啟 + 白名單端點 + 403 not_owner
+	 *
+	 * @param string                                           $endpoint 相對路徑
+	 * @param array<string, mixed>|\WP_Error                   $response dealer 模式的回應
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args     呼叫端參數
+	 * @return bool
+	 */
+	private static function should_retry_not_owner_as_legacy( string $endpoint, array|\WP_Error $response, array $args ): bool {
+		if ( true !== ( $args['legacy_on_not_owner'] ?? false ) ) {
+			return false;
+		}
+		if ( ! in_array( ltrim( $endpoint, '/' ), self::LEGACY_ON_NOT_OWNER_ENDPOINTS, true ) ) {
+			return false;
+		}
+		if ( \is_wp_error( $response ) || 403 !== (int) \wp_remote_retrieve_response_code( $response ) ) {
+			return false;
+		}
+		return 'not_owner' === self::error_code( $response );
+	}
+
+	/**
+	 * 回應是否為 HTTP 2xx
+	 *
+	 * CloudServer 的業務錯誤（403 not_owner、401 legacy_auth_disabled…）回來時不是 WP_Error，
+	 * 只看 is_wp_error() 會把它們當成成功。
+	 *
+	 * @param array<string, mixed>|\WP_Error $response 回應
+	 * @return bool
+	 */
+	public static function is_success( array|\WP_Error $response ): bool {
+		if ( \is_wp_error( $response ) ) {
+			return false;
+		}
+		$status = (int) \wp_remote_retrieve_response_code( $response );
+		return $status >= 200 && $status < 300;
+	}
+
+	/**
+	 * 失敗回應的說明文字（訂單備註與 log 用）
+	 *
+	 * WP_Error 維持只回 message（與既有備註相同）；HTTP 錯誤帶 status、錯誤代碼與上游 message。
+	 *
+	 * @param array<string, mixed>|\WP_Error $response 回應
+	 * @return string
+	 */
+	public static function failure_message( array|\WP_Error $response ): string {
+		if ( \is_wp_error( $response ) ) {
+			return $response->get_error_message();
+		}
+		$status  = (int) \wp_remote_retrieve_response_code( $response );
+		$code    = self::error_code( $response );
+		$body    = Arr::from_json( (string) \wp_remote_retrieve_body( $response ) );
+		$message = is_string( $body['message'] ?? null ) ? $body['message'] : '';
+
+		$text = "HTTP {$status}";
+		if ( '' !== $code ) {
+			$text .= " {$code}";
+		}
+		if ( '' !== $message ) {
+			$text .= "：{$message}";
+		}
+		return $text;
 	}
 
 	/**
@@ -208,11 +301,11 @@ final class CloudClient {
 	 *
 	 * 「查身分」這類請求必須用這個：自動 fallback 到 legacy 會查到共用帳號自己的身分。
 	 *
-	 * @param string               $mode     認證模式
-	 * @param string               $method   HTTP method
-	 * @param string               $endpoint 相對路徑
-	 * @param array<string, mixed> $params   GET 為 query、其他為 JSON body
-	 * @param array{timeout?: int} $args     timeout（秒）
+	 * @param string                                           $mode     認證模式
+	 * @param string                                           $method   HTTP method
+	 * @param string                                           $endpoint 相對路徑
+	 * @param array<string, mixed>                             $params   GET 為 query、其他為 JSON body
+	 * @param array{timeout?: int, legacy_on_not_owner?: bool} $args     timeout（秒）；這裡不處理 legacy_on_not_owner
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public function request_with_mode( string $mode, string $method, string $endpoint, array $params = [], array $args = [] ): array|\WP_Error {
