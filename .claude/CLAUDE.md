@@ -203,7 +203,7 @@ PowerCloud API key 儲存方式:
 | GET | `license-codes` | customer | `author` |
 | POST | `license-codes` | admin | `post_author` |
 | GET | `license-codes/products` | admin | `user_id` |
-| POST | `license-codes/release` | customer | — |
+| POST | `license-codes/release` | customer | —（先確認授權碼歸屬） |
 | POST | `v2/change-customer` | admin | `partner_id` |
 | POST | `v2/toggle-site` | admin | `partner_id` |
 | POST | `change-domain` | customer | —（先確認站台歸屬） |
@@ -211,7 +211,7 @@ PowerCloud API key 儲存方式:
 
 - 上游 status 與 JSON body **原樣回傳**，前端 `res.data` 與舊版直連時相同；CSV 以 `Shared\RawResponse` 在 `rest_pre_serve_request` 原文輸出，只轉送 `Content-Type` 與過濾過的 `Content-Disposition`。
 - 本站沒有 partner_id → 409 `pp_not_connected`；上游連不上 → 502 `pp_upstream_unavailable`；上游回應不是 JSON → `pp_invalid_upstream_response`。
-- 非管理員存取 `apps` / `license-codes` / `license-codes/release` / `change-domain` / `toggle-ssl` 時，`customer_id` 強制為 `get_current_user_id()`；`change-domain` / `toggle-ssl` 另外先向 CloudServer 確認 body 的 `id` 屬於自己，否則 403 `not_owner`（見常見陷阱 31）。
+- 非管理員存取 `apps` / `license-codes` / `license-codes/release` / `change-domain` / `toggle-ssl` 時，`customer_id` 強制為 `get_current_user_id()`；`change-domain` / `toggle-ssl` 另外先向 CloudServer 確認 body 的 `id` 屬於自己、`license-codes/release` 先以 `GET license-codes?author=<partner>&customer_id=<自己>&posts_per_page=-1` 確認 body 的 `ids` **每一個**都屬於自己，否則 403 `not_owner`（見常見陷阱 31）。
 
 **IP Whitelist** (`/customer-notification`, `/link-site`):
 - 固定: `103.153.176.121`, `199.99.88.1`, `163.61.60.80`
@@ -361,7 +361,7 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 30. **前端「重新登入」不可先 `DELETE /connection`** — 重新登入只切換 `isReconnectingAtom` 顯示 Login，`POST /connection` 成功時才直接覆寫、失敗不動既存憑證。先 DELETE 的話，使用者在登入畫面放棄或打錯密碼，整站就斷線（開站、停用/恢復、授權碼全部失效）。同理 `useDisconnect` 失敗時不可切回登入畫面——PHP 端連線仍在，重新整理後會自動登入。
 
-31. **Proxy 的身分與歸屬由 PHP 決定，不信任瀏覽器** — `ProxyApi::ROUTES` 第 4 欄的身分參數一律以本站 `power_partner_partner_id` 覆寫；非管理員另外強制 `customer_id`；`change-domain` / `toggle-ssl` 轉送前先 `GET apps?user_id=<partner>&customer_id=<自己>` 確認 `id` 屬於該客戶（CloudServer 舊版沒有歸屬檢查），確認不了（非 200）回 502 而不是放行。新增 proxy 路由要在 `ROUTES` 逐條宣告（不用 catch-all regex），並決定 audience、是否加入 `CUSTOMER_SCOPED_ROUTES` / `CUSTOMER_OWNERSHIP_ROUTES`。`logs/{log_id}/detail` 的 regex 刻意用 `[\w\-]*`（與 CloudServer 相同），非法值要由 CloudServer 回 400，不是在這裡變 404。
+31. **Proxy 的身分與歸屬由 PHP 決定，不信任瀏覽器** — `ProxyApi::ROUTES` 第 4 欄的身分參數一律以本站 `power_partner_partner_id` 覆寫；非管理員另外強制 `customer_id`；`change-domain` / `toggle-ssl` 轉送前先 `GET apps?user_id=<partner>&customer_id=<自己>` 確認 `id` 屬於該客戶（CloudServer 舊版沒有歸屬檢查），確認不了（非 200）回 502 而不是放行。新增 proxy 路由要在 `ROUTES` 逐條宣告（不用 catch-all regex），並決定 audience、是否加入 `CUSTOMER_SCOPED_ROUTES` / `CUSTOMER_OWNERSHIP_ROUTES`（map：路徑 => 要確認的對象，`OWNERSHIP_APP` 或 `OWNERSHIP_LICENSE_CODES`）。`license-codes/release` 也要確認歸屬：CloudServer 在 legacy 模式只比對 `customer_id`，不同經銷商站上編號相同的客戶可以互相釋出對方的授權碼。`logs/{log_id}/detail` 的 regex 刻意用 `[\w\-]*`（與 CloudServer 相同），非法值要由 CloudServer 回 400，不是在這裡變 404。
 
 32. **`GET /customers`：`get_users(['include' => []])` 會回傳「全部」使用者** — 3.5.5 起此端點需登入，非管理員只能查自己（`user_ids` 不含自己 → 空陣列）。`$user_ids` 為空時必須在呼叫 `get_users()` 之前就回空，不可讓空陣列流進去，否則「過濾到空」會退化成「撈出全站會員的 email」。
 

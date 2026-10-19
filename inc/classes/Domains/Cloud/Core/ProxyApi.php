@@ -22,7 +22,7 @@ use J7\PowerPartner\Plugin;
  * - 路由逐條宣告（不用 catch-all regex），只轉送前端實際用到的端點
  * - audience：admin = manage_options（AdminApp）；customer = 其他已登入者（前台 UserApp）
  * - 身分參數一律由 PHP 覆寫，不信任瀏覽器：partner 身分 → 本站 partner_id；customer → 自己的 user id
- * - customer 改網域 / 切 SSL 前先向 CloudServer 確認該站屬於自己（CloudServer 舊版沒有歸屬檢查）
+ * - customer 改網域 / 切 SSL / 釋出授權碼前，先向 CloudServer 確認對象屬於自己（CUSTOMER_OWNERSHIP_ROUTES）
  * - 上游 status 與 JSON body 原樣回傳，前端拿到的 res.data 與直連時相同
  */
 final class ProxyApi {
@@ -58,8 +58,23 @@ final class ProxyApi {
 		[ 'toggle-ssl', 'POST', self::AUDIENCE_CUSTOMER, '' ],
 	];
 
-	/** @var array<int, string> customer 操作前必須先確認歸屬的端點（body 的 id 是 WPCD app id） */
-	const CUSTOMER_OWNERSHIP_ROUTES = [ 'change-domain', 'toggle-ssl' ];
+	const OWNERSHIP_APP           = 'app';
+	const OWNERSHIP_LICENSE_CODES = 'license_codes';
+
+	/**
+	 * customer 操作前必須先向 CloudServer 確認歸屬的端點 => 要確認的對象
+	 *
+	 * - OWNERSHIP_APP：body 的 `id` 是 WPCD app id（CloudServer 舊版沒有歸屬檢查）
+	 * - OWNERSHIP_LICENSE_CODES：body 的 `ids` 是授權碼 id（CloudServer legacy 模式只比對 customer_id，
+	 *   不同經銷商站上編號相同的客戶可以互相釋出對方的碼）
+	 *
+	 * @var array<string, string>
+	 */
+	const CUSTOMER_OWNERSHIP_ROUTES = [
+		'change-domain'         => self::OWNERSHIP_APP,
+		'toggle-ssl'            => self::OWNERSHIP_APP,
+		'license-codes/release' => self::OWNERSHIP_LICENSE_CODES,
+	];
 
 	/** @var array<int, string> customer 存取時必須強制 customer_id 的端點 */
 	const CUSTOMER_SCOPED_ROUTES = [ 'apps', 'license-codes', 'license-codes/release', 'change-domain', 'toggle-ssl' ];
@@ -136,8 +151,11 @@ final class ProxyApi {
 			$params['customer_id'] = (string) \get_current_user_id();
 		}
 
-		if ( $is_customer && in_array( $path, self::CUSTOMER_OWNERSHIP_ROUTES, true ) ) {
-			$denied = $this->deny_unless_customer_owns( (int) ( $params['id'] ?? 0 ), $partner_id );
+		$ownership = $is_customer ? ( self::CUSTOMER_OWNERSHIP_ROUTES[ $path ] ?? null ) : null;
+		if ( null !== $ownership ) {
+			$denied = self::OWNERSHIP_APP === $ownership
+				? $this->deny_unless_customer_owns( (int) ( $params['id'] ?? 0 ), $partner_id )
+				: $this->deny_unless_customer_owns_license_codes( $params['ids'] ?? null, $partner_id );
 			if ( null !== $denied ) {
 				return $denied;
 			}
@@ -247,13 +265,7 @@ final class ProxyApi {
 			[ 'timeout' => 60 ]
 		);
 		if ( \is_wp_error( $response ) || 200 !== (int) \wp_remote_retrieve_response_code( $response ) ) {
-			return new \WP_REST_Response(
-				[
-					'code'    => 'pp_upstream_unavailable',
-					'message' => '暫時無法確認網站歸屬，請稍後再試',
-				],
-				502
-			);
+			return self::ownership_unverifiable( '暫時無法確認網站歸屬，請稍後再試' );
 		}
 
 		$body = Arr::from_json( (string) \wp_remote_retrieve_body( $response ) );
@@ -264,6 +276,76 @@ final class ProxyApi {
 			}
 		}
 		return $denied;
+	}
+
+	/**
+	 * customer 只能釋出自己的授權碼：向 CloudServer 取「這個經銷商 × 這個客戶」的授權碼清單確認
+	 *
+	 * @param mixed  $ids        body 的 ids
+	 * @param string $partner_id 經銷商 id
+	 * @return \WP_REST_Response|null 任一個不屬於自己時回 403，全部屬於自己回 null
+	 */
+	private function deny_unless_customer_owns_license_codes( mixed $ids, string $partner_id ): ?\WP_REST_Response {
+		$denied = new \WP_REST_Response(
+			[
+				'code'    => 'not_owner',
+				'message' => '你沒有權限釋出這些授權碼',
+			],
+			403
+		);
+		if ( ! is_array( $ids ) || [] === $ids ) {
+			return $denied;
+		}
+
+		$wanted = [];
+		foreach ( $ids as $id ) {
+			if ( ! is_numeric( $id ) || (int) $id <= 0 ) {
+				return $denied;
+			}
+			$wanted[] = (int) $id;
+		}
+
+		$response = CloudClient::instance()->request(
+			'GET',
+			'license-codes',
+			[
+				'author'         => $partner_id,
+				'customer_id'    => (string) \get_current_user_id(),
+				'posts_per_page' => -1,
+			],
+			[ 'timeout' => 60 ]
+		);
+		if ( \is_wp_error( $response ) || 200 !== (int) \wp_remote_retrieve_response_code( $response ) ) {
+			return self::ownership_unverifiable( '暫時無法確認授權碼歸屬，請稍後再試' );
+		}
+
+		$body  = Arr::from_json( (string) \wp_remote_retrieve_body( $response ) );
+		$owned = [];
+		foreach ( Arr::assoc( Arr::assoc( $body['data'] ?? null )['list'] ?? null ) as $license_code ) {
+			$owned[ (int) ( Arr::assoc( $license_code )['id'] ?? 0 ) ] = true;
+		}
+		foreach ( $wanted as $id ) {
+			if ( ! isset( $owned[ $id ] ) ) {
+				return $denied;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * 確認不了歸屬時一律不放行
+	 *
+	 * @param string $message 訊息
+	 * @return \WP_REST_Response
+	 */
+	private static function ownership_unverifiable( string $message ): \WP_REST_Response {
+		return new \WP_REST_Response(
+			[
+				'code'    => 'pp_upstream_unavailable',
+				'message' => $message,
+			],
+			502
+		);
 	}
 
 	/**

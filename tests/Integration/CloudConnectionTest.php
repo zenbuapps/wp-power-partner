@@ -1047,4 +1047,89 @@ class CloudConnectionTest extends TestCase {
 		$this->assertNotNull( CredentialStore::get_dealer() );
 		$this->assertSame( [], $this->sent( 'DELETE', 'v3/connect' ) );
 	}
+
+	// ========== 客戶釋出授權碼前確認授權碼屬於自己 ==========
+
+	/**
+	 * @param array<int, int> $ids 這位客戶在這個經銷商底下擁有的授權碼 id
+	 * @return void
+	 */
+	private function given_customer_license_codes( array $ids ): void {
+		$this->routes['GET license-codes'] = [
+			200,
+			[
+				'status'  => 200,
+				'message' => 'success',
+				'data'    => [
+					'list'       => array_map( static fn( $id ) => [ 'id' => $id, 'status' => 'activated' ], $ids ),
+					'pagination' => [ 'total' => count( $ids ) ],
+				],
+			],
+		];
+	}
+
+	/**
+	 * CloudServer legacy 模式只比對 customer_id：不同經銷商站上編號相同的客戶，可以互相釋出對方的授權碼
+	 *
+	 * @group security
+	 */
+	public function test_proxy一般會員不能釋出別人的授權碼(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->given_customer_license_codes( [ 10 ] );
+
+		$response = $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 10, 11 ] ] );
+
+		$this->assertSame( 403, $response->get_status() );
+		$this->assertSame( 'not_owner', $response->get_data()['code'] ?? null );
+		$this->assertSame( [], $this->sent( 'POST', 'license-codes/release' ), '只要有一個不是自己的就不可轉送' );
+
+		$query = $this->sent( 'GET', 'license-codes' )[0]['query'];
+		$this->assertSame( '777', $query['author'] ?? null, '以本站經銷商查' );
+		$this->assertSame( (string) $this->customer_id, $query['customer_id'] ?? null, '只查這位客戶自己的' );
+		$this->assertSame( '-1', $query['posts_per_page'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_proxy一般會員可以釋出自己的授權碼(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->given_customer_license_codes( [ 10, 11 ] );
+		$this->routes['POST license-codes/release'] = [ 200, [ 'code' => 'release_success', 'message' => 'ok', 'data' => [ 'ids' => [ 10, 11 ] ] ] ];
+
+		$response = $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 10, 11 ] ] );
+
+		$this->assertSame( 200, $response->get_status() );
+		$sent = $this->sent( 'POST', 'license-codes/release' )[0];
+		$this->assertSame( [ 10, 11 ], $sent['body']['ids'] ?? null );
+		$this->assertSame( (string) $this->customer_id, $sent['body']['customer_id'] ?? null );
+	}
+
+	/** @group error */
+	public function test_proxy確認不了授權碼歸屬時不放行(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->routes['GET license-codes'] = [ 500, [ 'code' => 'x', 'message' => 'x' ] ];
+
+		$response = $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 10 ] ] );
+
+		$this->assertSame( 502, $response->get_status() );
+		$this->assertSame( [], $this->sent( 'POST', 'license-codes/release' ) );
+	}
+
+	/** @group security */
+	public function test_proxy釋出授權碼的ids格式不對時拒絕(): void {
+		\wp_set_current_user( $this->customer_id );
+		$this->given_customer_license_codes( [ 10 ] );
+
+		$this->assertSame( 403, $this->proxy( 'POST', 'license-codes/release', [] )->get_status() );
+		$this->assertSame( 403, $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 'abc' ] ] )->get_status() );
+		$this->assertSame( [], $this->sent( 'POST', 'license-codes/release' ) );
+	}
+
+	/** @group happy */
+	public function test_proxy管理員釋出授權碼不需確認歸屬(): void {
+		\wp_set_current_user( $this->admin_id );
+		$this->routes['POST license-codes/release'] = [ 200, [ 'code' => 'release_success', 'message' => 'ok' ] ];
+
+		$this->assertSame( 200, $this->proxy( 'POST', 'license-codes/release', [ 'ids' => [ 99 ] ] )->get_status() );
+		$this->assertSame( [], $this->sent( 'GET', 'license-codes' ) );
+	}
 }
