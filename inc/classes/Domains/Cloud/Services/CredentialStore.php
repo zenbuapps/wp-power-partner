@@ -57,6 +57,14 @@ abstract class CredentialStore {
 	const LEGACY_REJECTED_TTL = 86400;
 
 	/**
+	 * @var string 「帳密已被拒」標記的特殊 reason：這個帳號需要互動式驗證（登入驗證碼、兩步驟驗證）
+	 *
+	 * 永久性的：本站自動送出的真實密碼永遠過不了，每試一次還會被 Fluent Security 計數、可能寄出 2FA 驗證信。
+	 * 所以**不適用 24 小時過期重試**，只有經銷商手動登入成功（save_legacy_account / delete_legacy_account）才清除。
+	 */
+	const REJECTED_LOGIN_CHALLENGE = 'login_challenge';
+
+	/**
 	 * @var string 共用帳號（legacy）的健康狀態 `{disabled_at, reason, ok_at}`
 	 *
 	 * - disabled_at：CloudServer 停用或撤銷共用帳號（試關回 legacy_auth_disabled；根除後 core 回
@@ -344,13 +352,29 @@ abstract class CredentialStore {
 	}
 
 	/**
-	 * 經銷商登入帳密是否在「已被拒」的有效期內（24 小時後自動過期，允許再試一次）
+	 * 經銷商登入帳密是否在「已被拒」的有效期內
+	 *
+	 * 帳密錯誤 24 小時後自動過期、允許再試一次；login_challenge 不過期（見 REJECTED_LOGIN_CHALLENGE）。
 	 *
 	 * @return bool
 	 */
 	public static function is_legacy_account_rejected(): bool {
+		return '' !== self::legacy_account_rejected_reason();
+	}
+
+	/**
+	 * @return string 有效中的「帳密已被拒」原因；沒有標記或已過期時為空字串
+	 */
+	public static function legacy_account_rejected_reason(): string {
 		$stored = \get_option( self::LEGACY_REJECTED_OPTION, false );
-		return is_array( $stored ) && ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_REJECTED_TTL;
+		if ( ! is_array( $stored ) ) {
+			return '';
+		}
+		$reason = (string) ( $stored['reason'] ?? '' );
+		if ( self::REJECTED_LOGIN_CHALLENGE === $reason ) {
+			return $reason;
+		}
+		return ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_REJECTED_TTL ? ( '' !== $reason ? $reason : 'rejected' ) : '';
 	}
 
 	/**

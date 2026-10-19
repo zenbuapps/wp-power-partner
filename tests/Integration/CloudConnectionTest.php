@@ -1397,4 +1397,194 @@ class CloudConnectionTest extends TestCase {
 		$this->assertSame( 'not_owner', CloudClient::error_code( $response ), '訂單備註要看得到真正原因' );
 		$this->assertTrue( CredentialStore::is_legacy_disabled() );
 	}
+
+	// ========== 第五輪：帳號需要互動式驗證（login_challenge）、遷移長期 pending ==========
+
+	/** CloudServer 契約：登入驗證碼、two-factor、email 2FA 讓 wp_authenticate 失敗時回 403 login_challenge */
+	private const LOGIN_CHALLENGE = [ 403, '{"code":"login_challenge","message":"此帳號需要登入驗證碼或兩步驟驗證，請改用瀏覽器登入站長路可","data":{"status":403,"error_code":"login_challenge"}}' ];
+
+	/** @return int 閘門目前的失敗次數 */
+	private function gate_failures(): int {
+		$gate = \get_option( ConnectionService::REAL_PASSWORD_GATE_OPTION, [] );
+		return is_array( $gate ) ? count( (array) ( $gate['failures'] ?? [] ) ) : 0;
+	}
+
+	/** @group error */
+	public function test_遷移收到login_challenge標成failed寫入標記且之後不再送出真實密碼(): void {
+		\wp_set_current_user( $this->admin_id );
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = self::LOGIN_CHALLENGE;
+
+		Migration::run();
+
+		$migration = ConnectionService::migration();
+		$this->assertSame( ConnectionService::MIGRATION_FAILED, $migration['status'] );
+		$this->assertSame( ConnectionService::EXCHANGE_LOGIN_CHALLENGE, $migration['reason'] );
+		$this->assertSame( CredentialStore::REJECTED_LOGIN_CHALLENGE, CredentialStore::legacy_account_rejected_reason() );
+		$this->assertFalse( Migration::needs_migration() );
+		$this->assertSame( 0, $this->gate_failures(), '不是帳密錯誤，不計入閘門' );
+		$this->assertTrue( ConnectionService::may_send_real_password(), '也不是 429，不觸發冷卻' );
+
+		ConnectionService::status();
+		$detail = $this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+		Migration::run();
+
+		$this->assertSame( 401, $detail->get_status() );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ), 'status() 不可再送出（每試一次都會被 Fluent 計數、可能寄 2FA 信）' );
+		$this->assertSame( [], $this->sent( 'POST', 'logs/abc-1/detail' ), '明細下載也不可再送出' );
+		$this->assertCount( 1, $this->sent( 'POST', 'v3/connect' ) );
+
+		$attention = ConnectionService::attention();
+		$this->assertSame( '此帳號啟用了登入驗證碼或兩步驟驗證，無法自動換成專屬密碼，請聯繫站長路可協助。', $attention['message'] ?? null );
+		$this->assertSame( ConnectionService::SCOPE_POWER_PARTNER, $attention['scope'] ?? null );
+	}
+
+	/**
+	 * login_challenge 是永久性的：不適用 24 小時過期重試
+	 *
+	 * @group error
+	 */
+	public function test_login_challenge標記不會過期(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		\update_option(
+			CredentialStore::LEGACY_REJECTED_OPTION,
+			[
+				'reason' => CredentialStore::REJECTED_LOGIN_CHALLENGE,
+				'at'     => time() - CredentialStore::LEGACY_REJECTED_TTL * 10,
+			],
+			false
+		);
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+
+		ConnectionService::status();
+
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ) );
+	}
+
+	/** @group error */
+	public function test_status收到login_challenge寫入標記且不計入閘門(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['POST identity'] = self::LOGIN_CHALLENGE;
+
+		$result = ConnectionService::status();
+		ConnectionService::status();
+
+		$this->assertSame( 401, $result['status'] );
+		$this->assertSame( '此帳號啟用了登入驗證碼或兩步驟驗證，無法自動換成專屬密碼，請聯繫站長路可協助。', $result['message'] );
+		$this->assertSame( CredentialStore::REJECTED_LOGIN_CHALLENGE, CredentialStore::legacy_account_rejected_reason() );
+		$this->assertCount( 1, $this->sent( 'POST', 'identity' ) );
+		$this->assertSame( 0, $this->gate_failures() );
+	}
+
+	/** @group error */
+	public function test_明細下載收到login_challenge寫入標記之後不再送出(): void {
+		\wp_set_current_user( $this->admin_id );
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		$this->routes['POST logs/abc-1/detail'] = self::LOGIN_CHALLENGE;
+
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+		$this->proxy( 'POST', 'logs/abc-1/detail', [ 'format' => 'json' ] );
+
+		$this->assertSame( CredentialStore::REJECTED_LOGIN_CHALLENGE, CredentialStore::legacy_account_rejected_reason() );
+		$this->assertCount( 1, $this->sent( 'POST', 'logs/abc-1/detail' ) );
+	}
+
+	/** @group happy */
+	public function test_手動登入收到login_challenge回傳server訊息_成功登入才清除標記(): void {
+		CredentialStore::save_legacy_account( self::OLD_EMAIL, self::OLD_PASSWORD );
+		CredentialStore::mark_legacy_account_rejected( CredentialStore::REJECTED_LOGIN_CHALLENGE );
+		$this->routes['POST v3/connect'] = self::LOGIN_CHALLENGE;
+
+		$failed = ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD );
+
+		$this->assertSame( 403, $failed['status'] );
+		$this->assertSame( '此帳號需要登入驗證碼或兩步驟驗證，請改用瀏覽器登入站長路可', $failed['message'] );
+		$this->assertSame( [], $this->sent( 'POST', 'identity' ), '不退回舊流程（identity 一樣過不了）' );
+		$this->assertTrue( CredentialStore::is_legacy_account_rejected() );
+
+		$this->routes['POST v3/connect'] = [
+			200,
+			[
+				'user_login'   => self::DEALER_LOGIN,
+				'app_password' => self::DEALER_PASSWORD,
+				'identity'     => $this->identity_data(),
+			],
+		];
+		$this->assertSame( 200, ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD )['status'] );
+		$this->assertFalse( CredentialStore::is_legacy_account_rejected() );
+		$this->assertNull( ConnectionService::attention() );
+	}
+
+	/**
+	 * login_challenge 只出現在真實密碼的路徑，不是「專屬密碼被拒」：不可觸發 dealer → legacy 重送
+	 *
+	 * @group security
+	 */
+	public function test_login_challenge不算專屬密碼被拒(): void {
+		$response = [
+			'headers'  => [],
+			'body'     => self::LOGIN_CHALLENGE[1],
+			'response' => [ 'code' => 403 ],
+		];
+
+		$this->assertTrue( ConnectionService::is_login_challenge( $response ) );
+		$this->assertFalse( CloudClient::is_credential_rejected( $response ) );
+		$this->assertNotContains( ConnectionService::LOGIN_CHALLENGE_CODE, CloudClient::CREDENTIAL_REJECTED_CODES );
+	}
+
+	/** @group happy */
+	public function test_遷移連續停在pending滿3天才提示(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$this->routes['POST v3/connect'] = self::RATE_LIMITED;
+		Migration::run();
+		$this->assertNull( ConnectionService::attention(), '剛開始 pending，不打擾經銷商' );
+
+		$this->set_pending_since( time() - ConnectionService::MIGRATION_STUCK_AFTER + 3600 );
+		$this->assertNull( ConnectionService::attention(), '未滿 3 天不顯示' );
+
+		$this->set_pending_since( time() - ConnectionService::MIGRATION_STUCK_AFTER - 1 );
+		$attention = ConnectionService::attention();
+		$this->assertSame( 'migration_stuck', $attention['code'] ?? null );
+		$this->assertSame( '已連續 3 天無法自動換成專屬密碼，請到 Power Partner 重新登入一次；若仍失敗請聯繫站長路可。', $attention['message'] ?? null );
+		$this->assertSame( ConnectionService::SCOPE_POWER_PARTNER, $attention['scope'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_每天重試仍pending時保留起點_手動登入重新起算(): void {
+		\update_option( CredentialStore::OLD_ACCOUNT_INFO_OPTION, self::OLD_CIPHER );
+		$since = time() - ConnectionService::MIGRATION_STUCK_AFTER - 1;
+		$this->set_pending_since( $since );
+		$this->routes['POST v3/connect'] = [ 500, [ 'code' => 'x', 'message' => 'x' ] ];
+
+		Migration::run();
+		$this->assertSame( $since, ConnectionService::migration()['since'], '每日重試失敗不重設起點' );
+		$this->assertSame( 'migration_stuck', ConnectionService::attention()['code'] ?? null );
+
+		// 手動重新登入：CloudServer 尚無 v3/connect → 退回舊流程成功，遷移仍是 pending
+		unset( $this->routes['POST v3/connect'] );
+		\delete_option( ConnectionService::REAL_PASSWORD_GATE_OPTION );
+		$this->routes['POST identity'] = [ 200, [ 'status' => 200, 'message' => 'success', 'data' => $this->identity_data() ] ];
+		$this->assertSame( 200, ConnectionService::connect( self::OLD_EMAIL, self::OLD_PASSWORD )['status'] );
+		$this->assertSame( ConnectionService::MIGRATION_PENDING, ConnectionService::migration()['status'] );
+		$this->assertGreaterThan( $since, ConnectionService::migration()['since'], '手動重新登入 = 照提示做了，重新起算' );
+		$this->assertNull( ConnectionService::attention() );
+	}
+
+	/**
+	 * @param int $since pending 的起點
+	 * @return void
+	 */
+	private function set_pending_since( int $since ): void {
+		\update_option(
+			ConnectionService::MIGRATION_OPTION,
+			[
+				'status' => ConnectionService::MIGRATION_PENDING,
+				'reason' => ConnectionService::EXCHANGE_RATE_LIMITED,
+				'at'     => time(),
+				'since'  => $since,
+			],
+			false
+		);
+	}
 }

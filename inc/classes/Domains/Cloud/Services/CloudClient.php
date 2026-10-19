@@ -53,6 +53,8 @@ final class CloudClient {
 	 *
 	 * ⛔ 不可加入 partner_mismatch / not_owner 這類「身分正確但無權操作」的代碼：
 	 * 那是 CloudServer 正確地拒絕越權，換成 legacy 重送等於繞過檢查。
+	 * ⛔ 也不可加入 login_challenge：它只出現在真實密碼的路徑（帳號需要驗證碼 / 2FA），不是專屬密碼被拒，
+	 * 由 ConnectionService 寫停止標記處理（見 ConnectionService::LOGIN_CHALLENGE_CODE）。
 	 * （授權碼作者不符的窄例外另見 LEGACY_ON_NOT_OWNER_ENDPOINTS，需呼叫端明確開啟）
 	 *
 	 * @var array<int, string>

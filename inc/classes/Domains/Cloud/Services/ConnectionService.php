@@ -45,6 +45,19 @@ abstract class ConnectionService {
 	const EXCHANGE_RATE_LIMITED     = 'rate_limited';
 	const EXCHANGE_TEMPORARY        = 'temporary';        // 連線錯誤、5xx
 	const EXCHANGE_PARTNER_MISMATCH = 'partner_mismatch'; // 換到的帳號不是本站綁定的經銷商（只在自動遷移比對）
+	const EXCHANGE_LOGIN_CHALLENGE  = 'login_challenge';  // 帳號需要互動式驗證（驗證碼、2FA），自動送出永遠過不了
+
+	/**
+	 * @var string CloudServer 回「需要互動式驗證」的 data.error_code（HTTP 403）
+	 *
+	 * 登入驗證碼、two-factor、Fluent 的 email 2FA 都會讓 wp_authenticate() 失敗，但不是帳密錯誤。
+	 * 永久性的：重試也不會成功，而且每試一次都會被 Fluent 計數、email 2FA 還會寄一封驗證信給經銷商。
+	 * ⛔ 它只會出現在真實密碼的路徑上，不是「專屬密碼被拒」（不可加進 CloudClient::CREDENTIAL_REJECTED_CODES）。
+	 */
+	const LOGIN_CHALLENGE_CODE = 'login_challenge';
+
+	/** @var int 遷移連續停在 pending 多久就提示經銷商（3 天） */
+	const MIGRATION_STUCK_AFTER = 259200;
 
 	/**
 	 * @var string 本站唯一的「真實密碼閘門」狀態 `{failures: int[], cooldown_until: int}`
@@ -122,6 +135,11 @@ abstract class ConnectionService {
 			return self::temporarily_unverifiable();
 		}
 		CloudClient::note_legacy_outcome( $response );
+		// 需要互動式驗證：永久不再自動送出，請經銷商聯繫站長路可
+		if ( self::is_login_challenge( $response ) ) {
+			CredentialStore::mark_legacy_account_rejected( CredentialStore::REJECTED_LOGIN_CHALLENGE );
+			return self::relogin_required();
+		}
 		$body = self::identity_body( $response );
 		if ( 200 !== (int) ( $body['status'] ?? 0 ) ) {
 			// 明確的「帳密錯誤」（經銷商改過密碼）→ 24 小時內不再重送，請他重新登入
@@ -179,10 +197,18 @@ abstract class ConnectionService {
 			];
 		}
 
+		// 需要互動式驗證：回傳 CloudServer 的說明，不退回舊流程（identity 也一樣過不了）
+		if ( self::EXCHANGE_LOGIN_CHALLENGE === $exchange['result'] ) {
+			return self::login_challenge_response( (string) $exchange['message'] );
+		}
+
 		// CloudServer 尚未支援 / 帳號不符資格 / 暫時錯誤 → 舊流程，與 3.5.x 行為相同（又一次真實密碼請求，同樣過閘門）
 		$response = self::send_legacy_identity( $email, $password );
 		if ( self::is_gated( $response ) || self::is_rate_limited( $response ) ) {
 			return self::gate_blocked();
+		}
+		if ( self::is_login_challenge( $response ) ) {
+			return self::login_challenge_response( (string) ( self::decode( $response )['message'] ?? '' ) );
 		}
 		$body = self::identity_body( $response );
 		if ( 200 !== (int) ( $body['status'] ?? 0 ) ) {
@@ -197,7 +223,8 @@ abstract class ConnectionService {
 		self::after_login( Arr::assoc( $body['data'] ?? null ) );
 		self::set_migration(
 			self::EXCHANGE_NOT_ELIGIBLE === $exchange['result'] ? self::MIGRATION_FAILED : self::MIGRATION_PENDING,
-			(string) $exchange['result']
+			(string) $exchange['result'],
+			true // 手動重新登入 = 照提示做了，pending 天數重新起算
 		);
 
 		return self::with_connection( $body, CloudClient::MODE_LEGACY );
@@ -267,6 +294,9 @@ abstract class ConnectionService {
 		// 429 一律是暫時性的（CloudServer 限流；IP 被封鎖、驗證碼、2FA 也以 429 回覆），不可當成帳密錯誤
 		if ( self::is_rate_limited( $response ) ) {
 			return self::exchange_result( self::EXCHANGE_RATE_LIMITED, self::GATE_MESSAGE );
+		}
+		if ( self::is_login_challenge( $response ) ) {
+			return self::exchange_result( self::EXCHANGE_LOGIN_CHALLENGE, $message );
 		}
 		if ( 403 === $status && 'not_eligible' === $code ) {
 			return self::exchange_result( self::EXCHANGE_NOT_ELIGIBLE, $message );
@@ -371,7 +401,7 @@ abstract class ConnectionService {
 	/**
 	 * 自動遷移狀態
 	 *
-	 * @return array{status: string, reason: string, at: int}
+	 * @return array{status: string, reason: string, at: int, since: int} since = 連續停在 pending 的起點（其他狀態為 0）
 	 */
 	public static function migration(): array {
 		$stored = \get_option( self::MIGRATION_OPTION, [] );
@@ -384,24 +414,61 @@ abstract class ConnectionService {
 			'status' => $status,
 			'reason' => (string) ( $stored['reason'] ?? '' ),
 			'at'     => (int) ( $stored['at'] ?? 0 ),
+			'since'  => self::MIGRATION_PENDING === $status ? (int) ( $stored['since'] ?? $stored['at'] ?? 0 ) : 0,
 		];
 	}
 
 	/**
-	 * @param string $status 狀態
-	 * @param string $reason 原因
+	 * @param string $status  狀態
+	 * @param string $reason  原因
+	 * @param bool   $restart pending 天數是否重新起算（手動重新登入時）；否則連續的 pending 保留原本的起點
 	 * @return void
 	 */
-	public static function set_migration( string $status, string $reason = '' ): void {
+	public static function set_migration( string $status, string $reason = '', bool $restart = false ): void {
+		$previous = self::migration();
+		$since    = 0;
+		if ( self::MIGRATION_PENDING === $status ) {
+			$since = ! $restart && self::MIGRATION_PENDING === $previous['status'] && $previous['since'] > 0 ? $previous['since'] : time();
+		}
 		\update_option(
 			self::MIGRATION_OPTION,
 			[
 				'status' => $status,
 				'reason' => $reason,
 				'at'     => time(),
+				'since'  => $since,
 			],
 			false
 		);
+	}
+
+	/**
+	 * CloudServer 是否回覆「這個帳號需要互動式驗證」（見 LOGIN_CHALLENGE_CODE）
+	 *
+	 * @param array<string, mixed>|\WP_Error $response 回應
+	 * @return bool
+	 */
+	public static function is_login_challenge( array|\WP_Error $response ): bool {
+		if ( \is_wp_error( $response ) ) {
+			return false;
+		}
+		$http   = (int) \wp_remote_retrieve_response_code( $response );
+		$status = (int) ( self::decode( $response )['status'] ?? $http );
+		return ( 403 === $http || 403 === $status ) && self::LOGIN_CHALLENGE_CODE === CloudClient::error_code( $response );
+	}
+
+	/**
+	 * 手動登入遇到 login_challenge：回傳 CloudServer 的說明
+	 *
+	 * @param string $message CloudServer 的 message
+	 * @return array<string, mixed>
+	 */
+	private static function login_challenge_response( string $message ): array {
+		return [
+			'status'     => 403,
+			'message'    => '' !== $message ? $message : '此帳號需要登入驗證碼或兩步驟驗證，無法在這裡登入，請聯繫站長路可協助。',
+			'connection' => [ 'mode' => CloudClient::MODE_NONE ],
+		];
 	}
 
 	/**
@@ -531,7 +598,8 @@ abstract class ConnectionService {
 	 * @return void
 	 */
 	public static function record_real_password_outcome( array|\WP_Error $response, string $kind ): void {
-		if ( \is_wp_error( $response ) ) {
+		// 連線錯誤：CloudServer 沒收到。login_challenge：永久性的，由呼叫端寫停止標記，不算帳密失敗也不冷卻
+		if ( \is_wp_error( $response ) || self::is_login_challenge( $response ) ) {
 			return;
 		}
 		$gate = self::gate();
@@ -616,8 +684,23 @@ abstract class ConnectionService {
 		$dealer_usable = null !== CredentialStore::get_dealer() && ! CredentialStore::is_dealer_invalid();
 		$unaffected    = CredentialStore::legacy_ok_recently() ? '目前功能不受影響。' : '';
 
+		$rejected      = CredentialStore::legacy_account_rejected_reason();
+
 		if ( ! $dealer_usable && self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_PARTNER_MISMATCH === $migration['reason'] ) {
 			return self::attention_item( 'partner_mismatch', '本站綁定的經銷商與登入帳號不同，請重新登入。', true );
+		}
+		// 需要互動式驗證：重新登入也一樣過不了，要站長路可協助。共用帳號停用後就是真的斷線，改成全域顯示
+		if (
+			! $dealer_usable
+			&& ( CredentialStore::REJECTED_LOGIN_CHALLENGE === $rejected
+				|| ( self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_LOGIN_CHALLENGE === $migration['reason'] ) )
+		) {
+			return self::attention_item(
+				'login_challenge',
+				'此帳號啟用了登入驗證碼或兩步驟驗證，無法自動換成專屬密碼，請聯繫站長路可協助。',
+				false,
+				$legacy_down ? self::SCOPE_GLOBAL : self::SCOPE_POWER_PARTNER
+			);
 		}
 		if ( ! $dealer_usable && self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_NOT_ELIGIBLE === $migration['reason'] ) {
 			return self::attention_item( 'not_eligible', '此帳號目前不符合經銷商資格，共用帳號停用後將無法使用雲端功能，請聯繫站長路可。', false );
@@ -626,13 +709,22 @@ abstract class ConnectionService {
 			return self::attention_item( 'disconnected', '雲端連線已中斷，請重新登入。', true );
 		}
 		if (
-			CredentialStore::is_legacy_account_rejected()
+			( '' !== $rejected && CredentialStore::REJECTED_LOGIN_CHALLENGE !== $rejected )
 			|| ( self::MIGRATION_FAILED === $migration['status'] && self::EXCHANGE_BAD_PASSWORD === $migration['reason'] )
 		) {
 			return self::attention_item( 'credentials_rejected', "雲端帳密已失效，請重新登入一次。{$unaffected}", true );
 		}
 		if ( CredentialStore::is_dealer_invalid() ) {
 			return self::attention_item( 'dealer_rejected', "站長路可拒絕了本站的專屬金鑰，請重新登入一次。{$unaffected}", true );
+		}
+		// 遷移一直停在 pending（不論原因，例如每天都 429）：背景自己好不了，請經銷商手動試一次
+		if (
+			! $dealer_usable
+			&& self::MIGRATION_PENDING === $migration['status']
+			&& $migration['since'] > 0
+			&& ( time() - $migration['since'] ) >= self::MIGRATION_STUCK_AFTER
+		) {
+			return self::attention_item( 'migration_stuck', '已連續 3 天無法自動換成專屬密碼，請到 Power Partner 重新登入一次；若仍失敗請聯繫站長路可。', true, self::SCOPE_POWER_PARTNER );
 		}
 		// 有 partner_id 卻讀不到任何憑證（salts 重產、站台 host 改變、帳密只存在瀏覽器的很早期站）：只靠寫死的共用帳號在運作。
 		// 模板站或 clone 站也可能帶著 partner_id，終端客戶看不懂，所以只在 Power Partner 頁面與 wp-admin 首頁提示

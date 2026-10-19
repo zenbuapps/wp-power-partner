@@ -18,6 +18,7 @@ use J7\PowerPartner\Plugin;
  *   改由 admin notice 請經銷商重新登入一次；在那之前一律走共用帳號，功能不受影響
  * - 不符經銷商資格（403 not_eligible）→ 停止，維持共用帳號（由 CloudServer 管理員決定是否放行）
  * - 換到的帳號不是本站綁定的經銷商 → 不保存、撤銷那把密碼、停止，請經銷商重新登入（以登入者為準）
+ * - 帳號需要互動式驗證（403 login_challenge：驗證碼、2FA）→ 停止，並永久不再自動送出真實密碼，請經銷商聯繫站長路可
  * - 429 / 5xx / 連線錯誤 → 明天再試
  *
  * 不寄信：通知經銷商由營運方自行處理。
@@ -109,8 +110,13 @@ final class Migration {
 			case ConnectionService::EXCHANGE_BAD_PASSWORD:
 			case ConnectionService::EXCHANGE_NOT_ELIGIBLE:
 			case ConnectionService::EXCHANGE_PARTNER_MISMATCH:
+			case ConnectionService::EXCHANGE_LOGIN_CHALLENGE:
 				if ( ConnectionService::EXCHANGE_BAD_PASSWORD === $exchange['result'] ) {
 					CredentialStore::mark_legacy_account_rejected( $exchange['result'] );
+				}
+				// 需要互動式驗證：永久停止自動送出（每試一次都會被 Fluent 計數、email 2FA 還會寄驗證信）
+				if ( ConnectionService::EXCHANGE_LOGIN_CHALLENGE === $exchange['result'] ) {
+					CredentialStore::mark_legacy_account_rejected( CredentialStore::REJECTED_LOGIN_CHALLENGE );
 				}
 				ConnectionService::set_migration( ConnectionService::MIGRATION_FAILED, $exchange['result'] );
 				Plugin::logger(

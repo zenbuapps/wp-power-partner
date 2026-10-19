@@ -246,6 +246,8 @@ final class ProxyApi {
 			}
 			if ( ConnectionService::is_password_rejected( $response ) ) {
 				CredentialStore::mark_legacy_account_rejected( ConnectionService::EXCHANGE_BAD_PASSWORD );
+			} elseif ( ConnectionService::is_login_challenge( $response ) ) {
+				CredentialStore::mark_legacy_account_rejected( CredentialStore::REJECTED_LOGIN_CHALLENGE );
 			}
 			return $response;
 		}
