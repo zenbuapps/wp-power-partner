@@ -40,13 +40,15 @@ final class User {
 			]
 		);
 
+		// UserApp（前台 shortcode）會用自己的 user id 查自己的資料，所以只要求登入；
+		// 非管理員能查到的範圍由 callback 收斂到本人，避免傳任意 id 撈出其他會員的 email
 		\register_rest_route(
 			Plugin::$kebab,
 			'customers',
 			[
 				'methods'             => 'GET',
 				'callback'            => [ $this, 'get_customers_callback' ],
-				'permission_callback' => '__return_true',
+				'permission_callback' => 'is_user_logged_in',
 			]
 		);
 	}
@@ -143,6 +145,21 @@ final class User {
 				],
 				500
 			);
+		}
+
+		if ( ! \current_user_can( 'manage_options' ) ) {
+			$current_user_id = \get_current_user_id();
+			$user_ids        = in_array( (string) $current_user_id, array_map( 'strval', (array) $user_ids ), true )
+				? [ $current_user_id ]
+				: [];
+		}
+
+		// get_users 的 include 為空陣列時會回傳「全部」使用者，必須在這裡擋掉
+		if ( empty( $user_ids ) ) {
+			$response = new \WP_REST_Response( [] );
+			$response->header( 'X-WP-Total', '0' );
+			$response->header( 'X-WP-TotalPages', '1' );
+			return $response;
 		}
 
 		$users = \get_users(

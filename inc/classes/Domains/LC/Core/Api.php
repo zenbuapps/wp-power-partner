@@ -7,7 +7,7 @@ namespace J7\PowerPartner\Domains\LC\Core;
 use J7\WpUtils\Classes\WP;
 use J7\WpUtils\Classes\ApiBase;
 use J7\WpUtils\Classes\General;
-use J7\Powerhouse\Api\Base as CloudApi;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient as CloudApi;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Status;
 
 /** Class Api */
@@ -67,10 +67,21 @@ final class Api extends ApiBase {
 		$body = \wp_remote_retrieve_body($response);
 		$data = General::json_parse($body, []);
 
+		// 上游的業務錯誤（如 403 not_owner）原樣回給 AdminApp，否則畫面會顯示「更新成功」
 		return new \WP_REST_Response(
 			$data,
-			200
+			self::status_of($response)
 			);
+	}
+
+	/**
+	 * 回給 AdminApp 的 HTTP status：上游 2xx 一律 200（與舊版相同），否則沿用上游 status
+	 *
+	 * @param array<string, mixed> $response CloudServer 回應
+	 * @return int
+	 */
+	private static function status_of( array $response ): int {
+		return CloudApi::is_success($response) ? 200 : (int) \wp_remote_retrieve_response_code($response);
 	}
 
 	/**
@@ -199,7 +210,7 @@ final class Api extends ApiBase {
 
 		return new \WP_REST_Response(
 			$data,
-			200
+			self::status_of($response)
 			);
 	}
 

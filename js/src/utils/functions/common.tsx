@@ -1,7 +1,5 @@
+import { isAxiosError } from 'axios'
 import React from 'react'
-import { kebab, LOCALSTORAGE_ACCOUNT_KEY } from '@/utils'
-import AES from 'crypto-js/aes'
-import CryptoJS from 'crypto-js'
 
 export const windowWidth = window?.innerWidth
 
@@ -75,28 +73,20 @@ export const filterObjKeys = (
 export const isUsingBlockEditor =
 	typeof window?.wp !== 'undefined' && typeof window?.wp?.blocks !== 'undefined'
 
-export const encrypt = (value: any) => {
-	if (typeof value === 'string') {
-		return AES.encrypt(value, kebab).toString()
-	}
-	if (typeof value === 'object') {
-		return AES.encrypt(JSON.stringify(value), kebab).toString()
-	}
-	return ''
-}
+/**
+ * 取出 API 失敗時要顯示給使用者的訊息
+ *
+ * WordPress REST 的錯誤（nonce 失效、權限不足）與 PHP proxy 原樣轉送的上游錯誤，
+ * body 都帶 message；拿不到時（網路中斷、非 JSON 回應）退回 fallback。
+ */
+export const getErrorMessage = (error: unknown, fallback: string): string => {
+	if (isAxiosError<{ message?: unknown }>(error)) {
+		const message = error.response?.data?.message
 
-export const decrypt = (encrypted = '', needJSONParse = false) => {
-	try {
-		const decryptedBytes = CryptoJS.AES.decrypt(encrypted, kebab)
-		const decryptedMessage = decryptedBytes.toString(CryptoJS.enc.Utf8)
-		if (needJSONParse) {
-			const result = JSON.parse(decryptedMessage)
-			return result
+		if (typeof message === 'string' && message) {
+			return message
 		}
-		return decryptedMessage
-	} catch (error) {
-		localStorage.removeItem(LOCALSTORAGE_ACCOUNT_KEY)
-		window.location.reload()
-		return {}
 	}
+
+	return fallback
 }

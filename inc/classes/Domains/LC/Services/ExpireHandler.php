@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Domains\LC\Services;
 
 use J7\Powerhouse\Domains\AsSchedulerHandler\Shared\Base;
-use J7\Powerhouse\Api\Base as CloudApi;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient as CloudApi;
+use J7\PowerPartner\Domains\LC\Core\LifeCycle;
 use J7\WpUtils\Classes\General;
 use J7\WpUtils\Classes\WP;
 
@@ -76,16 +77,17 @@ final class ExpireHandler extends Base {
 
 		// 發API停用授權碼
 		// 訂閱失敗，發API停用授權碼
+		// ids 來自本站訂閱的 lc_id meta，作者不符時允許以 legacy 重送（見 CloudClient::LEGACY_ON_NOT_OWNER_ENDPOINTS）
 		$api_instance = CloudApi::instance();
 		$response     = $api_instance->remote_post(
 			'license-codes/expire',
 			[
 				'ids' => $lc_ids,
-			]
+			],
+			[ 'legacy_on_not_owner' => true ]
 		);
-		$is_error     = \is_wp_error($response);
-		if ($is_error) {
-			$subscription->add_order_note("站長路可《過期》授權碼 失敗: \n{$response->get_error_message()}");
+		if (!CloudApi::is_success($response)) {
+			LifeCycle::log_failure($subscription, '《過期》', $lc_ids, $response);
 			return;
 		}
 

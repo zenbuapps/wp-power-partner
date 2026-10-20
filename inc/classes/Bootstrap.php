@@ -36,6 +36,11 @@ final class Bootstrap {
 		Api\Main::instance();
 		Api\Connect::instance();
 		Api\User::instance();
+		// CloudServer 連線：經銷商專屬密碼、瀏覽器 proxy、背景自動遷移
+		Domains\Cloud\Core\ConnectionApi::instance();
+		Domains\Cloud\Core\ProxyApi::instance();
+		Domains\Cloud\Core\Migration::instance();
+		Domains\Cloud\Core\Notices::instance();
 		Order::instance();
 		Product\DataTabs\LinkedSites::instance();
 		Product\DataTabs\LinkedLC::instance();
@@ -91,7 +96,9 @@ final class Bootstrap {
 
 		$post_id                  = \get_the_ID();
 		$permalink                = $post_id ? \get_permalink( $post_id ) : '';
-		$allowed_template_options = Fetch::get_allowed_template_options();
+		// 模板列表只有 AdminApp（手動開站）用得到；前台每個 page view 都會跑到這裡，
+		// 快取空的時候會變成「每個訪客 × 每一頁」打一次 CloudServer
+		$allowed_template_options = \is_admin() ? Fetch::get_allowed_template_options() : [];
 
 		$power_partner_settings = (array) \get_option( 'power_partner_settings', [] );
 
@@ -128,8 +135,8 @@ final class Bootstrap {
 					'partner_id'                => \get_option( Connect::PARTNER_ID_OPTION_NAME ),
 					'disable_site_after_n_days' => (int) ( $power_partner_settings['power_partner_disable_site_after_n_days'] ?? '7' ),
 					'allow_delete_site'         => !empty( $power_partner_settings['power_partner_allow_delete_site'] ),
-					't'                         => $this->t,
-					'cloudBaseUrl'              => $this->base_url,
+					// ⛔ 不可再輸出任何 CloudServer 憑證（原本的 `t` 就是這樣外洩的）：
+					// 前端一律打本站 /power-partner/cloud/*，由 Domains\Cloud\Core\ProxyApi 加上認證後轉送
 					'POWERCLOUD_API'            => $this->powercloud_api,
 					'powercloud_api_key'        => $powercloud_api_key,
 					'is_kiwissec'               => strpos( \site_url(), 'kiwissec.io' ) !== false,

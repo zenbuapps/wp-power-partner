@@ -1,27 +1,38 @@
 import { atom } from 'jotai'
-import { TAccountInfo, TIdentity } from '@/pages/AdminApp/types'
+
+import { TConnection, TIdentity } from '@/pages/AdminApp/types'
 
 export const defaultIdentity: TIdentity = {
-  status: 100,
-  message: 'un-login',
-  data: null,
+	status: 100,
+	message: 'un-login',
+	data: null,
 }
 
 export const identityAtom = atom<TIdentity>(defaultIdentity)
 
 export const globalLoadingAtom = atom({
-  isLoading: false,
-  label: '',
+	isLoading: false,
+	label: '',
 })
 
+export const defaultConnection: TConnection = {
+	mode: 'none',
+	migration: 'none',
+}
+
 /**
- * 目前已連結的經銷商帳密（僅存在記憶體中，不落地）
+ * 本站與雲端的連線狀態（GET / POST /power-partner/connection 回應的 connection 欄位）
  *
- * 來源與 useGetUserIdentity 完全相同：
- * localStorage 的密文 → 沒有時退回 GET /power-partner/account-info 的
- * encrypted_account_info，兩者擇一後 decrypt(cipher, true) 解出。
- * 這裡只是把「已經解出來的結果」留在記憶體供其他功能重用
- * （例如點數紀錄明細下載必須把帳密放進 POST body），
- * 不新增任何持久化儲存、也不擴大暴露面。
+ * 與 identityAtom 由同一份回應寫入（useGetUserIdentity），目前只用於
+ * 判斷是否顯示「尚未完成新版安全連線」提示。
  */
-export const accountInfoAtom = atom<TAccountInfo | null>(null)
+export const connectionAtom = atom<TConnection>(defaultConnection)
+
+/**
+ * 是否正在「重新登入」
+ *
+ * 已連線（Dashboard 可用）時切換到登入畫面用的旗標。
+ * ⚠️ 刻意不先解除綁定：使用者若中途放棄登入，站台仍維持原本的連線，
+ * 開站、停用/恢復網站、授權碼等功能不受影響；登入成功時由 POST /connection 直接覆寫。
+ */
+export const isReconnectingAtom = atom(false)

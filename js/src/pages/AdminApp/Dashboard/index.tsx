@@ -11,6 +11,7 @@ import {
 import { Tabs, TabsProps, Form, Button } from 'antd'
 import { HashRouter, Routes, Route } from 'react-router'
 import AccountIcon from './AccountIcon'
+import MigrationAlert from './MigrationAlert'
 import SiteList from './SiteList'
 import LogList from './LogList'
 import Description from './Description'
@@ -131,15 +132,18 @@ const TabsDashboard = () => {
 
 const index = () => {
 	return (
-		<HashRouter>
-			<Routes>
-				<Route path="/" element={<TabsDashboard />} />
-				<Route
-					path="/websites/edit/:id"
-					element={<WebsiteEditor />}
-				/>
-			</Routes>
-		</HashRouter>
+		<>
+			<MigrationAlert />
+			<HashRouter>
+				<Routes>
+					<Route path="/" element={<TabsDashboard />} />
+					<Route
+						path="/websites/edit/:id"
+						element={<WebsiteEditor />}
+					/>
+				</Routes>
+			</HashRouter>
+		</>
 	)
 }
 

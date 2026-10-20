@@ -5,10 +5,11 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Domains\LC\Core;
 
 use J7\PowerPartner\Product\DataTabs\LinkedLC;
-use J7\Powerhouse\Api\Base as CloudApi;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient as CloudApi;
 use J7\WpUtils\Classes\General;
 use J7\PowerPartner\Api\Connect;
 use J7\PowerPartner\Domains\LC\Services\ExpireHandler;
+use J7\PowerPartner\Plugin;
 use J7\Powerhouse\Domains\Subscription\Shared\Enums\Action;
 
 /**
@@ -69,7 +70,7 @@ final class LifeCycle {
 		$lc_ids = \get_post_meta($subscription->get_id(), 'lc_id', false);
 
 		// 如果訂閱身上沒有授權碼 就不處理
-		if ( ! $lc_ids ) {
+		if ( ! $lc_ids || ! is_array($lc_ids) ) {
 			return;
 		}
 
@@ -78,16 +79,17 @@ final class LifeCycle {
 
 		// 沒有 action_id ，代表目前是[過期/停用]狀態，發API讓授權碼變成可用
 		// 訂閱轉為成功，發API讓授權碼變成可用
+		// ids 來自本站訂閱的 lc_id meta，作者不符時允許以 legacy 重送（見 CloudClient::LEGACY_ON_NOT_OWNER_ENDPOINTS）
 		$api_instance = CloudApi::instance();
 		$response     = $api_instance->remote_post(
 			'license-codes/recover',
 			[
 				'ids' => $lc_ids,
-			]
+			],
+			[ 'legacy_on_not_owner' => true ]
 		);
-		$is_error     = \is_wp_error($response);
-		if ($is_error) {
-			$subscription->add_order_note("站長路可《重啟》授權碼 ❌失敗: \n{$response->get_error_message()}");
+		if (!CloudApi::is_success($response)) {
+			self::log_failure($subscription, '《重啟》', $lc_ids, $response);
 			return;
 		}
 
@@ -163,9 +165,9 @@ final class LifeCycle {
 				$params
 			);
 
-			$is_error = \is_wp_error($response);
-			if ($is_error) {
-				$subscription->add_order_note("站長路可《新增》授權碼 ❌失敗: \n{$response->get_error_message()}");
+			// 非 2xx 也是失敗：回應裡沒有真的授權碼，不可把 id 寫進訂閱
+			if (!CloudApi::is_success($response)) {
+				self::log_failure($subscription, '《新增》', [], $response);
 				continue;
 			}
 
@@ -196,6 +198,29 @@ final class LifeCycle {
 			$subscription->add_meta_data('lc_id', (string) $lc_id);
 		}
 		$subscription->save();
+	}
+
+	/**
+	 * 授權碼 API 失敗：寫訂單備註「❌失敗」+ error log
+	 *
+	 * @param \WC_Subscription               $subscription 訂閱
+	 * @param string                         $action       動作名稱，例如「《重啟》」
+	 * @param array<int|string, mixed>       $lc_ids       授權碼 ids（建立時為空）
+	 * @param array<string, mixed>|\WP_Error $response     CloudServer 回應
+	 * @return void
+	 */
+	public static function log_failure( \WC_Subscription $subscription, string $action, array $lc_ids, array|\WP_Error $response ): void {
+		$message = CloudApi::failure_message($response);
+		$subscription->add_order_note("站長路可{$action}授權碼 ❌失敗: \n{$message}");
+		Plugin::logger(
+			"站長路可{$action}授權碼失敗",
+			'error',
+			[
+				'subscription_id' => $subscription->get_id(),
+				'ids'             => $lc_ids,
+				'error'           => $message,
+			]
+		);
 	}
 
 	/**

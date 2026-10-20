@@ -1,0 +1,521 @@
+<?php
+
+declare(strict_types=1);
+
+namespace J7\PowerPartner\Domains\Cloud\Services;
+
+use J7\PowerPartner\Domains\Cloud\Shared\Arr;
+use J7\PowerPartner\Plugin;
+
+/**
+ * CloudServer（power-partner-server）憑證的本地存放處
+ *
+ * 存兩種東西：
+ * 1. 經銷商專屬應用程式密碼（dealer）—— 由 CloudServer `POST v3/connect` 發給本站，
+ *    取代寫死在外掛裡的共用帳號 powerpartner。
+ * 2. 經銷商的 cloud.luke.cafe 登入帳密（legacy account）—— 只有在 CloudServer 尚未支援 v3/connect、
+ *    或專屬密碼尚未取得時才需要：legacy 模式的 `POST identity` 與 `logs/{id}/detail` 必須帶它，
+ *    自動遷移也要用它去換專屬密碼。換到專屬密碼後即刪除。
+ *
+ * ⛔ 兩者都不可 localize 到前端，也不可經由任何 REST 回應吐回瀏覽器 —— 共用帳號就是這樣外洩的。
+ *
+ * 加密：sodium secretbox，金鑰由 wp-config salts 衍生，並把站台 host 一起封進密文。
+ * - salts 被重產（安全外掛常做）→ 解不開 → 視為「未連線」，不 fatal
+ * - 模板站被 clone 成另一個網域 → host 不符 → 視為「未連線」，避免終端客戶站繼承經銷商憑證
+ * 只防「資料庫單獨外洩」，擋不住能讀 wp-config 的人；那已超出外掛能防的範圍。
+ */
+abstract class CredentialStore {
+
+	/** @var string 經銷商專屬應用程式密碼（加密） */
+	const DEALER_OPTION = 'power_partner_cloud_dealer_credentials';
+
+	/** @var string 經銷商登入帳密（加密），legacy fallback 與自動遷移用 */
+	const LEGACY_ACCOUNT_OPTION = 'power_partner_cloud_legacy_account';
+
+	/**
+	 * @var string 舊版前端以 CryptoJS + 公開 passphrase 加密存放的帳密（v3.5.x 以前寫入）
+	 *
+	 * 只讀不寫：新版不再產生這種格式，成功換成新格式後刪除。
+	 */
+	const OLD_ACCOUNT_INFO_OPTION = 'power_partner_account_info';
+
+	/** @var string 專屬密碼被 CloudServer 拒絕時記錄的時間與原因（admin notice 用） */
+	const DEALER_INVALID_OPTION = 'power_partner_cloud_dealer_invalid';
+
+	/**
+	 * @var string 經銷商登入帳密（legacy account）已被 CloudServer 拒絕的標記 `{reason, at}`
+	 *
+	 * 標記有效期間本站不再送出這組帳密。原因：CloudServer 驗證真實密碼走 `wp_authenticate()`，
+	 * cloud.luke.cafe 上的 Fluent Security 依「來源 IP」累計失敗次數並封鎖整個 IP；這些請求的來源是本站主機，
+	 * 同一台主機上其他經銷商站的雲端功能會一起被封鎖。
+	 * 24 小時（LEGACY_REJECTED_TTL）後自動過期，允許再試一次（失敗就再標記 24 小時）：
+	 * 舊版 CloudServer 在 IP 被封鎖時回的訊息與「密碼錯誤」相同，誤判要能自己恢復。重新登入成功時清除。
+	 */
+	const LEGACY_REJECTED_OPTION = 'power_partner_cloud_legacy_account_rejected';
+
+	/** @var int 「帳密已被拒」標記的有效期（24 小時） */
+	const LEGACY_REJECTED_TTL = 86400;
+
+	/**
+	 * @var string 「帳密已被拒」標記的特殊 reason：這個帳號需要互動式驗證（登入驗證碼、兩步驟驗證）
+	 *
+	 * 永久性的：本站自動送出的真實密碼永遠過不了，每試一次還會被 Fluent Security 計數、可能寄出 2FA 驗證信。
+	 * 所以**不適用 24 小時過期重試**，只有經銷商手動登入成功（save_legacy_account / delete_legacy_account）才清除。
+	 */
+	const REJECTED_LOGIN_CHALLENGE = 'login_challenge';
+
+	/**
+	 * @var string 共用帳號（legacy）的健康狀態 `{disabled_at, reason, ok_at}`
+	 *
+	 * - disabled_at：CloudServer 停用或撤銷共用帳號（試關回 legacy_auth_disabled；根除後 core 回
+	 *   incorrect_password）。之後改走 legacy 沒有意義，CloudClient 一律先用專屬密碼，notice 改說「雲端連線已中斷」。
+	 *   共用帳號請求再次成功時清除（試關後又切回）
+	 * - ok_at：最近一次共用帳號請求成功的時間。只有 24 小時內真的成功過，notice 才可以說「目前功能不受影響」
+	 */
+	const LEGACY_STATE_OPTION = 'power_partner_cloud_legacy_state';
+
+	/** @var int 「共用帳號已停用」多久內不再以共用帳號重試、ok_at 多久更新一次（1 小時） */
+	const LEGACY_DISABLED_RECHECK = 3600;
+
+	/** @var int ok_at 在多久內算「共用帳號目前可用」（24 小時） */
+	const LEGACY_OK_FRESH = 86400;
+
+	/** @var string 衍生金鑰時的 context，避免與其他用到同一組 salt 的用途撞 key */
+	const KEY_CONTEXT = '|power-partner/cloud-credentials/v1';
+
+	/**
+	 * 取得經銷商專屬應用程式密碼
+	 *
+	 * @return array{user_login: string, app_password: string, uuid: string, partner_id: string}|null
+	 */
+	public static function get_dealer(): ?array {
+		$data = self::read( self::DEALER_OPTION );
+		if ( null === $data ) {
+			return null;
+		}
+
+		$user_login   = (string) ( $data['user_login'] ?? '' );
+		$app_password = (string) ( $data['app_password'] ?? '' );
+		if ( '' === $user_login || '' === $app_password ) {
+			return null;
+		}
+
+		return [
+			'user_login'   => $user_login,
+			'app_password' => $app_password,
+			'uuid'         => (string) ( $data['uuid'] ?? '' ),
+			'partner_id'   => (string) ( $data['partner_id'] ?? '' ),
+		];
+	}
+
+	/**
+	 * 儲存經銷商專屬應用程式密碼
+	 *
+	 * @param array{user_login: string, app_password: string, uuid?: string, partner_id?: string} $credentials 憑證
+	 * @return bool
+	 */
+	public static function save_dealer( array $credentials ): bool {
+		$saved = self::write(
+			self::DEALER_OPTION,
+			[
+				'user_login'   => (string) $credentials['user_login'],
+				'app_password' => (string) $credentials['app_password'],
+				'uuid'         => (string) ( $credentials['uuid'] ?? '' ),
+				'partner_id'   => (string) ( $credentials['partner_id'] ?? '' ),
+			]
+		);
+		if ( $saved ) {
+			\delete_option( self::DEALER_INVALID_OPTION );
+		}
+		return $saved;
+	}
+
+	/**
+	 * 刪除經銷商專屬應用程式密碼
+	 *
+	 * @return void
+	 */
+	public static function delete_dealer(): void {
+		\delete_option( self::DEALER_OPTION );
+		\delete_option( self::DEALER_INVALID_OPTION );
+	}
+
+	/**
+	 * 標記專屬密碼被 CloudServer 拒絕（經銷商在雲端撤銷、帳號被停用…）
+	 *
+	 * 不在這裡刪除密碼：可能只是 CloudServer 暫時異常，刪了就只能請經銷商重新登入。
+	 * CloudClient 會改用 legacy 重送，功能不中斷；admin notice 提醒經銷商重新連線。
+	 *
+	 * @param string $reason 原因（CloudServer 的 error code）
+	 * @return void
+	 */
+	public static function mark_dealer_invalid( string $reason ): void {
+		\update_option(
+			self::DEALER_INVALID_OPTION,
+			[
+				'reason' => $reason,
+				'at'     => time(),
+			],
+			false
+		);
+	}
+
+	/**
+	 * 專屬密碼是否已被標記為失效
+	 *
+	 * @return bool
+	 */
+	public static function is_dealer_invalid(): bool {
+		return false !== \get_option( self::DEALER_INVALID_OPTION, false );
+	}
+
+	/**
+	 * 專屬密碼再次被 CloudServer 接受時清除失效標記（暫時性的誤判自己恢復，notice 跟著消失）
+	 *
+	 * @return void
+	 */
+	public static function clear_dealer_invalid(): void {
+		if ( self::is_dealer_invalid() ) {
+			\delete_option( self::DEALER_INVALID_OPTION );
+		}
+	}
+
+	/**
+	 * 標記共用帳號已被 CloudServer 停用（見 LEGACY_STATE_OPTION）
+	 *
+	 * 每個請求都可能走到這裡，1 小時內只寫一次。
+	 *
+	 * @param string $reason CloudServer 的錯誤代碼
+	 * @return void
+	 */
+	public static function mark_legacy_disabled( string $reason ): void {
+		if ( self::legacy_disabled_recently() ) {
+			return;
+		}
+		$state = self::legacy_state();
+		$first = 0 === $state['disabled_at'];
+		self::save_legacy_state( time(), $reason, $state['ok_at'] );
+		if ( $first ) {
+			Plugin::logger( 'CloudServer 已停用共用帳號，之後一律以經銷商專屬密碼連線', 'warning', [ 'reason' => $reason ] );
+		}
+	}
+
+	/**
+	 * 共用帳號請求成功：清除停用標記、更新 ok_at（1 小時內只寫一次）
+	 *
+	 * @return void
+	 */
+	public static function note_legacy_ok(): void {
+		$state = self::legacy_state();
+		if ( 0 === $state['disabled_at'] && ( time() - $state['ok_at'] ) < self::LEGACY_DISABLED_RECHECK ) {
+			return;
+		}
+		self::save_legacy_state( 0, '', time() );
+	}
+
+	/**
+	 * @return bool 是否看過共用帳號被停用（沒有再次成功過）
+	 */
+	public static function is_legacy_disabled(): bool {
+		return self::legacy_state()['disabled_at'] > 0;
+	}
+
+	/**
+	 * @return bool 最近 1 小時內是否確認過共用帳號已停用
+	 */
+	public static function legacy_disabled_recently(): bool {
+		$disabled_at = self::legacy_state()['disabled_at'];
+		return $disabled_at > 0 && ( time() - $disabled_at ) < self::LEGACY_DISABLED_RECHECK;
+	}
+
+	/**
+	 * @return bool 最近 24 小時內是否真的看過共用帳號請求成功（才可以說「目前功能不受影響」）
+	 */
+	public static function legacy_ok_recently(): bool {
+		$state = self::legacy_state();
+		return 0 === $state['disabled_at'] && $state['ok_at'] > 0 && ( time() - $state['ok_at'] ) < self::LEGACY_OK_FRESH;
+	}
+
+	/**
+	 * @return array{disabled_at: int, reason: string, ok_at: int}
+	 */
+	private static function legacy_state(): array {
+		$stored = \get_option( self::LEGACY_STATE_OPTION, [] );
+		$stored = is_array( $stored ) ? $stored : [];
+		return [
+			'disabled_at' => (int) ( $stored['disabled_at'] ?? 0 ),
+			'reason'      => (string) ( $stored['reason'] ?? '' ),
+			'ok_at'       => (int) ( $stored['ok_at'] ?? 0 ),
+		];
+	}
+
+	/**
+	 * @param int    $disabled_at 停用時間（0 = 未停用）
+	 * @param string $reason      停用原因
+	 * @param int    $ok_at       最近一次成功時間
+	 * @return void
+	 */
+	private static function save_legacy_state( int $disabled_at, string $reason, int $ok_at ): void {
+		\update_option(
+			self::LEGACY_STATE_OPTION,
+			[
+				'disabled_at' => $disabled_at,
+				'reason'      => $reason,
+				'ok_at'       => $ok_at,
+			],
+			false
+		);
+	}
+
+	/**
+	 * 取得經銷商登入帳密
+	 *
+	 * 優先讀新格式；沒有時退回解密舊版前端寫入的 CryptoJS 密文。
+	 *
+	 * @return array{email: string, password: string}|null
+	 */
+	public static function get_legacy_account(): ?array {
+		$data = self::read( self::LEGACY_ACCOUNT_OPTION );
+		if ( null === $data ) {
+			$data = self::decrypt_old_account_info( (string) \get_option( self::OLD_ACCOUNT_INFO_OPTION, '' ) );
+		}
+		if ( null === $data ) {
+			return null;
+		}
+
+		$email    = (string) ( $data['email'] ?? '' );
+		$password = (string) ( $data['password'] ?? '' );
+		if ( '' === $email || '' === $password ) {
+			return null;
+		}
+
+		return [
+			'email'    => $email,
+			'password' => $password,
+		];
+	}
+
+	/**
+	 * 儲存經銷商登入帳密（新格式），並刪除舊版可被任何人解開的密文
+	 *
+	 * @param string $email    email
+	 * @param string $password 密碼
+	 * @return bool
+	 */
+	public static function save_legacy_account( string $email, string $password ): bool {
+		$saved = self::write(
+			self::LEGACY_ACCOUNT_OPTION,
+			[
+				'email'    => $email,
+				'password' => $password,
+			]
+		);
+		if ( $saved ) {
+			\delete_option( self::OLD_ACCOUNT_INFO_OPTION );
+			\delete_option( self::LEGACY_REJECTED_OPTION );
+		}
+		return $saved;
+	}
+
+	/**
+	 * 刪除經銷商登入帳密（新舊格式都刪）
+	 *
+	 * @return void
+	 */
+	public static function delete_legacy_account(): void {
+		\delete_option( self::LEGACY_ACCOUNT_OPTION );
+		\delete_option( self::OLD_ACCOUNT_INFO_OPTION );
+		\delete_option( self::LEGACY_REJECTED_OPTION );
+	}
+
+	/**
+	 * 標記經銷商登入帳密已被 CloudServer 拒絕（24 小時內不再送出，見 LEGACY_REJECTED_OPTION）
+	 *
+	 * 只能在 CloudServer 明確回覆「帳密錯誤」時呼叫；429（限流、IP 被封鎖、驗證碼、2FA）是暫時性錯誤，不可標記。
+	 *
+	 * @param string $reason 原因
+	 * @return void
+	 */
+	public static function mark_legacy_account_rejected( string $reason ): void {
+		if ( self::is_legacy_account_rejected() ) {
+			return;
+		}
+		\update_option(
+			self::LEGACY_REJECTED_OPTION,
+			[
+				'reason' => $reason,
+				'at'     => time(),
+			],
+			false
+		);
+		Plugin::logger( 'CloudServer 拒絕本站保存的經銷商登入帳密，24 小時內不再送出（重新登入成功即恢復）', 'warning', [ 'reason' => $reason ] );
+	}
+
+	/**
+	 * 經銷商登入帳密是否在「已被拒」的有效期內
+	 *
+	 * 帳密錯誤 24 小時後自動過期、允許再試一次；login_challenge 不過期（見 REJECTED_LOGIN_CHALLENGE）。
+	 *
+	 * @return bool
+	 */
+	public static function is_legacy_account_rejected(): bool {
+		return '' !== self::legacy_account_rejected_reason();
+	}
+
+	/**
+	 * @return string 有效中的「帳密已被拒」原因；沒有標記或已過期時為空字串
+	 */
+	public static function legacy_account_rejected_reason(): string {
+		$stored = \get_option( self::LEGACY_REJECTED_OPTION, false );
+		if ( ! is_array( $stored ) ) {
+			return '';
+		}
+		$reason = (string) ( $stored['reason'] ?? '' );
+		if ( self::REJECTED_LOGIN_CHALLENGE === $reason ) {
+			return $reason;
+		}
+		return ( time() - (int) ( $stored['at'] ?? 0 ) ) < self::LEGACY_REJECTED_TTL ? ( '' !== $reason ? $reason : 'rejected' ) : '';
+	}
+
+	/**
+	 * CloudServer 再次接受這組帳密時清除（過期後重試成功 = 之前是誤判）
+	 *
+	 * @return void
+	 */
+	public static function clear_legacy_account_rejected(): void {
+		if ( false !== \get_option( self::LEGACY_REJECTED_OPTION, false ) ) {
+			\delete_option( self::LEGACY_REJECTED_OPTION );
+		}
+	}
+
+	/**
+	 * 解開舊版前端以 CryptoJS.AES.encrypt(JSON, passphrase) 產生的密文
+	 *
+	 * 格式為 OpenSSL 相容：base64("Salted__" + 8 bytes salt + ciphertext)，
+	 * key / iv 由 EVP_BytesToKey(MD5) 自 passphrase + salt 衍生，AES-256-CBC。
+	 * passphrase 是公開的 Plugin::$kebab —— 這正是它必須被換掉的原因。
+	 *
+	 * @param string $cipher 密文
+	 * @return array<string, mixed>|null
+	 */
+	public static function decrypt_old_account_info( string $cipher ): ?array {
+		if ( '' === $cipher ) {
+			return null;
+		}
+
+		$raw = base64_decode( $cipher, true );
+		if ( false === $raw || strlen( $raw ) < 32 || 'Salted__' !== substr( $raw, 0, 8 ) ) {
+			return null;
+		}
+
+		$salt       = substr( $raw, 8, 8 );
+		$ciphertext = substr( $raw, 16 );
+		$passphrase = Plugin::$kebab;
+
+		$derived = '';
+		$block   = '';
+		while ( strlen( $derived ) < 48 ) {
+			$block    = md5( $block . $passphrase . $salt, true );
+			$derived .= $block;
+		}
+
+		$plain = openssl_decrypt( $ciphertext, 'aes-256-cbc', substr( $derived, 0, 32 ), OPENSSL_RAW_DATA, substr( $derived, 32, 16 ) );
+		if ( false === $plain ) {
+			return null;
+		}
+
+		$decoded = json_decode( $plain, true );
+		return is_array( $decoded ) ? Arr::assoc( $decoded ) : null;
+	}
+
+	/**
+	 * 讀取並解密 option
+	 *
+	 * @param string $option option name
+	 * @return array<string, mixed>|null 不存在、解不開、host 不符時回 null
+	 */
+	private static function read( string $option ): ?array {
+		$stored = \get_option( $option, '' );
+		if ( ! is_string( $stored ) || '' === $stored ) {
+			return null;
+		}
+
+		$raw = base64_decode( $stored, true );
+		if ( false === $raw || strlen( $raw ) <= SODIUM_CRYPTO_SECRETBOX_NONCEBYTES ) {
+			return null;
+		}
+
+		try {
+			$plain = sodium_crypto_secretbox_open(
+				substr( $raw, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES ),
+				substr( $raw, 0, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES ),
+				self::key()
+			);
+		} catch ( \Throwable $e ) {
+			$plain = false;
+		}
+
+		if ( false === $plain ) {
+			Plugin::logger( "CloudServer 憑證解密失敗（salts 可能已重產），視為未連線：{$option}", 'warning' );
+			return null;
+		}
+
+		$payload = json_decode( $plain, true );
+		if ( ! is_array( $payload ) || ! is_array( $payload['data'] ?? null ) ) {
+			return null;
+		}
+
+		if ( ( $payload['host'] ?? '' ) !== self::host() ) {
+			Plugin::logger(
+				"CloudServer 憑證的站台 host 不符（站台可能被複製或改網域），視為未連線：{$option}",
+				'warning',
+				[
+					'stored_host'  => (string) ( $payload['host'] ?? '' ),
+					'current_host' => self::host(),
+				]
+			);
+			return null;
+		}
+
+		return Arr::assoc( $payload['data'] );
+	}
+
+	/**
+	 * 加密並寫入 option（autoload = no）
+	 *
+	 * @param string               $option option name
+	 * @param array<string, mixed> $data   資料
+	 * @return bool
+	 */
+	private static function write( string $option, array $data ): bool {
+		$plain = \wp_json_encode(
+			[
+				'host' => self::host(),
+				'data' => $data,
+			]
+		);
+		if ( false === $plain ) {
+			return false;
+		}
+
+		$nonce  = random_bytes( SODIUM_CRYPTO_SECRETBOX_NONCEBYTES );
+		$stored = base64_encode( $nonce . sodium_crypto_secretbox( $plain, $nonce, self::key() ) );
+
+		\update_option( $option, $stored, false );
+		return \get_option( $option ) === $stored;
+	}
+
+	/**
+	 * @return string 32 bytes secretbox key
+	 */
+	private static function key(): string {
+		return sodium_crypto_generichash( \wp_salt( 'auth' ) . \wp_salt( 'secure_auth' ) . self::KEY_CONTEXT, '', SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
+	}
+
+	/**
+	 * @return string 目前站台的 host（不含 scheme / port 以外的部分）
+	 */
+	private static function host(): string {
+		return strtolower( (string) \wp_parse_url( \home_url(), PHP_URL_HOST ) );
+	}
+}

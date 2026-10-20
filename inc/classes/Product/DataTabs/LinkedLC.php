@@ -13,7 +13,8 @@ namespace J7\PowerPartner\Product\DataTabs;
 use J7\PowerPartner\Plugin;
 use J7\PowerPartner\Utils\Base;
 use J7\WpUtils\Classes\General;
-use J7\PowerPartner\Bootstrap;
+use J7\PowerPartner\Api\Connect;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient;
 
 /**
  * Class LinkedLC
@@ -214,23 +215,16 @@ final class LinkedLC {
 			return (array) $cloud_products;
 		}
 
-		$args = [
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
-			'timeout' => 120,
-		];
-
-		$api_url = Bootstrap::instance()->base_url . '/wp-json/power-partner-server/license-codes/products';
-		$api_url = \add_query_arg(
+		// user_id 是 CloudServer 上的經銷商 id（決定授權碼牌價等級），不是本站的使用者 id。
+		// 尚未連線（沒有 partner_id）時維持舊行為送本站使用者 id，避免更新後商品編輯頁的授權碼選單變空
+		$partner_id = (string) \get_option( Connect::PARTNER_ID_OPTION_NAME, '' );
+		$response   = CloudClient::instance()->remote_get(
+			'license-codes/products',
 			[
-				'user_id' => \get_current_user_id(),
+				'user_id' => '' !== $partner_id ? $partner_id : \get_current_user_id(),
 			],
-			$api_url
-			);
-
-		$response = \wp_remote_get( $api_url, $args );
+			[ 'timeout' => 120 ]
+		);
 
 		if (\is_wp_error($response)) {
 			\set_transient(self::CLOUD_PRODUCTS_TRANSIENT_KEY, [], self::CACHE_TIME);

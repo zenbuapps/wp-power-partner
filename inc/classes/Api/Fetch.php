@@ -5,12 +5,42 @@ declare(strict_types=1);
 namespace J7\PowerPartner\Api;
 
 use J7\PowerPartner\Bootstrap;
+use J7\PowerPartner\Domains\Cloud\Services\CloudClient;
 use J7\PowerPartner\Plugin;
 
 /** Class Fetch */
 abstract class Fetch {
 
 	const ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY = 'power_partner_allowed_template_options';
+
+	/**
+	 * 模板列表抓取失敗時的負面快取秒數
+	 *
+	 * 成功的結果不設 TTL（由 POST /partner-id 與「清除快取」維護），但失敗時若不寫快取，
+	 * 每一次載入 AdminApp / 商品編輯頁都會再打一次 CloudServer（timeout 120 秒）。
+	 * CloudServer 撤銷共用帳號或經銷商尚未重新連線時，失敗會是常態，必須擋住重打。
+	 */
+	const ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL = 5 * MINUTE_IN_SECONDS;
+
+	/**
+	 * 呼叫 CloudServer（power-partner-server）共用的 request headers
+	 *
+	 * X-PP-Client-Version / X-PP-Site 供 CloudServer 統計「還有哪些站用舊版、舊憑證」，
+	 * 是撤銷共用帳號前判斷能否關閉的依據，不參與任何驗證。
+	 *
+	 * Authorization 這裡給的是共用帳號（legacy）；實際送出前由 CloudClient 依認證模式覆寫，
+	 * 呼叫 CloudServer 一律經過 CloudClient，不要直接拿這組 headers 去 wp_remote_*。
+	 *
+	 * @return array<string, string>
+	 */
+	public static function cloud_headers(): array {
+		return [
+			'Content-Type'        => 'application/json',
+			'Authorization'       => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
+			'X-PP-Client-Version' => (string) Plugin::$version,
+			'X-PP-Site'           => \site_url(),
+		];
+	}
 
 	/**
 	 * 發 API 開站
@@ -41,26 +71,14 @@ abstract class Fetch {
 	 * @throws \Exception When the request fails.
 	 */
 	public static function site_sync( array $props ) {
-		$body = \wp_json_encode( $props );
-		if ( false === $body ) {
-			throw new \Exception('開站失敗: wp_json_encode failed');
-		}
-		$args     = [
-			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
-			'timeout' => 600,
-		];
-		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/site-sync', $args );
+		$response = CloudClient::instance()->remote_post( 'site-sync', $props, [ 'timeout' => 600 ] );
 
 		if (\is_wp_error($response)) {
 			throw new \Exception("開站失敗: {$response->get_error_message()}");
 		}
 
 		/** @var object{status: int, message: string, data: mixed} $response_obj */
-		$response_obj = json_decode( $response['body'] );
+		$response_obj = json_decode( (string) \wp_remote_retrieve_body( $response ) );
 
 		\do_action( 'pp_after_site_sync', $response_obj );
 
@@ -86,26 +104,15 @@ abstract class Fetch {
 			return false;
 		}
 
-		$body = \wp_json_encode(
+		$response = CloudClient::instance()->remote_post(
+			'v2/disable-site',
 			[
 				'site_id'    => $site_id,
 				'partner_id' => $partner_id,
 				'reason'     => $reason,
-			]
-		);
-		if ( false === $body ) {
-			Plugin::logger( 'disable_site wp_json_encode failed', 'error', [ 'site_id' => $site_id ] );
-			return false;
-		}
-		$args     = [
-			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
 			],
-			'timeout' => 600,
-		];
-		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/disable-site', $args );
+			[ 'timeout' => 600 ]
+		);
 
 		if ( \is_wp_error( $response ) ) {
 			Plugin::logger(
@@ -158,25 +165,14 @@ abstract class Fetch {
 			return false;
 		}
 
-		$body = \wp_json_encode(
+		$response = CloudClient::instance()->remote_post(
+			'v2/enable-site',
 			[
 				'site_id'    => $site_id,
 				'partner_id' => $partner_id,
-			]
-		);
-		if ( false === $body ) {
-			Plugin::logger( 'enable_site wp_json_encode failed', 'error', [ 'site_id' => $site_id ] );
-			return false;
-		}
-		$args     = [
-			'body'    => $body,
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
 			],
-			'timeout' => 600,
-		];
-		$response = \wp_remote_post( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/v2/enable-site', $args );
+			[ 'timeout' => 600 ]
+		);
 
 		if ( \is_wp_error( $response ) ) {
 			Plugin::logger(
@@ -224,7 +220,12 @@ abstract class Fetch {
 		if ( false === $allowed_template_options ) {
 			$allowed_template_options = [];
 			$result                   = self::fetch_template_sites_by_user();
+			// null = 尚未連線（沒有 partner_id），根本沒發請求，不需要負面快取
+			if ( null === $result ) {
+				return [];
+			}
 			if (\is_wp_error($result)) {
+				\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, [], self::ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL );
 				return [];
 			}
 
@@ -233,6 +234,7 @@ abstract class Fetch {
 			$template_sites = $result_obj->data->list ?? null;
 
 			if (!$template_sites) {
+				\set_transient( self::ALLOWED_TEMPLATE_OPTIONS_TRANSIENT_KEY, [], self::ALLOWED_TEMPLATE_OPTIONS_FAILURE_TTL );
 				return [];
 			}
 
@@ -258,15 +260,7 @@ abstract class Fetch {
 			return null;
 		}
 
-		$args = [
-			'headers' => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Basic ' . \base64_encode( Bootstrap::instance()->username . ':' . Bootstrap::instance()->psw ), // phpcs:ignore
-			],
-			'timeout' => 120,
-		];
-
-		$response = \wp_remote_get( Bootstrap::instance()->base_url . '/wp-json/power-partner-server/template-sites?user_id=' . (string) $partner_id, $args );
+		$response = CloudClient::instance()->remote_get( 'template-sites', [ 'user_id' => (string) $partner_id ], [ 'timeout' => 120 ] );
 
 		if ( \is_wp_error( $response ) ) {
 			return new \WP_Error(
@@ -278,6 +272,6 @@ abstract class Fetch {
 			);
 		}
 
-		return json_decode( $response['body'] );
+		return json_decode( (string) \wp_remote_retrieve_body( $response ) );
 	}
 }

@@ -28,14 +28,25 @@ WooCommerce 訂閱首次付款 (INITIAL_PAYMENT_COMPLETE)
       └── HTTP 201 → 暫存 email_payloads_tmp
       └── as_schedule_single_action(time()+240, 'powerhouse_delay_send_email')
   → [wpcd] Fetch::site_sync($params)
-      └── POST cloud.luke.cafe/wp-json/power-partner-server/site-sync（Basic Auth）
+      └── POST cloud.luke.cafe/wp-json/power-partner-server/site-sync（經 CloudClient：專屬密碼優先、共用帳號 fallback）
   → 儲存回應到 order item meta + order meta
   → do_action('pp_site_sync_by_subscription')
       └── 公開擴充點，PP 內部已無監聽者（issue #21 移除了 site_sync 排程）
   → LC\LifeCycle::create_lcs()（同時觸發）
-      └── CloudApi::remote_post('license-codes', ...)
+      └── CloudClient::remote_post('license-codes', ...)
       └── send_email_to_subscriber()
 ```
+
+## CloudServer 連線（Domains\Cloud）
+
+呼叫 cloud.luke.cafe 的 power-partner-server（開站 WPCD、停用/啟用、模板列表、每日計費、授權碼）**一律經 `Domains\Cloud\Services\CloudClient`**：
+
+- 認證模式自動選擇：`dealer`（經銷商專屬應用程式密碼）→ 被 CloudServer 以憑證類錯誤拒絕時**當次改用** `legacy`（寫死的共用帳號）重送；`v3/connect` 用 `none`（不帶 Authorization）
+- 憑證由 `CredentialStore` 以 sodium 加密存放（`autoload=no`、綁 host），**不可 localize 到前端、不可進 REST 回應**
+- 瀏覽器不直連 CloudServer：`cloudAxios` 打本站 `/wp-json/power-partner/cloud/*`（nonce 認證），由 `ProxyApi` 加上認證、覆寫身分參數後轉送；AdminApp 登入/身分走 `/power-partner/connection`
+- 背景遷移：`power_partner/3.6.0/cloud/migrate`（AS 每日）把舊登入帳密換成專屬密碼；失敗只寫 log 與 admin notice，**不寄信**
+- 查身分類請求（`v3/identity`、legacy `identity`、`logs/{id}/detail`）不可走自動 fallback；`CREDENTIAL_REJECTED_CODES` 不可加入 `partner_mismatch` / `not_owner` 等越權碼
+- 詳見 `.claude/CLAUDE.md` 的「CloudServer 連線」與常見陷阱 25–37
 
 ## 訂閱狀態對應
 
