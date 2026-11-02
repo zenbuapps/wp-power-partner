@@ -77,6 +77,43 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
       When 系統再次載入外掛
       Then 首推排程數量仍為 1
 
+    Example: 升級後回滾再重升，首推尚未執行時不重複排程（issue #32）
+      Given 外掛升級時已排定 billing_date "2026-08-19"、retried 0 的首推，尚未執行
+      And 外掛回滾後再次升級，版本旗標再次判定為版本變更
+      When 系統載入外掛
+      Then 首推排程數量仍為 1
+      And 版本旗標更新為目前外掛版本
+
+  Rule: 前置（狀態）- 同一 partner_id 的同一 billing_date 推送成功後，不再抓清單也不再推送
+    # 回滾再重升、定期排程與首推落在同一業務日，都會讓同一天被觸發多次（issue #32）。
+    # 接收端雖以 billing_date 防重複扣點，第二次推送只會得到 already_deducted，所以這裡略過
+    # 不影響扣點結果，只是省掉無意義的 PowerCloud 與 CloudServer 請求。
+    # 接收端仍是唯一的冪等保證：併發的兩個觸發可能同時通過這道檢查。
+    # 只有推送成功（HTTP 2xx，含 already_deducted）才記標記；任何失敗都不記，否則重試會被略過、當天收不到錢。
+
+    Example: 同日第二次觸發直接略過
+      Given billing_date "2026-08-19" 已推送成功
+      When 排程再次以 billing_date "2026-08-19" 觸發
+      Then 系統不呼叫 PowerCloud 與 CloudServer
+      And 回傳 reason 為 "already_pushed"，寫 info log，不寫告警
+
+    Example: 失敗後的重試照常送出
+      Given billing_date "2026-08-19" 上一次推送失敗
+      When 排程以 billing_date "2026-08-19"、retried 1 重試
+      Then 系統照常推送
+
+    Example: 補推前一天不影響隔天的標記
+      Given billing_date "2026-08-20" 已推送成功，"2026-08-19" 尚未推送
+      When 排程以 billing_date "2026-08-19" 重試
+      Then 系統照常推送
+      And "2026-08-20" 的標記仍然存在
+
+    Example: 換綁經銷商後同一天仍可推送
+      Given partner_id 174 的 billing_date "2026-08-19" 已推送成功
+      And 本站 partner_id 改為 175
+      When 排程以 billing_date "2026-08-19" 觸發
+      Then 系統照常推送
+
   Rule: 前置（狀態）- PowerCloud API Key 不存在時中止推送
     # 不得以空 key 呼叫 API，避免產生無意義的 401 與誤判為「該經銷商沒有站」
 
@@ -468,6 +505,14 @@ Feature: 推送新架構網站計費資料（PushPowerCloudBillingData）
         | 1       | 排程 30 分鐘後重試      | 第 2 次重試              |
         | 2       | 排程 30 分鐘後重試      | 第 3 次重試              |
         | 3       | 不再重試並寫 error log  | 已達上限                 |
+
+  Rule: 錯誤處理 - 同一 billing_date、同一 retried 已有 pending 重試時不重複排程
+    # 首推與定期排程同一天各自失敗時，兩條失敗鏈只需要一筆重試（issue #32）
+
+    Example: 兩次失敗只留一筆重試
+      Given billing_date "2026-08-19"、retried 1 的重試已排定
+      When 同一天另一次觸發也推送失敗
+      Then 該重試排程數量仍為 1
 
   Rule: 錯誤處理 - 重試次數達上限仍失敗時，寫 error log 並停止重試
     # 漏推一天等於少收一天錢，必須留得下痕跡
