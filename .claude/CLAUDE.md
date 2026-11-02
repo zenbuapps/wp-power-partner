@@ -132,6 +132,7 @@ PowerCloud API key 儲存方式:
 | `power_partner_cloud_installation` | array | `{id: uuid4, host}` 本站安裝識別，`autoload=no`。送給 `v3/connect`，讓 CloudServer 只撤銷「這個站」的那把專屬密碼；host 變更（被 clone）時重新產生，避免複製站撤銷到原站的密碼 |
 | `power_partner_compatibility_scheduled` | string | 已跑過相容設定的版本號。⚠️ constructor 在版本不同時會先 `delete_option()`，所以 `compatibility()` 裡讀到的 `$previous_version` 永遠是 `'0.0.1'`——`version_compare('3.1.0')` 區塊事實上每次升版都會執行 |
 | `power_partner_issue22_backfilled` | string | issue #22 一次性補排的守門（值為當時版本號）。**不可改用 `$previous_version` 判斷**，理由同上。⚠️ **必須等 `as_enqueue_async_action()` 回傳非 0 才寫入**——AS 未初始化時它回 0 且不排任何東西，而 `compatibility()` 也綁在 `upgrader_process_complete`（同步 wp-admin request）上；先寫旗標會讓補排永久跳過（旗標無清除路徑、後台無手動入口）。防重複排程改由 `as_has_scheduled_action()` 負責 |
+| `power_partner_billing_pushed_dates` | array | `{"{partner_id}:{billing_date}": unix_timestamp}`，`autoload=no`，最多 10 筆（`DailyBillingCron::PUSHED_DATES_KEEP`）。issue #32：此業務日已推送成功（HTTP 2xx，含接收端回 `already_deducted`）的標記，同日再觸發時不抓清單也不推送，回 reason `already_pushed`。**只在成功後才寫**，失敗時不可寫（否則重試全被略過、當天收不到錢）。只是省請求，扣點的冪等保證仍在接收端（`DailyBilling::deduct_with_transaction`）；併發觸發可能同時通過檢查。要對同一天強制重推時，刪掉對應的 key |
 | `pp_site_sync_lock_{order_id}` | string | issue #24 開站併發鎖，`autoload=no`。值的格式是 `{unix_timestamp}:{隨機}`——前半供逾時判定，後半是持有者身分，讓釋放能做條件式刪除。正常路徑由 `try/finally` 清除，fatal/OOM 留下的殘鎖由逾時接管機制回收 |
 
 ## WordPress Transients

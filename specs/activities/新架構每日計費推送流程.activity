@@ -10,6 +10,7 @@
 [DECISION:1a] 推送前置條件檢查
   [BRANCH:1a:PowerCloud API Key 不存在] @ActionScheduler 中止推送、寫告警 log（不寄信） {features/billing/推送新架構網站計費資料.feature}
   [BRANCH:1a:partner_id 未設定] @ActionScheduler 中止推送、只留原地 error log（不走告警路徑：未連結的站每天都會走到這裡，且沒有錢會漏） {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:1a:同一 partner_id 的同一 billing_date 已推送成功] @ActionScheduler 略過本次推送、寫 info log（不抓清單、不告警） {features/billing/推送新架構網站計費資料.feature}
   [BRANCH:1a:前置條件皆滿足] @ActionScheduler 繼續取得網站清單 {features/billing/推送新架構網站計費資料.feature}
 [MERGE:1a]
 
@@ -42,7 +43,7 @@
 [STEP:4] @ActionScheduler 以 Basic Auth 推送 payload 給 CloudServer {features/billing/推送新架構網站計費資料.feature}
 
 [DECISION:4a] 推送結果
-  [BRANCH:4a:HTTP 2xx] @ActionScheduler 寫入成功 log，並於首推成功時記錄本地 dealer_id 綁定值 {features/billing/推送新架構網站計費資料.feature}
+  [BRANCH:4a:HTTP 2xx] @ActionScheduler 記下本 billing_date 已推送、寫入成功 log，並於首推成功時記錄本地 dealer_id 綁定值 {features/billing/推送新架構網站計費資料.feature}
   [BRANCH:4a:HTTP 403 身分綁定不符] @ActionScheduler 立即寫告警 log（不寄信，不重試，需人工介入） {features/billing/推送新架構網站計費資料.feature}
   [BRANCH:4a:HTTP 非 2xx 且 data.error_code 為永久性代碼] @ActionScheduler 立即寫告警 log（不寄信，不重試，重送必然以同樣方式失敗） {features/billing/推送新架構網站計費資料.feature}
   [BRANCH:4a:失敗且重試次數未達上限] @ActionScheduler 排程 30 分鐘後重試 {features/billing/推送新架構網站計費資料.feature}

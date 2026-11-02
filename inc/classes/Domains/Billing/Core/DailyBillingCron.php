@@ -65,6 +65,19 @@ final class DailyBillingCron {
 	/** @var string 本地記錄的經銷商 id（dealerId）綁定值 option */
 	const BOUND_DEALER_ID_OPTION = 'power_partner_billing_dealer_id';
 
+	/**
+	 * 已推送成功的標記 option（`{partner_id}:{billing_date}` => 推送時間）
+	 *
+	 * 只用來省掉重複觸發時的請求，扣點的冪等保證仍在接收端：併發的兩個觸發可能同時通過檢查。
+	 * 帶 partner_id 是因為同一天換綁經銷商時，扣點對象已經不同，不該被舊標記擋下。
+	 *
+	 * @var string
+	 */
+	const PUSHED_DATES_OPTION = 'power_partner_billing_pushed_dates';
+
+	/** @var int 標記保留筆數。接收端只接受回溯 7 天內的 billing_date，更舊的重試本來就會被拒 */
+	const PUSHED_DATES_KEEP = 10;
+
 	/** @var int 啟用／升級後首推的延遲秒數 */
 	const BOOTSTRAP_DELAY = 60;
 
@@ -145,17 +158,18 @@ final class DailyBillingCron {
 		\update_option( self::BOOTSTRAP_VERSION_OPTION, $version, true );
 
 		$billing_date = self::resolve_billing_date();
+		$args         = [
+			'billing_date' => $billing_date,
+			'retried'      => 0,
+		];
 
-		\as_schedule_single_action(
-			time() + self::BOOTSTRAP_DELAY,
-			self::RETRY_HOOK,
-			[
-				[
-					'billing_date' => $billing_date,
-					'retried'      => 0,
-				],
-			]
-		);
+		// 版本旗標只記最後一個版本，「升級 → 回滾 → 再升級」每次都判定為版本變更，
+		// 所以要再看同一筆首推是不是還在排程中（issue #32）
+		if ( self::has_scheduled_push( $args ) ) {
+			return;
+		}
+
+		\as_schedule_single_action( time() + self::BOOTSTRAP_DELAY, self::RETRY_HOOK, [ $args ] );
 
 		Plugin::logger(
 			sprintf( '新架構每日計費：外掛版本 %1$s 首次載入，已排程 %2$d 秒後推送一次以盡早建立身分綁定', $version, self::BOOTSTRAP_DELAY ),
@@ -222,6 +236,20 @@ final class DailyBillingCron {
 			// 每天都會走到這裡，而這類站根本不是運作中的經銷商站、沒有任何錢會漏。
 			// 上面的 error log 已足夠，不需要再多一筆帶完整 context 的告警。
 			return self::result( false, 'no_partner_id', $billing_date );
+		}
+
+		// 同一天已推送成功：回滾再重升、首推與定期排程落在同一業務日都會走到這裡（issue #32）。
+		// 接收端對已扣過點的日期不會再扣，略過不影響結果，也不寫告警
+		if ( self::is_already_pushed( (int) $partner_id, $billing_date ) ) {
+			Plugin::logger(
+				'新架構每日計費：此業務日已推送過，略過本次觸發',
+				'info',
+				[
+					'billing_date' => $billing_date,
+					'retried'      => $retried,
+				]
+			);
+			return self::result( false, 'already_pushed', $billing_date );
 		}
 
 		// 前置：PowerCloud API Key —— 不得以空 key 呼叫 API，避免 401 被誤判為「該經銷商沒有站」
@@ -491,6 +519,9 @@ final class DailyBillingCron {
 			return self::result( false, 'push_failed', $billing_date, count( $sites ), $total_amount );
 		}
 
+		// 只有成功才記：在 run() 開頭就記的話，第一次失敗後的重試全部會被略過，當天就收不到錢
+		self::mark_pushed( (int) $partner_id, $billing_date );
+
 		// 首推成功才建立本地綁定 —— 之後每次推送都會先與此值比對
 		if ( '' === $bound ) {
 			\update_option( self::BOUND_DEALER_ID_OPTION, $dealer_id, true );
@@ -661,17 +692,17 @@ final class DailyBillingCron {
 
 		$next_retry = $retried + 1;
 		$timestamp  = time() + self::RETRY_INTERVAL;
+		$args       = [
+			'billing_date' => $billing_date,
+			'retried'      => $next_retry,
+		];
 
-		\as_schedule_single_action(
-			$timestamp,
-			self::RETRY_HOOK,
-			[
-				[
-					'billing_date' => $billing_date,
-					'retried'      => $next_retry,
-				],
-			]
-		);
+		// 同一天有兩次觸發都失敗時（例如首推與定期排程），一筆重試就夠了
+		if ( self::has_scheduled_push( $args ) ) {
+			return;
+		}
+
+		\as_schedule_single_action( $timestamp, self::RETRY_HOOK, [ $args ] );
 
 		Plugin::logger(
 			sprintf(
@@ -687,6 +718,55 @@ final class DailyBillingCron {
 				'reason'       => $reason,
 			]
 		);
+	}
+
+	/**
+	 * 相同參數的推送是否已在排程中
+	 *
+	 * 不可改用 as_schedule_single_action() 的 $unique：它只比對 hook 與 group，不看 args，
+	 * 會把不同 billing_date 的排程也當成重複。
+	 *
+	 * @param array{billing_date: string, retried: int} $args 排程參數
+	 * @return bool
+	 */
+	private static function has_scheduled_push( array $args ): bool {
+		return \function_exists( 'as_has_scheduled_action' ) && \as_has_scheduled_action( self::RETRY_HOOK, [ $args ] );
+	}
+
+	/**
+	 * 取得已推送成功的標記
+	 *
+	 * @return array<mixed>
+	 */
+	private static function pushed_markers(): array {
+		$markers = \get_option( self::PUSHED_DATES_OPTION, [] );
+		return is_array( $markers ) ? $markers : [];
+	}
+
+	/**
+	 * 此經銷商的此業務日是否已推送成功
+	 *
+	 * @param int    $partner_id   經銷商 id
+	 * @param string $billing_date 業務日期
+	 * @return bool
+	 */
+	private static function is_already_pushed( int $partner_id, string $billing_date ): bool {
+		return isset( self::pushed_markers()[ "{$partner_id}:{$billing_date}" ] );
+	}
+
+	/**
+	 * 記下此經銷商的此業務日已推送成功
+	 *
+	 * @param int    $partner_id   經銷商 id
+	 * @param string $billing_date 業務日期
+	 * @return void
+	 */
+	private static function mark_pushed( int $partner_id, string $billing_date ): void {
+		$markers = self::pushed_markers();
+
+		$markers[ "{$partner_id}:{$billing_date}" ] = time();
+
+		\update_option( self::PUSHED_DATES_OPTION, array_slice( $markers, -self::PUSHED_DATES_KEEP, null, true ), false );
 	}
 
 	/**
