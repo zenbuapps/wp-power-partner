@@ -105,6 +105,7 @@ class DailyBillingPushTest extends TestCase {
 		\delete_option( DailyBillingCron::BOUND_DEALER_ID_OPTION );
 		\delete_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION );
 		\delete_option( DailyBillingCron::SCHEDULE_VERSION_OPTION );
+		\delete_option( 'power_partner_billing_pushed_dates' );
 	}
 
 	/**
@@ -116,6 +117,7 @@ class DailyBillingPushTest extends TestCase {
 		\delete_option( DailyBillingCron::BOUND_DEALER_ID_OPTION );
 		\delete_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION );
 		\delete_option( DailyBillingCron::SCHEDULE_VERSION_OPTION );
+		\delete_option( 'power_partner_billing_pushed_dates' );
 
 		if ( $this->http_mock ) {
 			\remove_filter( 'pre_http_request', $this->http_mock, 10 );
@@ -1514,6 +1516,252 @@ class DailyBillingPushTest extends TestCase {
 			$this->pending_actions( DailyBillingCron::RETRY_HOOK ),
 			'同一版本重複呼叫時首推排程數量仍應為 1'
 		);
+	}
+
+	/**
+	 * Rule: 「升級 → 回滾 → 再升級」期間，首推尚未執行時不重複排程（issue #32）
+	 *
+	 * 版本旗標只記「最後一個版本」，版本來回切換時每次都判定為新版本，所以防重複要看排程本身。
+	 *
+	 * @group edge
+	 */
+	public function test_bootstrap_push_not_duplicated_after_rollback_and_reupgrade(): void {
+		$cron = DailyBillingCron::instance();
+
+		$cron->maybe_schedule_bootstrap_push();
+
+		// 回滾後再升級：舊版把旗標寫回舊版本號，新版載入時又判定為版本變更
+		// （刻意用不存在的版本號：寫實際舊版本號的話，開發環境版本剛好相同時會提前 return，測試空轉）
+		\update_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION, '0.0.1', true );
+		$cron->maybe_schedule_bootstrap_push();
+
+		$this->assertCount(
+			1,
+			$this->pending_actions( DailyBillingCron::RETRY_HOOK ),
+			'同一 billing_date 已有 pending 首推時不應再排一筆'
+		);
+		$this->assertSame(
+			(string) \J7\PowerPartner\Plugin::$version,
+			\get_option( DailyBillingCron::BOOTSTRAP_VERSION_OPTION ),
+			'略過排程時仍要更新版本旗標，否則每次 init 都會再判斷一次'
+		);
+	}
+
+	/**
+	 * Rule: 不同業務日的首推不互相擋（跨日的回滾再升級仍要排）
+	 *
+	 * @group edge
+	 */
+	public function test_bootstrap_push_scheduled_when_pending_one_is_for_another_date(): void {
+		\as_schedule_single_action(
+			time() + HOUR_IN_SECONDS,
+			DailyBillingCron::RETRY_HOOK,
+			[
+				[
+					'billing_date' => '2020-01-01',
+					'retried'      => 0,
+				],
+			]
+		);
+
+		DailyBillingCron::instance()->maybe_schedule_bootstrap_push();
+
+		$this->assertCount( 2, $this->pending_actions( DailyBillingCron::RETRY_HOOK ) );
+	}
+
+	/**
+	 * Rule: 同一 billing_date 已推送成功時，之後的觸發不再抓清單也不再推送（issue #32）
+	 *
+	 * @group edge
+	 */
+	public function test_same_billing_date_is_pushed_only_once(): void {
+		$this->mock_http( [ $this->make_website() ] );
+
+		$first = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+		$this->assertTrue( $first['pushed'] );
+
+		$this->requests = [];
+		$second         = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertFalse( $second['pushed'] );
+		$this->assertSame( 'already_pushed', $second['reason'] );
+		$this->assertSame( '2026-08-19', $second['billing_date'] );
+		$this->assertSame( [], $this->requests, '已推送過的日期不應再打 PowerCloud 或 CloudServer' );
+		$this->assert_log( 'info', '已推送過' );
+		$this->assertSame( '', $this->alert_log(), '重複觸發是正常情況，不應寫告警' );
+	}
+
+	/**
+	 * Rule: 接收端回「已扣過點」（HTTP 200）同樣算推送成功，之後不再送
+	 *
+	 * @group edge
+	 */
+	public function test_receiver_already_deducted_also_marks_pushed(): void {
+		$this->mock_http(
+			[ $this->make_website() ],
+			[
+				'cloud_body' => [
+					'status' => 200,
+					'data'   => [ 'already_deducted' => true ],
+				],
+			]
+		);
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+		$second = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertSame( 'already_pushed', $second['reason'] );
+	}
+
+	/**
+	 * Rule: 只有推送成功才算數 —— 失敗後的重試必須真的再送一次
+	 *
+	 * 若在 run() 開頭就記標記，第一次失敗後的重試全部會被略過，當天就收不到錢。
+	 *
+	 * @dataProvider provide_failed_push_opts
+	 * @group error
+	 *
+	 * @param array<string, mixed> $opts mock_http 選項
+	 */
+	public function test_failed_attempt_does_not_block_retry( array $opts ): void {
+		$this->mock_http( [ $this->make_website() ], $opts );
+
+		$first = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+		$this->assertFalse( $first['pushed'] );
+
+		\remove_filter( 'pre_http_request', $this->http_mock, 10 );
+		$this->requests = [];
+		$this->mock_http( [ $this->make_website() ] );
+
+		$retry = DailyBillingCron::run(
+			[
+				'billing_date' => '2026-08-19',
+				'retried'      => 1,
+			]
+		);
+
+		$this->assertTrue( $retry['pushed'], '前一次失敗時重試必須真的送出' );
+		$this->assertNotNull( $this->push_request() );
+	}
+
+	/**
+	 * 失敗情境
+	 *
+	 * @return array<string, array{0: array<string, mixed>}>
+	 */
+	public function provide_failed_push_opts(): array {
+		return [
+			'推送回 500'    => [ [ 'cloud_status' => 500 ] ],
+			'清單抓取失敗'     => [ [ 'page_errors' => [ 1 => 500 ] ] ],
+			'永久性錯誤也不算推過' => [
+				[
+					'cloud_status' => 400,
+					'cloud_body'   => [
+						'message' => 'x',
+						'data'    => [ 'error_code' => 'not_a_dealer' ],
+					],
+				],
+			],
+		];
+	}
+
+	/**
+	 * Rule: 標記只擋同一天，隔天照常推送
+	 *
+	 * @group happy
+	 */
+	public function test_different_billing_date_still_pushes(): void {
+		$this->mock_http( [ $this->make_website() ] );
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+		$next_day = DailyBillingCron::run( [ 'billing_date' => '2026-08-20' ] );
+
+		$this->assertTrue( $next_day['pushed'] );
+	}
+
+	/**
+	 * Rule: 排程積壓時，隔天先推成功不可讓前一天的重試被略過，也不可洗掉隔天的標記
+	 *
+	 * @group edge
+	 */
+	public function test_out_of_order_dates_keep_their_own_markers(): void {
+		$this->mock_http( [ $this->make_website() ] );
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-20' ] );
+		$older = DailyBillingCron::run(
+			[
+				'billing_date' => '2026-08-19',
+				'retried'      => 1,
+			]
+		);
+		$this->assertTrue( $older['pushed'], '前一天尚未推過，應送出' );
+
+		$again = DailyBillingCron::run( [ 'billing_date' => '2026-08-20' ] );
+		$this->assertSame( 'already_pushed', $again['reason'], '補推前一天不應洗掉隔天的標記' );
+	}
+
+	/**
+	 * Rule: 同一天換綁經銷商後，新經銷商的推送不受舊標記影響（扣點對象不同）
+	 *
+	 * @group edge
+	 */
+	public function test_marker_is_scoped_to_partner_id(): void {
+		$this->mock_http( [ $this->make_website() ] );
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		\update_option( Connect::PARTNER_ID_OPTION_NAME, '175' );
+		$other_partner = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertTrue( $other_partner['pushed'] );
+	}
+
+	/**
+	 * Rule: 標記只保留最近幾筆，option 不會無限長大
+	 *
+	 * @group edge
+	 */
+	public function test_pushed_markers_are_trimmed(): void {
+		$this->mock_http( [ $this->make_website() ] );
+
+		$total = DailyBillingCron::PUSHED_DATES_KEEP + 5;
+		for ( $i = 1; $i <= $total; $i++ ) {
+			DailyBillingCron::run( [ 'billing_date' => sprintf( '2026-08-%02d', $i ) ] );
+		}
+
+		$markers = \get_option( DailyBillingCron::PUSHED_DATES_OPTION );
+
+		$this->assertCount( DailyBillingCron::PUSHED_DATES_KEEP, $markers );
+		$this->assertArrayHasKey( self::PARTNER_ID . ':' . sprintf( '2026-08-%02d', $total ), $markers, '最新一筆要留著' );
+	}
+
+	/**
+	 * Rule: 標記內容異常（例如被手動改壞）時不 fatal，視為沒有標記
+	 *
+	 * @group edge
+	 */
+	public function test_corrupted_marker_option_is_ignored(): void {
+		\update_option( DailyBillingCron::PUSHED_DATES_OPTION, 'not-an-array', false );
+		$this->mock_http( [ $this->make_website() ] );
+
+		$result = DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertTrue( $result['pushed'] );
+		$this->assertIsArray( \get_option( DailyBillingCron::PUSHED_DATES_OPTION ) );
+	}
+
+	/**
+	 * Rule: 同日期、同重試次數已有 pending 重試時不重複排（兩條失敗鏈不要各排一筆）
+	 *
+	 * @group error
+	 */
+	public function test_retry_not_duplicated_when_same_retry_pending(): void {
+		$this->mock_http( [ $this->make_website() ], [ 'cloud_status' => 500 ] );
+
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+		DailyBillingCron::run( [ 'billing_date' => '2026-08-19' ] );
+
+		$this->assertCount( 1, $this->pending_actions( DailyBillingCron::RETRY_HOOK ) );
 	}
 
 	/**
