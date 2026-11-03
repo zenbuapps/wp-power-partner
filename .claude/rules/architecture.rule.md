@@ -147,7 +147,7 @@ Customer buys subscription
 瀏覽器不持有 API key，由 PHP 代為呼叫 `api.wpsite.pro`。**不寄任何信**。
 
 - **`Core\CustomerSiteApi`** — Singleton。`GET /powercloud/sites`、`POST /powercloud/sites/{id}/start|stop|domain`，權限 `is_user_logged_in`。寫入前先確認歸屬，不轉送上游回應。
-- **`Services\CustomerSites`** — Abstract。`owned_by()` 判斷歸屬（訂閱綁定優先，沒綁任何訂閱才比對 `adminEmail`）；`to_public()` 只留 `PUBLIC_FIELDS`。規則與理由見 CLAUDE.md 常見陷阱 40。
+- **`Services\CustomerSites`** — Abstract。`owned_by()` 判斷歸屬（綁在自己訂閱上，或 `adminEmail` 與自己相同）；`to_public()` 只留 `PUBLIC_FIELDS`。規則與理由見 CLAUDE.md 常見陷阱 40。
 
 ### `Domains\Settings`
 監聽設定變更並重新排程。

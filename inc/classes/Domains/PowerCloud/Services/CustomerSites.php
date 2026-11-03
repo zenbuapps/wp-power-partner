@@ -6,7 +6,6 @@ namespace J7\PowerPartner\Domains\PowerCloud\Services;
 
 use J7\PowerPartner\Api\FetchPowerCloud;
 use J7\PowerPartner\Domains\Cloud\Shared\Arr;
-use J7\PowerPartner\Product\SiteSync;
 use J7\PowerPartner\ShopSubscription;
 
 /**
@@ -14,11 +13,13 @@ use J7\PowerPartner\ShopSubscription;
  *
  * PowerCloud API key 的範圍是整個經銷商帳號，API 不認識本站的客戶，所以歸屬只能由本站判斷：
  * 1. 站台綁在這位客戶的訂閱上（pp_linked_site_ids）→ 屬於他
- * 2. 站台綁在別人的訂閱上 → 不屬於他，就算 adminEmail 相同也一樣
- * 3. 沒有綁任何訂閱（例如後台手動開站）→ 比對 adminEmail
+ * 2. 站台的 adminEmail 與這位客戶的 email 相同 → 屬於他
  *
- * 第 2 點不可省略：WooCommerce「我的帳號」改 email 不需要驗證，只比 adminEmail 的話，
- * 客戶把自己的 email 改成對方的，就能取得對方站台的管理員密碼。
+ * 兩條是「或」：經銷商用自己的帳號代客戶下單時，訂閱屬於經銷商，adminEmail 卻是客戶填的帳單 email
+ * （SiteSync 取 $parent_order->get_billing_email()），雙方都要看得到，否則更新後客戶的站會消失。
+ *
+ * 已知限制：WordPress 不允許兩個帳號用同一個 email，但註冊與改 email 都不驗證信箱。
+ * 如果某站的 adminEmail 沒有任何帳號在用（例如原客戶後來改了 email），別人用它註冊就能取得該站。
  */
 abstract class CustomerSites {
 
@@ -71,7 +72,9 @@ abstract class CustomerSites {
 				continue;
 			}
 
-			if ( isset( $linked_ids[ $id ] ) || self::is_owned_by_email( $id, $site, $email, $user_id ) ) {
+			$is_email_match = '' !== $email && self::normalize_email( $site['adminEmail'] ?? null ) === $email;
+
+			if ( isset( $linked_ids[ $id ] ) || $is_email_match ) {
 				$owned[ $id ] = $site;
 			}
 		}
@@ -103,49 +106,6 @@ abstract class CustomerSites {
 			}
 		}
 		return $linked_ids;
-	}
-
-	/**
-	 * 站台的 adminEmail 與使用者相同，而且沒有綁在別人的訂閱上
-	 *
-	 * 這裡要比對訂閱的客戶，不可把「查到訂閱」直接當成別人的：linked_site_ids() 讀的是 WCS 的
-	 * 客戶訂閱快取，快取過期時，客戶自己訂閱上的站也會走到這裡，不比對就會被誤判成別人的。
-	 *
-	 * @param string               $id      站台 id
-	 * @param array<string, mixed> $site    站台原始資料
-	 * @param string               $email   使用者 email（已正規化）
-	 * @param int                  $user_id 使用者 ID
-	 * @return bool
-	 */
-	private static function is_owned_by_email( string $id, array $site, string $email, int $user_id ): bool {
-		if ( '' === $email || self::normalize_email( $site['adminEmail'] ?? null ) !== $email ) {
-			return false;
-		}
-
-		$subscriptions = \wcs_get_subscriptions(
-			[
-				'subscriptions_per_page' => -1,
-				'subscription_status'    => 'any',
-				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
-					[
-						'key'   => SiteSync::LINKED_SITE_IDS_META_KEY,
-						'value' => $id,
-					],
-				],
-			]
-		);
-
-		if ( [] === $subscriptions ) {
-			return true;
-		}
-
-		foreach ( $subscriptions as $subscription ) {
-			if ( (int) $subscription->get_customer_id() === $user_id ) {
-				return true;
-			}
-		}
-
-		return false;
 	}
 
 	/**

@@ -5,7 +5,7 @@
  * 舊版把 PowerCloud API key 送到每個前台頁面，任何登入的客戶都能拿來操作經銷商底下的所有站台。
  * 本檔鎖住：
  * - key 只給 wp-admin 的管理員
- * - 站台歸屬由 PHP 判斷：訂閱綁定優先，沒綁任何訂閱才比對 adminEmail
+ * - 站台歸屬由 PHP 判斷：綁在自己訂閱上，或 adminEmail 與自己相同
  * - 回應只含 PUBLIC_FIELDS，寫入操作不轉送上游回應
  */
 
@@ -30,8 +30,7 @@ class PowerCloudCustomerSiteApiTest extends TestCase {
 	private const SITE_OWN       = 'aaaaaaaa-0000-4000-8000-000000000001';
 	private const SITE_LINKED    = 'aaaaaaaa-0000-4000-8000-000000000002';
 	private const SITE_OTHER     = 'aaaaaaaa-0000-4000-8000-000000000003';
-	private const SITE_HIJACK    = 'aaaaaaaa-0000-4000-8000-000000000004';
-	private const SITE_CANCELLED = 'aaaaaaaa-0000-4000-8000-000000000005';
+	private const SITE_PROXY     = 'aaaaaaaa-0000-4000-8000-000000000004';
 
 	/** @var int 管理員 */
 	private int $admin_id;
@@ -366,7 +365,7 @@ class PowerCloudCustomerSiteApiTest extends TestCase {
 	}
 
 	/**
-	 * WCS 的客戶訂閱快取過期時，不可把客戶自己訂閱上的站誤判成別人的
+	 * WCS 的客戶訂閱快取過期時，email 相同的站仍看得到
 	 */
 	public function test_訂閱快取過期時email相同的自己站台仍屬於自己(): void {
 		$this->websites[] = $this->website( self::SITE_LINKED, 'customer@test.com' );
@@ -378,23 +377,23 @@ class PowerCloudCustomerSiteApiTest extends TestCase {
 	}
 
 	/**
-	 * WooCommerce「我的帳號」改 email 不需要驗證，不可藉此取得別人訂閱上的站台
+	 * 代客戶下單：訂閱屬於經銷商，adminEmail 是客戶的帳單 email，雙方都要看得到
 	 */
-	public function test_綁在別人訂閱上的站台即使email相同也不屬於自己(): void {
-		$this->websites[] = $this->website( self::SITE_HIJACK, 'customer@test.com' );
-		$this->subscription( $this->other_customer_id, [ self::SITE_HIJACK ] );
+	public function test_代客戶下單時客戶與下單帳號都看得到站台(): void {
+		$this->websites[] = $this->website( self::SITE_PROXY, 'customer@test.com' );
+		$this->subscription( $this->other_customer_id, [ self::SITE_PROXY ] );
+
 		\wp_set_current_user( $this->customer_id );
+		$this->assertSame( [ self::SITE_OWN, self::SITE_PROXY ], $this->returned_site_ids( $this->get_sites() ) );
+		$this->assertSame( 200, $this->post_action( self::SITE_PROXY, 'stop' )->get_status() );
 
-		$response = $this->get_sites();
-
-		$this->assertSame( [ self::SITE_OWN ], $this->returned_site_ids( $response ) );
-		$this->assertStringNotContainsString( 'admin-password-' . self::SITE_HIJACK, (string) \wp_json_encode( $response->get_data() ) );
+		\wp_set_current_user( $this->other_customer_id );
+		$this->assertSame( [ self::SITE_OTHER, self::SITE_PROXY ], $this->returned_site_ids( $this->get_sites() ) );
+		$this->assertSame( 200, $this->post_action( self::SITE_PROXY, 'start' )->get_status() );
 	}
 
-	public function test_綁在別人已取消訂閱上的站台也不屬於自己(): void {
-		$this->websites[] = $this->website( self::SITE_CANCELLED, 'customer@test.com' );
-		$subscription     = $this->subscription( $this->other_customer_id, [ self::SITE_CANCELLED ] );
-		$subscription->update_status( 'cancelled' );
+	public function test_email不同也沒綁訂閱的站台看不到(): void {
+		$this->subscription( $this->customer_id, [ self::SITE_LINKED ] );
 		\wp_set_current_user( $this->customer_id );
 
 		$this->assertSame( [ self::SITE_OWN ], $this->returned_site_ids( $this->get_sites() ) );
