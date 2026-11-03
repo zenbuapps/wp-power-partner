@@ -41,6 +41,8 @@ final class Bootstrap {
 		Domains\Cloud\Core\ProxyApi::instance();
 		Domains\Cloud\Core\Migration::instance();
 		Domains\Cloud\Core\Notices::instance();
+		// 前台客戶的 PowerCloud 站台：瀏覽器不持有 API key
+		Domains\PowerCloud\Core\CustomerSiteApi::instance();
 		Order::instance();
 		Product\DataTabs\LinkedSites::instance();
 		Product\DataTabs\LinkedLC::instance();
@@ -102,15 +104,13 @@ final class Bootstrap {
 
 		$power_partner_settings = (array) \get_option( 'power_partner_settings', [] );
 
-		// AdminApp (wp-admin) 要 manage_options；UserApp (frontend shortcode) 只要登入即可
-		$powercloud_api_key = '';
-		$can_access_key     = \is_admin()
-			? \current_user_can( 'manage_options' )
-			: \is_user_logged_in();
-		if ( $can_access_key ) {
-			$stored_key         = \get_transient( Api\Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
-			$powercloud_api_key = \is_string( $stored_key ) ? $stored_key : '';
-		}
+		// ⛔ PowerCloud API key 可以操作經銷商底下的所有站台，只能給 wp-admin 的管理員（AdminApp）。
+		// 前台 UserApp 一律打 /power-partner/powercloud/sites，由 Domains\PowerCloud\Core\CustomerSiteApi 代為呼叫
+		$stored_key           = \get_transient( Api\Main::POWERCLOUD_API_KEY_TRANSIENT_KEY );
+		$has_powercloud_key   = \is_string( $stored_key ) && '' !== $stored_key;
+		$can_access_key       = \is_admin() && \current_user_can( 'manage_options' );
+		$powercloud_api_key   = $has_powercloud_key && $can_access_key ? $stored_key : '';
+		$powercloud_connected = $has_powercloud_key && \is_user_logged_in();
 
 		\wp_localize_script(
 			Plugin::$kebab,
@@ -139,6 +139,7 @@ final class Bootstrap {
 					// 前端一律打本站 /power-partner/cloud/*，由 Domains\Cloud\Core\ProxyApi 加上認證後轉送
 					'POWERCLOUD_API'            => $this->powercloud_api,
 					'powercloud_api_key'        => $powercloud_api_key,
+					'powercloud_connected'      => $powercloud_connected,
 					'is_kiwissec'               => strpos( \site_url(), 'kiwissec.io' ) !== false,
 					'myAccountUrl'              => \get_permalink( \wc_get_page_id( 'myaccount' ) ),
 				],

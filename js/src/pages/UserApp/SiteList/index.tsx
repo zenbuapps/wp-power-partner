@@ -1,22 +1,13 @@
 import { CloudOutlined, GlobalOutlined } from '@ant-design/icons'
 import { Tabs, TabsProps } from 'antd'
-import { useAtomValue } from 'jotai'
-
-import {
-	EPowercloudIdentityStatusEnum,
-	powercloudIdentityAtom,
-} from '@/pages/AdminApp/Atom/powercloud.atom'
 
 import Powercloud from './Powercloud'
 import WPCD from './WPCD'
 
-const index = () => {
-	const powercloudIdentity = useAtomValue(powercloudIdentityAtom)
-	const hasPowerCloudApiKey =
-		powercloudIdentity.status === EPowercloudIdentityStatusEnum.LOGGED_IN &&
-		!!powercloudIdentity.apiKey
+import { powercloud_connected } from '@/utils'
 
-	if (!hasPowerCloudApiKey) {
+const index = () => {
+	if (!powercloud_connected) {
 		return <WPCD />
 	}
 

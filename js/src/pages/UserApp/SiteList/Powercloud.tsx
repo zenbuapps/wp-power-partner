@@ -25,12 +25,13 @@ import {
 	Typography,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
+import { isAxiosError } from 'axios'
 import { useSetAtom } from 'jotai'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
-import { powerCloudAxios, usePowerCloudAxiosWithApiKey } from '@/api'
+import { axios } from '@/api'
 import { globalLoadingAtom } from '@/pages/UserApp/atom'
-import { currentUserEmail } from '@/utils'
+import { getErrorMessage, kebab } from '@/utils'
 
 const { Text, Link } = Typography
 
@@ -48,41 +49,34 @@ const statusTextMap: Record<string, string> = {
 	deleting: '刪除中',
 }
 
+/** 本站 proxy 的路徑：瀏覽器不持有 PowerCloud API key，歸屬與欄位都由 PHP 決定 */
+const SITES_PATH = `/${kebab}/powercloud/sites`
+
+/** 這些錯誤代表操作確定沒有成功；其他情況（逾時、閘道錯誤）操作可能仍在進行 */
+const DEFINITE_FAILURE_CODES = [
+	'not_owner',
+	'invalid_domain',
+	'pp_upstream_error',
+]
+
+const isDefiniteFailure = (error: unknown): boolean =>
+	isAxiosError<{ code?: string }>(error) &&
+	DEFINITE_FAILURE_CODES.includes(error.response?.data?.code ?? '')
+
+/** 欄位由 CustomerSites::PUBLIC_FIELDS 決定 */
 interface IWebsite {
 	id: string
 	name: string
 	domain?: string
 	primaryDomain?: string
 	subDomain?: string
-	wildcardDomain: string
-	namespace: string
+	wildcardDomain?: string
 	status: string
-	adminUsername: string
 	adminEmail: string
 	adminPassword: string
-	databaseName: string
-	databaseUsername: string
-	databasePassword: string | null
-	databaseRootPassword: string | null
-	package: {
-		id: string
-		name: string
-		description: string
-		price: string
-		wordpressSize: string
-		mysqlSize: string
-	} | null
-	user: {
-		id: string
-		firstName: string
-		lastName: string
-		email: string
-	} | null
-	phpPodSize: number
 	ipAddress: string
 	memo?: string
 	createdAt: string
-	updatedAt: string
 }
 
 interface IWebsiteResponse {
@@ -108,36 +102,11 @@ const getDomain = (website: IWebsite): string => {
 }
 
 const Powercloud = () => {
-	const powerCloudInstance = usePowerCloudAxiosWithApiKey(powerCloudAxios)
 	const setGlobalLoading = useSetAtom(globalLoadingAtom)
 
-	// 一次拉足夠多的資料，前端用 adminEmail 過濾當前客戶的網站
-	const [pagination] = useState({ page: 1, limit: 100 })
-
-	const { data, isLoading, refetch, isFetching } = useQuery({
-		queryKey: [
-			'powercloud-websites-user',
-			pagination.page,
-			pagination.limit,
-		],
-		queryFn: () =>
-			powerCloudInstance.get<IWebsiteResponse>(
-				`/websites?page=${pagination.page}&limit=${pagination.limit}`
-			),
-	})
-
-	const { mutate: startWebsite } = useMutation({
-		mutationFn: (id: string) => {
-			return powerCloudInstance.patch(`/wordpress/${id}/start`)
-		},
-		onSuccess: () => refetch(),
-	})
-
-	const { mutate: stopWebsite } = useMutation({
-		mutationFn: (id: string) => {
-			return powerCloudInstance.patch(`/wordpress/${id}/stop`)
-		},
-		onSuccess: () => refetch(),
+	const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
+		queryKey: ['powercloud-websites-user'],
+		queryFn: () => axios.get<IWebsiteResponse>(SITES_PATH),
 	})
 
 	// Shadow DOM 容器與通知 context（App2 前臺包在 react-shadow Shadow Root 內，
@@ -147,6 +116,28 @@ const Powercloud = () => {
 		placement: 'bottomRight',
 		duration: 10,
 		getContainer: () => containerRef.current as HTMLElement,
+	})
+
+	const { mutate: startWebsite } = useMutation({
+		mutationFn: (id: string) => axios.post(`${SITES_PATH}/${id}/start`),
+		onSuccess: () => refetch(),
+		onError: (mutationError) => {
+			api.error({
+				message: '啟動站台失敗',
+				description: getErrorMessage(mutationError, '請稍後再試'),
+			})
+		},
+	})
+
+	const { mutate: stopWebsite } = useMutation({
+		mutationFn: (id: string) => axios.post(`${SITES_PATH}/${id}/stop`),
+		onSuccess: () => refetch(),
+		onError: (mutationError) => {
+			api.error({
+				message: '停止站台失敗',
+				description: getErrorMessage(mutationError, '請稍後再試'),
+			})
+		},
 	})
 
 	// 變更域名 Modal 狀態與表單
@@ -160,7 +151,7 @@ const Powercloud = () => {
 	 */
 	const { mutate: changeDomain, isPending: isChangingDomain } = useMutation({
 		mutationFn: ({ id, newDomain }: TChangeDomainVariables) => {
-			return powerCloudInstance.patch(`/wordpress/${id}/domain`, {
+			return axios.post(`${SITES_PATH}/${id}/domain`, {
 				domain: newDomain,
 			})
 		},
@@ -186,7 +177,20 @@ const Powercloud = () => {
 			refetch()
 			form.resetFields()
 		},
-		onError: (_error, { id, oldDomain, newDomain }: TChangeDomainVariables) => {
+		onError: (
+			mutationError,
+			{ id, oldDomain, newDomain }: TChangeDomainVariables
+		) => {
+			// 網域變更可能要數分鐘，閘道逾時不代表失敗，不能告訴客戶「失敗」讓他重送
+			if (!isDefiniteFailure(mutationError)) {
+				api.warning({
+					key: `cd-${id}`,
+					message: '域名變更結果未確認',
+					description: `${newDomain} 的變更可能仍在處理中，請數分鐘後重新整理列表確認`,
+				})
+				return
+			}
+
 			api.error({
 				key: `cd-${id}`,
 				message: '域名變更失敗',
@@ -218,16 +222,7 @@ const Powercloud = () => {
 		})
 	}
 
-	// 用 adminEmail 過濾當前客戶的網站
-	const allWebsites = data?.data?.data || []
-	const websites = useMemo(
-		() =>
-			allWebsites.filter(
-				(site) =>
-					site.adminEmail?.toLowerCase() === currentUserEmail.toLowerCase()
-			),
-		[allWebsites, currentUserEmail]
-	)
+	const websites = data?.data?.data || []
 
 	useEffect(() => {
 		if (!isLoading) {
@@ -415,6 +410,18 @@ const Powercloud = () => {
 					<Text type="secondary">載入網站列表中...</Text>
 				</div>
 			</div>
+		)
+	}
+
+	// 載入失敗不可顯示成「尚無網站」
+	if (isError) {
+		return (
+			<Alert
+				type="error"
+				showIcon
+				message="無法載入新架構網站列表"
+				description={getErrorMessage(error, '請稍後再試')}
+			/>
 		)
 	}
 

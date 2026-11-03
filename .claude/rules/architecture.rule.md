@@ -143,6 +143,12 @@ Customer buys subscription
 
 `Bootstrap` 在 `Api\User::instance()` 之後依序啟動 `ConnectionApi` → `ProxyApi` → `Migration` → `Notices`。**不寄任何信**，異常只寫 log 或顯示 notice。
 
+### `Domains\PowerCloud`（前台客戶的 PowerCloud 站台）
+瀏覽器不持有 API key，由 PHP 代為呼叫 `api.wpsite.pro`。**不寄任何信**。
+
+- **`Core\CustomerSiteApi`** — Singleton。`GET /powercloud/sites`、`POST /powercloud/sites/{id}/start|stop|domain`，權限 `is_user_logged_in`。寫入前先確認歸屬，不轉送上游回應。
+- **`Services\CustomerSites`** — Abstract。`owned_by()` 判斷歸屬（訂閱綁定優先，沒綁任何訂閱才比對 `adminEmail`）；`to_public()` 只留 `PUBLIC_FIELDS`。規則與理由見 CLAUDE.md 常見陷阱 40。
+
 ### `Domains\Settings`
 監聽設定變更並重新排程。
 
@@ -168,6 +174,7 @@ Abstract class。透過 `X-API-Key` header 與 `api.wpsite.pro` 通訊。
 - `site_sync(array $props, string $plan_id, string $template_id)` — POST `/wordpress`
 - `disable_site(string $user_id, string $websiteId): bool` — PATCH `/wordpress/{id}/stop`，HTTP 2xx 才回傳 `true`（issue #13）
 - `enable_site(string $user_id, string $websiteId): bool` — PATCH `/wordpress/{id}/start`，HTTP 2xx 才回傳 `true`（issue #13）
+- `patch_website(string $user_id, string $website_id, string $action, array $body): array` — PATCH `/wordpress/{id}/{start|stop|domain}`，供 `Domains\PowerCloud` 代替前台客戶操作；回 `{ok, status, message}`，`status` 0 代表沒收到回應。回應原文不進 log
 - `get_allowed_template_options()` — GET `/templates/wordpress`
 - `get_open_site_plan_options()` — GET `/website-packages`
 

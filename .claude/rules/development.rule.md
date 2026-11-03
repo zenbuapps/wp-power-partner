@@ -155,7 +155,7 @@ pnpm zip             # 手動建立 ZIP
 - `api/axios.tsx` — WP REST Axios 實例（每次請求經 `applyCurrentNonce` 帶 `wpApiSettings.nonce`）
 - `api/cloudAxios.tsx` — cloud.luke.cafe 的 Axios 實例，**baseURL 是本站 PHP proxy**（`cloudProxyUrl` = `{wpApiSettings.root}/power-partner/cloud`），呼叫路徑與 CloudServer 相同；雲端認證由 PHP 補上，**瀏覽器不帶任何雲端憑證**。路由與 audience 見 CLAUDE.md `/cloud/*` 表，新增呼叫前先確認 `ProxyApi::ROUTES` 有宣告，沒有的路徑會 404
 - `api/nonce.tsx` — nonce 管理：`applyCurrentNonce`（request interceptor）、`retryWithFreshNonce`（response error）、`refreshNonce()`、`fetchWithNonce()`（原生 `fetch` 用）。nonce 過期（HTTP 403 + `rest_cookie_invalid_nonce`）時打 admin-ajax `action=rest-nonce` 換新、寫回 `wpApiSettings.nonce` 並**只重送一次**（`ppNonceRetried` 防迴圈）；多個請求同時過期共用同一次換新，換新有 30 秒逾時。重送失敗由重送那一輪通知並 reject，呼叫端不可再通知一次
-- `api/powerCloudAxios.tsx` — api.wpsite.pro Axios 實例
+- `api/powerCloudAxios.tsx` — api.wpsite.pro Axios 實例，**只給 AdminApp 用**（帶 wp-admin 管理員才拿得到的 API key）。前台 UserApp 用 `api/axios.tsx` 打 `/power-partner/powercloud/sites`，見 CLAUDE.md 常見陷阱 40
 - `api/resources/` — CRUD helpers（create, get, update, delete）
 - **不要**再從 `window.power_partner_data.env` 讀 `t` / `cloudBaseUrl`（已移除）；不要把帳密存進 localStorage（開機時 `main.tsx` 會清掉殘留的 `power-partner-account`）
 

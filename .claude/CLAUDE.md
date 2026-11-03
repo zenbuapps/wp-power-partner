@@ -61,6 +61,9 @@ power-partner/
 │   │   │   ├── Core/Migration.php                   # AS 每日自動換專屬密碼
 │   │   │   ├── Core/Notices.php                     # 需重新登入時的 admin notice
 │   │   │   └── Shared/{Arr,RawResponse}.php
+│   │   ├── PowerCloud/                              # 前台客戶的 PowerCloud 站台：瀏覽器不持有 API key
+│   │   │   ├── Core/CustomerSiteApi.php             # /powercloud/sites：瀏覽器 → 本站 → PowerCloud
+│   │   │   └── Services/CustomerSites.php           # 站台歸屬判斷、客戶可見欄位
 │   │   ├── Email/Core/SubscriptionEmailHooks.php    # 訂閱生命週期 → 排程發信
 │   │   ├── Site/Core/DisableHooks.php               # 訂閱失敗 → 停用/恢復網站
 │   │   ├── LC/Core/LifeCycle.php                    # 授權碼 建立/停用/恢復
@@ -94,6 +97,7 @@ PowerCloud API key 儲存方式:
 - 全域: transient `power_partner_powercloud_api_key`（無 TTL）
 - Per-user 舊版: transient `power_partner_powercloud_api_key_{user_id}`（無 TTL）
 - `FetchPowerCloud::get_powercloud_api_key()` 優先使用全域 key，fallback 到 per-user key
+- ⛔ 只有 wp-admin 的管理員拿得到，前台一律走 `/power-partner/powercloud/sites`（常見陷阱 40）
 
 ## CloudServer 連線（`Domains\Cloud`，v3.6.0）
 
@@ -190,6 +194,9 @@ PowerCloud API key 儲存方式:
 | POST | `/connection` | `manage_options` | `{email, password}` 登入：先試 `v3/connect`，不支援/不符資格退回舊 `POST identity`。帳密錯誤也回 HTTP 200，失敗看 body 的 `status`；回應帶 `Cache-Control: no-store` |
 | DELETE | `/connection` | `manage_options` | 登出：盡力呼叫 `DELETE v3/connect` 撤銷專屬密碼，再清除本地專屬密碼、legacy 帳密、partner_id、migration、模板快取 |
 | GET/POST/DELETE | `/cloud/*` | admin 或已登入 | 瀏覽器 → 本站 → CloudServer 的轉送層，逐條宣告，見下表 |
+| GET | `/powercloud/sites` | 已登入 | 當前使用者的 PowerCloud 站台（只含 `CustomerSites::PUBLIC_FIELDS`），見常見陷阱 40 |
+| POST | `/powercloud/sites/{id}/start`、`/stop` | 已登入 | 啟動 / 停止自己的站台，不是自己的回 403 `not_owner` |
+| POST | `/powercloud/sites/{id}/domain` | 已登入 | `{domain}` 變更自己站台的網域，格式不合法回 400 `invalid_domain` |
 | GET | `/customers-by-search` | `manage_options` | 搜尋用戶 |
 | GET | `/customers` | 已登入（`is_user_logged_in`） | 以 ID 陣列查詢用戶。3.5.5 起不再 public；非管理員只能查自己，範圍不含自己時回空陣列（見常見陷阱 32） |
 
@@ -382,3 +389,5 @@ string $key, $enabled, $subject, $body, $action_name, $days, $operator; bool $un
 
 
 39. **⛔ `login_challenge`（帳號需要驗證碼或兩步驟驗證）是永久性的，不可當成暫時性錯誤重試** — cloud.luke.cafe 上的登入驗證碼（Powerhouse captcha）、two-factor、Fluent 的 email 2FA 都會讓 `wp_authenticate()` 失敗，但不是帳密錯誤。CloudServer（#23 起）在 `POST identity`、`POST v3/connect`、`logs/{id}/detail` 遇到這類失敗時回 HTTP 403 + `data.error_code: 'login_challenge'`（Fluent 封鎖 IP、限流仍是 429，帳密錯誤的回應不變）。若當成暫時性錯誤：遷移永遠停在 pending、每天重試、沒有任何提示，根除後重新登入也一樣失敗；captcha 失敗還會被 Fluent 計數，email 2FA 每天寄一封驗證信給經銷商。所以（`ConnectionService::is_login_challenge()`）：(1) 不計入真實密碼閘門的失敗、也不觸發 429 冷卻；(2) 寫入 `power_partner_cloud_legacy_account_rejected`，reason 為 `login_challenge`——**不適用 24 小時過期重試**，之後 `status()`、點數明細、`Migration` 都不再自動送出真實密碼；(3) 遷移標 `failed`（reason `login_challenge`）；(4) **只有經銷商手動登入成功才清除**（`save_legacy_account()` / `delete_legacy_account()`）；(5) 手動登入收到它時回傳 CloudServer 的 message，不退回舊流程 `POST identity`（一樣過不了）。提示「此帳號啟用了登入驗證碼或兩步驟驗證，無法自動換成專屬密碼，請聯繫站長路可協助」（Power Partner 頁面與 wp-admin 首頁；共用帳號停用後改成全域）。⛔ 它不是「專屬密碼被拒」，不可加進 `CloudClient::CREDENTIAL_REJECTED_CODES`。另外，遷移**連續 3 天**（`MIGRATION_STUCK_AFTER`）停在 pending（不論原因，例如每天都 429）時提示「已連續 3 天無法自動換成專屬密碼，請到 Power Partner 重新登入一次；若仍失敗請聯繫站長路可」——起點記在 `power_partner_cloud_migration` 的 `since`，每日重試失敗不重設，手動重新登入才重新起算。
+
+40. **⛔ PowerCloud API key 只能給 wp-admin 的管理員，不可再送到前台** — `Bootstrap::enqueue_script()` 只在 `is_admin() && manage_options` 時輸出 `powercloud_api_key`；前台（含管理員逛前台）一律是空字串，只輸出 `powercloud_connected`（已登入且本站有 key）決定要不要顯示新架構分頁。key 的範圍是整個經銷商帳號，API 不認識本站客戶，所以前台 UserApp 一律打 `/power-partner/powercloud/sites`（`Domains\PowerCloud\Core\CustomerSiteApi`），由 PHP 持 key 呼叫 API。不可把 `powerCloudAxios` / `usePowerCloudAxiosWithApiKey` 用回 UserApp。**歸屬判斷**（`CustomerSites::owned_by()`）：綁在自己訂閱上 → 屬於自己；綁在別人訂閱上（任何狀態）→ 不屬於自己，就算 `adminEmail` 相同；沒綁任何訂閱（後台手動開站）→ 比對 `adminEmail`。不可退回只比 `adminEmail`：WooCommerce「我的帳號」改 email 不需要驗證。**已知限制**：沒綁訂閱的站仍只能靠 `adminEmail`。**回應**：只回 `CustomerSites::PUBLIC_FIELDS`（允許清單，對端新增欄位預設不外流）；寫入操作不轉送上游回應（可能帶憑證），失敗只取 `message`，log 也不寫回應原文。**清單抓取失敗（`fetch_websites()` 回 null）一律回 502**，不可當成「沒有站台」或放行寫入。**網域變更可能要數分鐘**：`patch_website()` 逾時 290 秒（比瀏覽器的 300 秒先結束），`pp_upstream_unavailable`、閘道逾時在前端顯示「結果未確認」而不是「失敗」，否則客戶會重送；只有 `not_owner` / `invalid_domain` / `pp_upstream_error` 才是確定失敗。**只修程式不會讓已外流的 key 失效**：要作廢 key 必須在 `api.wpsite.pro` 端處理，本站重新認證或「登出」只換本地 transient。
