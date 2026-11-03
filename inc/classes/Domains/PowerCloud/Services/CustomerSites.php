@@ -71,7 +71,7 @@ abstract class CustomerSites {
 				continue;
 			}
 
-			if ( isset( $linked_ids[ $id ] ) || self::is_unlinked_site_of_email( $id, $site, $email ) ) {
+			if ( isset( $linked_ids[ $id ] ) || self::is_owned_by_email( $id, $site, $email, $user_id ) ) {
 				$owned[ $id ] = $site;
 			}
 		}
@@ -106,23 +106,25 @@ abstract class CustomerSites {
 	}
 
 	/**
-	 * 站台的 adminEmail 與使用者相同，而且沒有綁在任何訂閱上
+	 * 站台的 adminEmail 與使用者相同，而且沒有綁在別人的訂閱上
 	 *
-	 * 呼叫前已確認站台不在這位使用者的訂閱裡，所以查到任何訂閱都是別人的
+	 * 這裡要比對訂閱的客戶，不可把「查到訂閱」直接當成別人的：linked_site_ids() 讀的是 WCS 的
+	 * 客戶訂閱快取，快取過期時，客戶自己訂閱上的站也會走到這裡，不比對就會被誤判成別人的。
 	 *
-	 * @param string               $id    站台 id
-	 * @param array<string, mixed> $site  站台原始資料
-	 * @param string               $email 使用者 email（已正規化）
+	 * @param string               $id      站台 id
+	 * @param array<string, mixed> $site    站台原始資料
+	 * @param string               $email   使用者 email（已正規化）
+	 * @param int                  $user_id 使用者 ID
 	 * @return bool
 	 */
-	private static function is_unlinked_site_of_email( string $id, array $site, string $email ): bool {
+	private static function is_owned_by_email( string $id, array $site, string $email, int $user_id ): bool {
 		if ( '' === $email || self::normalize_email( $site['adminEmail'] ?? null ) !== $email ) {
 			return false;
 		}
 
 		$subscriptions = \wcs_get_subscriptions(
 			[
-				'subscriptions_per_page' => 1,
+				'subscriptions_per_page' => -1,
 				'subscription_status'    => 'any',
 				'meta_query'             => [ // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query
 					[
@@ -133,7 +135,17 @@ abstract class CustomerSites {
 			]
 		);
 
-		return [] === $subscriptions;
+		if ( [] === $subscriptions ) {
+			return true;
+		}
+
+		foreach ( $subscriptions as $subscription ) {
+			if ( (int) $subscription->get_customer_id() === $user_id ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

@@ -355,6 +355,29 @@ class PowerCloudCustomerSiteApiTest extends TestCase {
 	}
 
 	/**
+	 * 最常見的情況：客戶自己開的站，email 相同、也綁在自己的訂閱上
+	 */
+	public function test_綁在自己訂閱上且email相同的站台屬於自己(): void {
+		$this->websites[] = $this->website( self::SITE_LINKED, 'customer@test.com' );
+		$this->subscription( $this->customer_id, [ self::SITE_LINKED ] );
+		\wp_set_current_user( $this->customer_id );
+
+		$this->assertSame( [ self::SITE_OWN, self::SITE_LINKED ], $this->returned_site_ids( $this->get_sites() ) );
+	}
+
+	/**
+	 * WCS 的客戶訂閱快取過期時，不可把客戶自己訂閱上的站誤判成別人的
+	 */
+	public function test_訂閱快取過期時email相同的自己站台仍屬於自己(): void {
+		$this->websites[] = $this->website( self::SITE_LINKED, 'customer@test.com' );
+		$this->subscription( $this->customer_id, [ self::SITE_LINKED ] );
+		\update_user_meta( $this->customer_id, '_wcs_subscription_ids_cache', [] );
+		\wp_set_current_user( $this->customer_id );
+
+		$this->assertSame( [ self::SITE_OWN, self::SITE_LINKED ], $this->returned_site_ids( $this->get_sites() ) );
+	}
+
+	/**
 	 * WooCommerce「我的帳號」改 email 不需要驗證，不可藉此取得別人訂閱上的站台
 	 */
 	public function test_綁在別人訂閱上的站台即使email相同也不屬於自己(): void {
