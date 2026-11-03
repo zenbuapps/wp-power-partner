@@ -44,5 +44,11 @@ export const allow_delete_site: boolean =
 	window?.[APP_DOMAIN]?.env?.allow_delete_site ?? false
 
 export const POWERCLOUD_API = window?.[APP_DOMAIN]?.env?.POWERCLOUD_API || ''
+
+// 只有 wp-admin 的管理員才有值；前台 UserApp 不可使用，改打 /powercloud/sites
 export const powercloud_api_key: string =
     window?.[APP_DOMAIN]?.env?.powercloud_api_key || ''
+
+// 本站已連結新架構帳號，前台用來決定要不要顯示新架構分頁
+export const powercloud_connected: boolean =
+    window?.[APP_DOMAIN]?.env?.powercloud_connected ?? false

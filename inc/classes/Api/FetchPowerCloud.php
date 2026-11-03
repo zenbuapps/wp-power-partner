@@ -16,6 +16,9 @@ abstract class FetchPowerCloud
 	const WEBSITES_PAGE_LIMIT = 250;
 	/** @var int /websites 分頁保護上限，避免對端回報錯誤 total 時無限迴圈 */
 	const WEBSITES_MAX_PAGES  = 100;
+
+	/** @var int 前台客戶操作站台的逾時秒數：網域變更可能要數分鐘，且要比瀏覽器的 300 秒（apiTimeout）先結束 */
+	const CUSTOMER_ACTION_TIMEOUT = 290;
 	/**
 	 * 發 API 開站
 	 *
@@ -255,6 +258,76 @@ abstract class FetchPowerCloud
 			]
 		);
 		return true;
+	}
+
+	/**
+	 * 代替前台客戶操作站台（start / stop / domain）
+	 *
+	 * 回應可能帶站台憑證：不寫進 log，也不可原樣回傳給瀏覽器，只取 message。
+	 * 呼叫前必須先確認站台屬於該客戶（Domains\PowerCloud\Services\CustomerSites）。
+	 *
+	 * @param string               $user_id    當前用戶 ID
+	 * @param string               $website_id 網站 ID
+	 * @param string               $action     start / stop / domain
+	 * @param array<string, mixed> $body       請求內容
+	 * @return array{ok: bool, status: int, message: string} status 0 代表沒有收到回應
+	 */
+	public static function patch_website(string $user_id, string $website_id, string $action, array $body = []): array
+	{
+		$args = [
+			'method'  => 'PATCH',
+			'headers' => [
+				'Content-Type' => 'application/json',
+				'X-API-Key'    => (string) self::get_powercloud_api_key($user_id),
+			],
+			'timeout' => self::CUSTOMER_ACTION_TIMEOUT,
+		];
+		if ([] !== $body) {
+			$args['body'] = (string) \wp_json_encode($body);
+		}
+
+		$response = \wp_remote_request(
+			Bootstrap::instance()->powercloud_api . '/wordpress/' . rawurlencode($website_id) . '/' . $action,
+			$args
+		);
+
+		$context = [
+			'user_id'   => $user_id,
+			'websiteId' => $website_id,
+			'action'    => $action,
+		];
+
+		if (\is_wp_error($response)) {
+			Plugin::logger("patch_website error: {$response->get_error_message()}", 'error', $context);
+			return [
+				'ok'      => false,
+				'status'  => 0,
+				'message' => '',
+			];
+		}
+
+		$status = (int) \wp_remote_retrieve_response_code($response);
+		if ($status >= 200 && $status < 300) {
+			Plugin::logger('patch_website success', 'info', [ ...$context, 'response_code' => $status ]);
+			return [
+				'ok'      => true,
+				'status'  => $status,
+				'message' => '',
+			];
+		}
+
+		$decoded = json_decode((string) \wp_remote_retrieve_body($response), true);
+		$message = is_array($decoded) ? ($decoded['message'] ?? '') : '';
+		$message = is_array($message) ? implode('；', array_filter($message, 'is_string')) : $message;
+		$message = is_string($message) ? \wp_strip_all_tags($message) : '';
+
+		Plugin::logger('patch_website http error', 'error', [ ...$context, 'response_code' => $status, 'message' => $message ]);
+
+		return [
+			'ok'      => false,
+			'status'  => $status,
+			'message' => $message,
+		];
 	}
 
 	/**

@@ -10,3 +10,4 @@ api.wpsite.pro (新架構) 外部系統。提供 Kubernetes 容器化 WordPress 
 - 模板站 API: /templates/wordpress
 - 開站方案 API: /website-packages
 - 開站為同步回應，不需回調
+- API Key 的範圍是整個經銷商帳號，不可送到客戶的瀏覽器：前台客戶的操作由本站 PHP 代為呼叫（/power-partner/powercloud/sites）
