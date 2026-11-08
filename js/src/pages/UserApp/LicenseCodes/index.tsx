@@ -13,10 +13,10 @@ const index = () => {
 	const setGlobalLoading = useSetAtom(globalLoadingAtom)
 	const [search, setSearch] = useState('')
 
+	// 不帶 author：本站 proxy 一律以 partner_id 覆寫；網址帶數字 author 會被 Wordfence 的「防止 /?author=N 列舉」擋成 404
 	const { tableProps } = useTable<TParams, DataType>({
 		resource: 'license-codes',
 		defaultParams: {
-			author: partner_id,
 			customer_id: currentUserId,
 			search,
 		},
