@@ -236,6 +236,80 @@ class CredentialExposureHotfixTest extends TestCase {
 		$this->assertSame( $expected, $ids );
 	}
 
+	// ========== GET /partner-id ==========
+
+	/** @group security */
+	public function test_partner_id_未登入回401(): void {
+		$response = rest_do_request( new \WP_REST_Request( 'GET', '/power-partner/partner-id' ) );
+
+		$this->assertSame( 401, $response->get_status() );
+	}
+
+	/** @group happy */
+	public function test_partner_id_一般會員可取得(): void {
+		\wp_set_current_user( $this->member_a_id );
+
+		$response = rest_do_request( new \WP_REST_Request( 'GET', '/power-partner/partner-id' ) );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( '777', $response->get_data()['data']['partner_id'] ?? null );
+	}
+
+	/** @group happy */
+	public function test_partner_id_管理員可取得(): void {
+		\wp_set_current_user( $this->admin_id );
+
+		$response = rest_do_request( new \WP_REST_Request( 'GET', '/power-partner/partner-id' ) );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( '777', $response->get_data()['data']['partner_id'] ?? null );
+	}
+
+	// ========== GET /apps ==========
+
+	/** @group security */
+	public function test_apps_未登入回401(): void {
+		$request = new \WP_REST_Request( 'GET', '/power-partner/apps' );
+		$request->set_query_params( [ 'app_ids' => [ '999' ] ] );
+		$response = rest_do_request( $request );
+
+		$this->assertSame( 401, $response->get_status() );
+	}
+
+	/** @group happy */
+	public function test_apps_一般會員可查詢(): void {
+		\wp_set_current_user( $this->member_a_id );
+
+		$request = new \WP_REST_Request( 'GET', '/power-partner/apps' );
+		$request->set_query_params( [ 'app_ids' => [ '999' ] ] );
+		$response = rest_do_request( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertIsArray( $response->get_data() );
+	}
+
+	// ========== GET /subscriptions/next-payment ==========
+
+	/** @group security */
+	public function test_subscriptions_next_payment_未登入回401(): void {
+		$request = new \WP_REST_Request( 'GET', '/power-partner/subscriptions/next-payment' );
+		$request->set_query_params( [ 'ids' => [ '1' ] ] );
+		$response = rest_do_request( $request );
+
+		$this->assertSame( 401, $response->get_status() );
+	}
+
+	/** @group happy */
+	public function test_subscriptions_next_payment_一般會員可查詢(): void {
+		\wp_set_current_user( $this->member_a_id );
+
+		$request = new \WP_REST_Request( 'GET', '/power-partner/subscriptions/next-payment' );
+		$request->set_query_params( [ 'ids' => [ '1' ] ] );
+		$response = rest_do_request( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+	}
+
 	// ========== 頁面資料（wp_localize_script） ==========
 
 	/** @group security */
