@@ -183,10 +183,10 @@ PowerCloud API key 儲存方式:
 | POST | `/emails` | `manage_options` | 儲存 Email 模板 *(deprecated → 用 /settings)* |
 | GET | `/subscriptions` | `manage_options` | 列出用戶的訂閱 |
 | POST | `/change-subscription` | `manage_options` | 重新綁定 site IDs |
-| GET | `/apps` | public | 查詢 site IDs 對應的訂閱 |
+| GET | `/apps` | 已登入 | 查詢 site IDs 對應的訂閱 |
 | POST | `/settings` | `manage_options` | 儲存 `power_partner_settings` |
 | POST | `/powercloud-api-key` | `manage_options` | 儲存 PowerCloud API key |
-| GET | `/partner-id` | public | 取得 partner ID |
+| GET | `/partner-id` | 已登入 | 取得 partner ID |
 | POST | `/partner-id` | `manage_options` | 設定 partner ID + 更新模板快取（新版 AdminApp 改走 `/connection`，不再呼叫） |
 | DELETE | `/partner-id` | `manage_options` | 移除 partner ID + 清除快取 |
 | GET | `/account-info` | `manage_options` | 取得**舊格式**加密帳號資訊（3.5.5 起不再 public：密文是經銷商真實帳密、passphrase 公開；新版 AdminApp 不呼叫） |

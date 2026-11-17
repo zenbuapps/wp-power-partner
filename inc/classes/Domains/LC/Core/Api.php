@@ -30,7 +30,7 @@ final class Api extends ApiBase {
 		[
 			'endpoint'            => 'subscriptions/next-payment',
 			'method'              => 'get',
-			'permission_callback' => '__return_true',
+			'permission_callback' => 'is_user_logged_in',
 		],
 	];
 

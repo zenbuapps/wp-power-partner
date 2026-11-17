@@ -157,7 +157,7 @@ final class Main
 			[
 				'methods'             => 'GET',
 				'callback'            => [$this, 'get_apps_callback'],
-				'permission_callback' => '__return_true',
+				'permission_callback' => 'is_user_logged_in',
 			]
 		);
 

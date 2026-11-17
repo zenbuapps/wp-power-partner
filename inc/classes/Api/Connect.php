@@ -60,7 +60,7 @@ final class Connect {
 			[
 				'methods'             => 'GET',
 				'callback'            => [ $this, 'get_partner_id_callback' ],
-				'permission_callback' => '__return_true',
+				'permission_callback' => 'is_user_logged_in',
 			]
 		);
 
